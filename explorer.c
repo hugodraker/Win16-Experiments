@@ -22,6 +22,10 @@
 #include <ctype.h>
 #include <malloc.h>
 
+#ifndef SS_NOTIFY
+#define SS_NOTIFY 0x0100L
+#endif
+
 #ifndef DEFAULT_GUI_FONT
 #define DEFAULT_GUI_FONT ANSI_VAR_FONT
 #endif
@@ -218,6 +222,7 @@ int ShowModalReplaceDialog(HWND hParent) {
 
 BOOL DoCopyFile(HWND hDlg, const char* src, const char* dst) {
     FILE *fs, *fd; char *buf; size_t n;
+    if (g_bCancelDel) return FALSE;
     if (access(dst, 0) == 0) {
         if (g_ReplaceMode == 1) { /* Yes to All */ }
         else if (g_ReplaceMode == 2) { return TRUE; /* Skip */ }
@@ -236,68 +241,105 @@ BOOL DoCopyFile(HWND hDlg, const char* src, const char* dst) {
     if (buf) {
         while ((n = fread(buf, 1, 4096, fs)) > 0) { 
             fwrite(buf, 1, n, fd); UpdateProgressGauge(hDlg); ProcessMessages(); 
+            if (g_bCancelDel) break;
         }
         free(buf);
     }
     fclose(fs); fclose(fd);
-    return TRUE;
+    if (g_bCancelDel) remove(dst);
+    return !g_bCancelDel;
 }
 
 void DoCopyFolder(HWND hDlg, const char* src, const char* dst) {
     struct find_t file; char *search; char *sPath; char *dPath;
+    HGLOBAL hMem; char FAR* fileBuf; int count = 0, i;
     
     if (strstr(dst, src) == dst) {
         MessageBox(hDlg, "Cannot copy a folder into itself.", "Error", MB_OK|MB_ICONHAND);
         g_ReplaceMode = 3; return;
     }
     
+    mkdir(dst);
     search = (char*)malloc(MAX_PATH); if (!search) return;
-    mkdir(dst); lstrcpy(search, src);
+    lstrcpy(search, src);
     if (search[0] != '\0' && search[lstrlen(search)-1] != '\\') lstrcat(search, "\\");
     lstrcat(search, "*.*");
     
+    hMem = GlobalAlloc(GHND, 4096L * 14L);
+    if (!hMem) { free(search); return; }
+    fileBuf = (char FAR*)GlobalLock(hMem);
+    
     if (_dos_findfirst(search, _A_NORMAL|_A_SUBDIR|_A_RDONLY|_A_ARCH|_A_HIDDEN|_A_SYSTEM, &file) == 0) {
-        sPath = (char*)malloc(MAX_PATH); dPath = (char*)malloc(MAX_PATH);
-        if (sPath && dPath) {
-            do {
-                if (g_ReplaceMode == 3) break;
-                UpdateProgressGauge(hDlg); ProcessMessages();
-                if (lstrcmp(file.name, ".") != 0 && lstrcmp(file.name, "..") != 0) {
-                    lstrcpy(sPath, src); if (sPath[lstrlen(sPath)-1] != '\\') lstrcat(sPath, "\\"); lstrcat(sPath, file.name);
-                    lstrcpy(dPath, dst); if (dPath[lstrlen(dPath)-1] != '\\') lstrcat(dPath, "\\"); lstrcat(dPath, file.name);
-                    if (file.attrib & _A_SUBDIR) DoCopyFolder(hDlg, sPath, dPath); else DoCopyFile(hDlg, sPath, dPath);
-                }
-            } while (_dos_findnext(&file) == 0);
-        }
-        if (sPath) free(sPath); if (dPath) free(dPath);
+        do {
+            if (lstrcmp(file.name, ".") != 0 && lstrcmp(file.name, "..") != 0 && count < 4096) {
+                lstrcpy((char FAR*)(fileBuf + count * 14), file.name);
+                count++;
+            }
+        } while (_dos_findnext(&file) == 0);
     }
     free(search);
+    
+    sPath = (char*)malloc(MAX_PATH); dPath = (char*)malloc(MAX_PATH);
+    if (sPath && dPath) {
+        for (i = 0; i < count; i++) {
+            char fname[16]; char fullS[MAX_PATH];
+            lstrcpy(fname, (char FAR*)(fileBuf + i * 14));
+            lstrcpy(sPath, src); if (sPath[lstrlen(sPath)-1] != '\\') lstrcat(sPath, "\\"); lstrcat(sPath, fname);
+            lstrcpy(dPath, dst); if (dPath[lstrlen(dPath)-1] != '\\') lstrcat(dPath, "\\"); lstrcat(dPath, fname);
+            
+            if (_dos_findfirst(sPath, _A_NORMAL|_A_SUBDIR|_A_RDONLY|_A_ARCH|_A_HIDDEN|_A_SYSTEM, &file) == 0) {
+                if (g_ReplaceMode == 3 || g_bCancelDel) break;
+                UpdateProgressGauge(hDlg); ProcessMessages();
+                if (file.attrib & _A_SUBDIR) DoCopyFolder(hDlg, sPath, dPath);
+                else DoCopyFile(hDlg, sPath, dPath);
+            }
+        }
+    }
+    if (sPath) free(sPath); if (dPath) free(dPath);
+    GlobalUnlock(hMem); GlobalFree(hMem);
 }
 
 BOOL DoDeleteFolder(const char* path) {
     struct find_t file; char *search; char *child;
-    search = (char*)malloc(MAX_PATH); if (!search) return FALSE;
+    HGLOBAL hMem; char FAR* fileBuf; int count = 0, i;
     
+    search = (char*)malloc(MAX_PATH); if (!search) return FALSE;
     lstrcpy(search, path);
     if (search[0] != '\0' && search[lstrlen(search)-1] != '\\') lstrcat(search, "\\");
     lstrcat(search, "*.*");
     
+    hMem = GlobalAlloc(GHND, 4096L * 14L);
+    if (!hMem) { free(search); return FALSE; }
+    fileBuf = (char FAR*)GlobalLock(hMem);
+    
     if (_dos_findfirst(search, _A_NORMAL|_A_SUBDIR|_A_RDONLY|_A_ARCH|_A_HIDDEN|_A_SYSTEM, &file) == 0) {
-        child = (char*)malloc(MAX_PATH);
-        if (child) {
-            do {
-                if (g_bCancelDel) break;
-                if (g_hDelDlg) UpdateProgressGauge(g_hDelDlg); ProcessMessages();
-                if (lstrcmp(file.name, ".") != 0 && lstrcmp(file.name, "..") != 0) {
-                    lstrcpy(child, path); if (child[lstrlen(child)-1] != '\\') lstrcat(child, "\\"); lstrcat(child, file.name);
-                    if (g_hDelDlg) { HWND hLbl = GetDlgItem(g_hDelDlg, 101); if (hLbl) { SetWindowText(hLbl, child); UpdateWindow(hLbl); } }
-                    if (file.attrib & _A_SUBDIR) { DoDeleteFolder(child); if (!g_bCancelDel) rmdir(child); } else remove(child);
-                }
-            } while (_dos_findnext(&file) == 0);
-            free(child);
-        }
+        do {
+            if (lstrcmp(file.name, ".") != 0 && lstrcmp(file.name, "..") != 0 && count < 4096) {
+                lstrcpy((char FAR*)(fileBuf + count * 14), file.name);
+                count++;
+            }
+        } while (_dos_findnext(&file) == 0);
     }
     free(search);
+    
+    child = (char*)malloc(MAX_PATH);
+    if (child) {
+        for (i = 0; i < count; i++) {
+            char fname[16];
+            lstrcpy(fname, (char FAR*)(fileBuf + i * 14));
+            lstrcpy(child, path); if (child[lstrlen(child)-1] != '\\') lstrcat(child, "\\"); lstrcat(child, fname);
+            
+            if (_dos_findfirst(child, _A_NORMAL|_A_SUBDIR|_A_RDONLY|_A_ARCH|_A_HIDDEN|_A_SYSTEM, &file) == 0) {
+                if (g_bCancelDel) break;
+                if (g_hDelDlg) { UpdateProgressGauge(g_hDelDlg); ProcessMessages(); }
+                if (g_hDelDlg) { HWND hLbl = GetDlgItem(g_hDelDlg, 101); if (hLbl) { SetWindowText(hLbl, child); UpdateWindow(hLbl); } }
+                if (file.attrib & _A_SUBDIR) { DoDeleteFolder(child); if (!g_bCancelDel) rmdir(child); }
+                else remove(child);
+            }
+        }
+        free(child);
+    }
+    GlobalUnlock(hMem); GlobalFree(hMem);
     return !g_bCancelDel;
 }
 
@@ -446,7 +488,6 @@ static void LoadIniShortcuts(void) {
     }
     free(keys); free(val);
 
-    /* Dynamically add system drives to the INI shortcuts list in memory */
     {
         int d;
         for (d = 0; d < 26 && g_IniShortcutCount < MAX_INI_SHORTCUTS; d++) {
@@ -828,21 +869,25 @@ LRESULT CALLBACK ReplaceDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 LRESULT CALLBACK CopyProgressDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch(msg) {
         case WM_CREATE:
+            g_bCancelDel = FALSE;
             CreateWindow("STATIC", g_CurrentJob.isMove ? "Moving..." : "Copying...", WS_CHILD|WS_VISIBLE|SS_CENTER, 10, 10, 260, 20, hwnd, NULL, g_hInst, NULL);
             CreateWindow("STATIC", g_CurrentJob.src, WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX, 10, 40, 260, 20, hwnd, (HMENU)101, g_hInst, NULL);
             CreateWindow("STATIC", "", WS_CHILD|WS_VISIBLE|WS_BORDER, 10, 70, 260, 20, hwnd, (HMENU)102, g_hInst, NULL);
+            CreateWindow("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 100, 100, 80, 24, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
             SetTimer(hwnd, 1, 100, NULL); return 0;
         case WM_TIMER:
             KillTimer(hwnd, 1);
-            if (g_CurrentJob.isMove) { if (rename(g_CurrentJob.src, g_CurrentJob.dst) != 0) { if (g_CurrentJob.isDir) DoCopyFolder(hwnd, g_CurrentJob.src, g_CurrentJob.dst); else DoCopyFile(hwnd, g_CurrentJob.src, g_CurrentJob.dst); if (g_ReplaceMode != 3) { if (g_CurrentJob.isDir) { g_bCancelDel = FALSE; DoDeleteFolder(g_CurrentJob.src); rmdir(g_CurrentJob.src); } else remove(g_CurrentJob.src); } } } 
+            if (g_CurrentJob.isMove) { if (rename(g_CurrentJob.src, g_CurrentJob.dst) != 0) { if (g_CurrentJob.isDir) DoCopyFolder(hwnd, g_CurrentJob.src, g_CurrentJob.dst); else DoCopyFile(hwnd, g_CurrentJob.src, g_CurrentJob.dst); if (g_ReplaceMode != 3 && !g_bCancelDel) { if (g_CurrentJob.isDir) { DoDeleteFolder(g_CurrentJob.src); rmdir(g_CurrentJob.src); } else remove(g_CurrentJob.src); } } } 
             else { if (g_CurrentJob.isDir) DoCopyFolder(hwnd, g_CurrentJob.src, g_CurrentJob.dst); else DoCopyFile(hwnd, g_CurrentJob.src, g_CurrentJob.dst); }
             { HWND hParent = GetParent(hwnd); EnableWindow(hParent, TRUE); DestroyWindow(hwnd); PostMessage(hParent, WM_COMMAND, 4028, 0); } return 0;
+        case WM_COMMAND: if (wp == IDCANCEL) g_bCancelDel = TRUE; return 0;
     } return DefWindowProc(hwnd, msg, wp, lp);
 }
 
 LRESULT CALLBACK DeleteProgressDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch(msg) {
         case WM_CREATE:
+            g_bCancelDel = FALSE;
             g_hDelDlg = hwnd; CreateWindow("STATIC", "Deleting...", WS_CHILD|WS_VISIBLE|SS_CENTER, 10, 10, 260, 20, hwnd, NULL, g_hInst, NULL);
             CreateWindow("STATIC", g_DelPath, WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX, 10, 40, 260, 20, hwnd, (HMENU)101, g_hInst, NULL);
             CreateWindow("STATIC", "", WS_CHILD|WS_VISIBLE|WS_BORDER, 10, 70, 260, 20, hwnd, (HMENU)102, g_hInst, NULL);
@@ -1044,7 +1089,76 @@ LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_LBUTTONUP) {
         if (g_bListDragging) {
             g_bListDragging = FALSE; ReleaseCapture(); POINT pt; pt.x = LOWORD(lp); pt.y = HIWORD(lp); ClientToScreen(hwnd, &pt); HWND hTarget = WindowFromPoint(pt);
-            if (hTarget) { char cls[64]; GetClassName(hTarget, cls, 64); if (lstrcmpi(cls, "Win95DesktopClass") == 0) PostMessage(GetParent(hwnd), WM_COMMAND, 9999, 0); }
+            if (hTarget) { 
+                char cls[64]; GetClassName(hTarget, cls, 64); 
+                if (lstrcmpi(cls, "Win95DesktopClass") == 0) {
+                    PostMessage(GetParent(hwnd), WM_COMMAND, 9999, 0); 
+                } else if (!g_SelectedListItemIsVirtual && g_SelectedListItemPath[0] != '\0') {
+                    char targetFolder[MAX_PATH] = "";
+                    BOOL validTarget = FALSE;
+                    
+                    if (hTarget == hwnd) {
+                        POINT clPt = pt; ScreenToClient(hwnd, &clPt);
+                        int hitIdx = -1; int topIdx = SendMessage(hwnd, LB_GETTOPINDEX, 0, 0); int count = SendMessage(hwnd, LB_GETCOUNT, 0, 0);
+                        for (int i = topIdx; i < count; i++) {
+                            RECT rc; if (SendMessage(hwnd, LB_GETITEMRECT, i, (LPARAM)(LPRECT)&rc) != LB_ERR) {
+                                if (clPt.y >= rc.top && clPt.y <= rc.bottom) { hitIdx = i; break; }
+                            }
+                        }
+                        if (hitIdx >= 0) {
+                            int FAR* pType = (int FAR*)SendMessage(hwnd, LB_GETITEMDATA, hitIdx, 0);
+                            if (pType && *pType == 2 && (g_ViewMode == 0 || g_ViewMode == 1)) {
+                                RowItemData FAR* row = (RowItemData FAR*)pType; int colW = (g_ViewMode == 0) ? CELL_W : 150; int col = clPt.x / colW;
+                                if (col >= 0 && col < row->count && row->items[col]->isDir && !row->items[col]->isVirtual) {
+                                    lstrcpy(targetFolder, row->items[col]->path); validTarget = TRUE;
+                                }
+                            } else if (pType && *pType == 1) {
+                                ListItemData FAR* item = (ListItemData FAR*)pType;
+                                if (item->isDir && !item->isVirtual) { lstrcpy(targetFolder, item->path); validTarget = TRUE; }
+                            }
+                        }
+                    } else if (hTarget == GetDlgItem(GetParent(hwnd), ID_TREE)) {
+                        POINT clPt = pt; ScreenToClient(hTarget, &clPt);
+                        int hitIdx = -1; int topIdx = SendMessage(hTarget, LB_GETTOPINDEX, 0, 0); int count = SendMessage(hTarget, LB_GETCOUNT, 0, 0);
+                        for (int i = topIdx; i < count; i++) {
+                            RECT rc; if (SendMessage(hTarget, LB_GETITEMRECT, i, (LPARAM)(LPRECT)&rc) != LB_ERR) {
+                                if (clPt.y >= rc.top && clPt.y <= rc.bottom) { hitIdx = i; break; }
+                            }
+                        }
+                        if (hitIdx >= 0) {
+                            TreeItemData FAR* item = (TreeItemData FAR*)SendMessage(hTarget, LB_GETITEMDATA, hitIdx, 0);
+                            if (item && !item->isVirtual) { lstrcpy(targetFolder, item->pathOrId); validTarget = TRUE; }
+                        }
+                    }
+                    
+                    if (validTarget && lstrcmpi(targetFolder, g_SelectedListItemPath) != 0) {
+                        int op = (GetKeyState(VK_SHIFT) & 0x8000) ? 2 : 1; 
+                        if (GetKeyState(VK_CONTROL) & 0x8000) op = 1;
+                        
+                        lstrcpy(g_CurrentJob.src, g_SelectedListItemPath);
+                        lstrcpy(g_CurrentJob.dst, targetFolder);
+                        if (g_CurrentJob.dst[0] != '\0' && g_CurrentJob.dst[lstrlen(g_CurrentJob.dst)-1] != '\\') lstrcat(g_CurrentJob.dst, "\\");
+                        lstrcat(g_CurrentJob.dst, g_SelectedListItemName);
+                        
+                        if (op == 2 && strstr(g_CurrentJob.dst, g_CurrentJob.src) == g_CurrentJob.dst) {
+                            MessageBox(GetParent(hwnd), "Cannot move a folder into itself.", "Error", MB_OK|MB_ICONHAND);
+                        } else {
+                            if (op == 1 && lstrcmpi(g_CurrentJob.src, g_CurrentJob.dst) == 0) {
+                                char tempDst[MAX_PATH];
+                                lstrcpy(tempDst, targetFolder);
+                                if (tempDst[0] != '\0' && tempDst[lstrlen(tempDst)-1] != '\\') lstrcat(tempDst, "\\");
+                                lstrcat(tempDst, "Copy of ");
+                                lstrcat(tempDst, g_SelectedListItemName);
+                                lstrcpy(g_CurrentJob.dst, tempDst);
+                            }
+                            g_CurrentJob.isMove = (op == 2);
+                            g_CurrentJob.isDir = g_SelectedListItemIsDir;
+                            g_ReplaceMode = 0;
+                            CreateCenteredDialog(g_hInst, GetParent(hwnd), "CopyProgressDlgClass", g_CurrentJob.isMove ? "Moving" : "Copying", 280, 140);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1135,13 +1249,17 @@ LRESULT CALLBACK DesktopProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (g_ClipIsVirtual) { int i; for(i=0; i<g_IniShortcutCount; i++) if (lstrcmp(g_IniShortcuts[i]->id, g_ClipId) == 0) { lstrcpy(sh.exe, g_IniShortcuts[i]->exe); lstrcpy(sh.params, g_IniShortcuts[i]->params); lstrcpy(sh.icon, g_IniShortcuts[i]->icon); sh.minimized = g_IniShortcuts[i]->minimized; break; }
                         if (g_ClipOp == 2) { WritePrivateProfileString("Shortcut", g_ClipId, NULL, g_szExplorerIni); g_ClipOp = 0; }
                     } else lstrcpy(sh.exe, g_ClipPath);
-                    if (!NameExists("0", sh.name, TRUE)) SaveIniEntry(&sh); LoadIniShortcuts(); InvalidateRect(hwnd, NULL, TRUE);
+                    if (g_ClipOp == 1 && lstrcmpi(g_ClipPath, "0") == 0) { char temp[MAX_PATH]; sprintf(temp, "Copy of %s", sh.name); lstrcpy(sh.name, temp); }
+                    if (NameExists("0", sh.name, TRUE)) { char temp[MAX_PATH]; sprintf(temp, "Copy of %s", sh.name); lstrcpy(sh.name, temp); }
+                    if (!NameExists("0", sh.name, TRUE)) { SaveIniEntry(&sh); LoadIniShortcuts(); InvalidateRect(hwnd, NULL, TRUE); }
                 }
                 else if (id == 4014) {
                     if (g_ClipOp == 0) return 0; char newId[16]; IniShortcut sh; memset(&sh, 0, sizeof(sh)); GetNewIniId(newId); lstrcpy(sh.id, newId);
                     sprintf(sh.name, "Shortcut to %s", g_ClipName); lstrcpy(sh.parentId, "0"); sh.isFolder = FALSE;
                     if (g_ClipIsVirtual) { int i; for(i=0; i<g_IniShortcutCount; i++) if (lstrcmp(g_IniShortcuts[i]->id, g_ClipId) == 0) { lstrcpy(sh.exe, g_IniShortcuts[i]->exe); lstrcpy(sh.params, g_IniShortcuts[i]->params); lstrcpy(sh.icon, g_IniShortcuts[i]->icon); sh.minimized = g_IniShortcuts[i]->minimized; break; } } 
-                    else lstrcpy(sh.exe, g_ClipPath); if (!NameExists("0", sh.name, TRUE)) SaveIniEntry(&sh); LoadIniShortcuts(); InvalidateRect(hwnd, NULL, TRUE);
+                    else lstrcpy(sh.exe, g_ClipPath); 
+                    if (NameExists("0", sh.name, TRUE)) { char temp[MAX_PATH]; sprintf(temp, "Copy of %s", sh.name); lstrcpy(sh.name, temp); }
+                    if (!NameExists("0", sh.name, TRUE)) { SaveIniEntry(&sh); LoadIniShortcuts(); InvalidateRect(hwnd, NULL, TRUE); }
                 }
             }
             if (id >= 4001 && id <= 4005) {
@@ -1192,7 +1310,8 @@ LRESULT CALLBACK FolderWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             hHelp = CreatePopupMenu(); AppendMenu(hHelp, MF_STRING, 4040, "&Help Topics"); AppendMenu(hHelp, MF_SEPARATOR, 0, NULL); AppendMenu(hHelp, MF_STRING, 4041, "&About Calmira"); AppendMenu(hMenu, MF_POPUP, (UINT)hHelp, "&Help"); 
             SetMenu(hwnd, hMenu); DrawMenuBar(hwnd);
 
-            hToolbar = CreateWindowEx(0, "STATIC", "", WS_CHILD | (g_bShowToolbar ? WS_VISIBLE : 0), 0, 0, 0, 0, hwnd, (HMENU)ID_TOOLBAR, g_hInst, NULL); g_lpfnOldToolbarProc = (FARPROC)SetWindowLong(hToolbar, GWL_WNDPROC, (LONG)g_lpfnToolbarProcInst);
+hToolbar = CreateWindowEx(0, "STATIC", "", WS_CHILD | (g_bShowToolbar ? WS_VISIBLE : 0) | SS_NOTIFY, 0, 0, 0, 0, hwnd, (HMENU)ID_TOOLBAR, g_hInst, NULL); g_lpfnOldToolbarProc = (FARPROC)SetWindowLong(hToolbar, GWL_WNDPROC, (LONG)g_lpfnToolbarProcInst);
+
             CreateWindow("BUTTON", "Name", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)ID_HDR_NAME, g_hInst, NULL); CreateWindow("BUTTON", "Size", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)ID_HDR_SIZE, g_hInst, NULL); CreateWindow("BUTTON", "Type", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)ID_HDR_TYPE, g_hInst, NULL); CreateWindow("BUTTON", "Modified", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)ID_HDR_DATE, g_hInst, NULL);
             hTree = CreateWindowEx(0, "LISTBOX", "", WS_CHILD | WS_VISIBLE | LBS_OWNERDRAWFIXED | LBS_NOTIFY | WS_VSCROLL | WS_HSCROLL | WS_BORDER, 0, 0, 0, 0, hwnd, (HMENU)ID_TREE, g_hInst, NULL); SendMessage(hTree, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), FALSE); g_lpfnOldTreeProc = (FARPROC)SetWindowLong(hTree, GWL_WNDPROC, (LONG)g_lpfnTreeProcInst);
             ChangeViewMode(hwnd, g_ViewMode);
@@ -1331,6 +1450,13 @@ LRESULT CALLBACK FolderWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                      if (lstrcmp(g_IniShortcuts[i]->id, clipP) == 0) { lstrcpy(sh->exe, g_IniShortcuts[i]->exe); break; }
                                  }
                              } else { lstrcpy(sh->exe, clipP); }
+                             
+                             if (NameExists("0", sh->name, TRUE)) {
+                                char temp[MAX_PATH];
+                                sprintf(temp, "Copy of %s", sh->name);
+                                lstrcpy(sh->name, temp);
+                             }
+                             
                              if (!NameExists("0", sh->name, TRUE)) { SaveIniEntry(sh); LoadIniShortcuts(); InvalidateRect(hDesktop, NULL, TRUE); }
                              free(sh);
                          }
@@ -1425,7 +1551,10 @@ LRESULT CALLBACK FolderWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 else if (id == 4005 && g_ContextId[0] != '\0') { lstrcpy(g_EditShortcutId, g_ContextId); CreateCenteredDialog(g_hInst, hwnd, "ShortcutDlgClass", "Properties", 360, 300); }
                 else if (id == 4011 || id == 4012) {
                     if (hFocus == hTree) {
-                        lstrcpy(g_ClipPath, g_ContextId); lstrcpy(g_ClipName, "");
+                        lstrcpy(g_ClipPath, g_ContextId); 
+                        lstrcpy(g_ClipName, "");
+                        g_ClipIsVirtual = g_ContextIsVirtual;
+                        g_ClipIsDir = g_ContextIsFolder;
                     } else {
                         if (g_ViewMode == 0 || g_ViewMode == 1) {
                             lstrcpy(g_ClipPath, g_SelectedListItemPath); lstrcpy(g_ClipName, g_SelectedListItemName); g_ClipIsVirtual = g_SelectedListItemIsVirtual; g_ClipIsDir = g_SelectedListItemIsDir;
@@ -1440,7 +1569,16 @@ LRESULT CALLBACK FolderWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             }
                         }
                     }
-                    if (g_ClipName[0] == '\0') { int k; for(k=0; k<g_IniShortcutCount; k++) if(lstrcmp(g_IniShortcuts[k]->id, g_ClipPath) == 0) { lstrcpy(g_ClipName, g_IniShortcuts[k]->name); break; } }
+                    if (g_ClipName[0] == '\0') { 
+                        if (!g_ClipIsVirtual) {
+                            char tempP[MAX_PATH]; lstrcpy(tempP, g_ClipPath);
+                            if (tempP[0] && tempP[lstrlen(tempP)-1] == '\\') tempP[lstrlen(tempP)-1] = '\0';
+                            char* p = strrchr(tempP, '\\');
+                            if (p) lstrcpy(g_ClipName, p + 1); else lstrcpy(g_ClipName, tempP);
+                        } else {
+                            int k; for(k=0; k<g_IniShortcutCount; k++) if(lstrcmp(g_IniShortcuts[k]->id, g_ClipPath) == 0) { lstrcpy(g_ClipName, g_IniShortcuts[k]->name); break; } 
+                        }
+                    }
                     g_ClipOp = (id == 4011) ? 2 : 1; if (g_ClipIsVirtual) lstrcpy(g_ClipId, g_ClipPath);
                 }
                 else if (id == 4013) {
@@ -1451,11 +1589,31 @@ LRESULT CALLBACK FolderWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             memset(sh, 0, sizeof(IniShortcut)); GetNewIniId(newId); lstrcpy(sh->id, newId);
                             lstrcpy(sh->name, g_ClipName); lstrcpy(sh->parentId, g_CurrentPathOrId); sh->isFolder = g_ClipIsDir;
                             if (g_ClipIsVirtual) { int i; for(i=0; i<g_IniShortcutCount; i++) if (lstrcmp(g_IniShortcuts[i]->id, g_ClipId) == 0) { lstrcpy(sh->exe, g_IniShortcuts[i]->exe); lstrcpy(sh->params, g_IniShortcuts[i]->params); lstrcpy(sh->icon, g_IniShortcuts[i]->icon); sh->minimized = g_IniShortcuts[i]->minimized; break; } if (g_ClipOp == 2) { WritePrivateProfileString("Shortcut", g_ClipId, NULL, g_szExplorerIni); g_ClipOp = 0; } } else lstrcpy(sh->exe, g_ClipPath);
-                            if (!NameExists(g_CurrentPathOrId, sh->name, TRUE)) SaveIniEntry(sh); LoadIniShortcuts(); RebuildTree(hTree); RebuildList(hwnd);
+                            
+                            if (NameExists(g_CurrentPathOrId, sh->name, TRUE)) {
+                                char temp[MAX_PATH];
+                                sprintf(temp, "Copy of %s", sh->name);
+                                lstrcpy(sh->name, temp);
+                            }
+                            
+                            if (!NameExists(g_CurrentPathOrId, sh->name, TRUE)) { SaveIniEntry(sh); LoadIniShortcuts(); RebuildTree(hTree); RebuildList(hwnd); }
                             free(sh);
                         }
                     } else {
-                        lstrcpy(g_CurrentJob.src, g_ClipPath); lstrcpy(g_CurrentJob.dst, g_CurrentPathOrId); if (g_CurrentJob.dst[0] != '\0' && g_CurrentJob.dst[lstrlen(g_CurrentJob.dst)-1] != '\\') lstrcat(g_CurrentJob.dst, "\\"); lstrcat(g_CurrentJob.dst, g_ClipName); g_CurrentJob.isMove = (g_ClipOp == 2); g_CurrentJob.isDir = g_ClipIsDir; g_ReplaceMode = 0; if (g_ClipOp == 2) g_ClipOp = 0; CreateCenteredDialog(g_hInst, hwnd, "CopyProgressDlgClass", g_CurrentJob.isMove ? "Moving" : "Copying", 280, 130);
+                        lstrcpy(g_CurrentJob.src, g_ClipPath); lstrcpy(g_CurrentJob.dst, g_CurrentPathOrId); if (g_CurrentJob.dst[0] != '\0' && g_CurrentJob.dst[lstrlen(g_CurrentJob.dst)-1] != '\\') lstrcat(g_CurrentJob.dst, "\\"); lstrcat(g_CurrentJob.dst, g_ClipName); 
+                        
+                        if (g_ClipOp == 1 && lstrcmpi(g_CurrentJob.src, g_CurrentJob.dst) == 0) {
+                            char tempDst[MAX_PATH];
+                            lstrcpy(tempDst, g_CurrentPathOrId);
+                            if (tempDst[0] != '\0' && tempDst[lstrlen(tempDst)-1] != '\\') lstrcat(tempDst, "\\");
+                            lstrcat(tempDst, "Copy of ");
+                            lstrcat(tempDst, g_ClipName);
+                            lstrcpy(g_CurrentJob.dst, tempDst);
+                        } else if (g_ClipOp == 2 && lstrcmpi(g_CurrentJob.src, g_CurrentJob.dst) == 0) {
+                            g_ClipOp = 0; return 0;
+                        }
+                        
+                        g_CurrentJob.isMove = (g_ClipOp == 2); g_CurrentJob.isDir = g_ClipIsDir; g_ReplaceMode = 0; if (g_ClipOp == 2) g_ClipOp = 0; CreateCenteredDialog(g_hInst, hwnd, "CopyProgressDlgClass", g_CurrentJob.isMove ? "Moving" : "Copying", 280, 140);
                     }
                 }
                 else if (id == 4014) {
@@ -1510,12 +1668,6 @@ int PASCAL WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdSh
     if (startPath[0] != '\0') { g_hwndMain = CreateWindowEx(0, "Win95FolderClass", startPath, WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, NULL, NULL, hInst, (LPVOID)startPath); } else if (isWindowed) { g_hwndMain = FindWindow("Win95DesktopClass", "Desktop"); }
     
     while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
-    
-    /* Clean up proc instances */
-    if (g_lpfnTreeProcInst) FreeProcInstance(g_lpfnTreeProcInst); 
-    if (g_lpfnListProcInst) FreeProcInstance(g_lpfnListProcInst); 
-    if (g_lpfnToolbarProcInst) FreeProcInstance(g_lpfnToolbarProcInst);
-    if (g_lpfnInlineEditProcInst) FreeProcInstance(g_lpfnInlineEditProcInst);
     
     return (int)msg.wParam;
 }
