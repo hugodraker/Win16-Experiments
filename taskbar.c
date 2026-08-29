@@ -1603,13 +1603,7 @@ LRESULT CALLBACK __export TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                         if (sh->isFolder) {
                             ShowWindow(g_hSearchList, SW_HIDE);
                             SetWindowText(g_hSearchBox, "");
-                            
-                            /* Check if it is a mapped folder by verifying if the target path is set */
-                            if (sh->exe[0] != '\0') {
-                                ShellExecute(hwnd, "open", "explorer.exe", sh->exe, NULL, SW_SHOWNORMAL);
-                            } else {
-                                ShowFolderMenu(g_hSearchBox, sh->id);
-                            }
+                            ShowFolderMenu(g_hSearchBox, sh->id);
                             return 0;
                         } else {
                             PostMessage(hwnd, WM_COMMAND, IDM_START_BASE + idx, 0);
@@ -1690,6 +1684,7 @@ LRESULT CALLBACK __export TaskbarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
+
 LRESULT CALLBACK DateTimeDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     static int s_month, s_year, s_day;
     static HWND hPrev, hNext, hLbl;
