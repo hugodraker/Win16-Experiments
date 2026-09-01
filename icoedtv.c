@@ -1,12 +1,12 @@
 /* ============================================================================
+ * Vector Icon Editor for Win16 - Saves icons as GDI Polygons
+ * ============================================================================
+ * OPENWATCOM WIN16 C PORT (Windows 3.1x / 16-bit Target)
+ * wcl -ml -za99 -bt=windows -l=windows -k16k -zq -os -s icoedtv.c commdlg.lib
+ *
  * PUBLIC DOMAIN NOTICE
  * Free and unencumbered software released into the public domain.
- * ============================================================================
  *
- * OPENWATCOM WIN16 C PORT - FULL FEATURED VECTOR EDITOR (Windows 3.1x / 16-bit)
- *
- * COMPILATION INSTRUCTIONS:
- *   wcl -ml -za99 -bt=windows -l=windows -k16k -zq -os -s -fe=icoedtv.exe icoedtv.c commdlg.lib
  * ============================================================================ */
 
 #pragma library("commdlg.lib")
@@ -28,22 +28,30 @@
 #define WM_APP 0x8000
 #endif
 
-/* Win16 Limits */
 #define GRID_SIZE 32
 #define MAX_POINTS 64
 #define MAX_SHAPES 40
 #define MAX_UNDO 10
 #define MAX_ICONS 50
 #define PANEL_WIDTH 340
-#define MAX_TOTAL_POINTS (MAX_SHAPES * MAX_POINTS)
 
 /* C89 Math & Color Macros */
 #define fmax(a,b) (((a)>(b))?(a):(b))
 #define fmin(a,b) (((a)<(b))?(a):(b))
 #define round(x) ((double)((long)((x) + ((x)>=0 ? 0.5 : -0.5))))
-#define GET_R(c) ((int)((c) & 0xFF))
-#define GET_G(c) ((int)(((c) >> 8) & 0xFF))
-#define GET_B(c) ((int)(((c) >> 16) & 0xFF))
+
+/* --- Function Prototypes --- */
+double Snap(double val);
+double CLAMP(double v, double minv, double maxv);
+void PtToSegProj(double px, double py, double x1, double y1, double x2, double y2, double* prX, double* prY, double* dist);
+void MatMul(double* A, double* B, double* out);
+int GetNextSVGFloat(char** pp, double* val);
+void ParseTransform(char* str, double* mat, char limitChar);
+char* Attr(char* tagStr, char* tagEnd, const char* attrName);
+double AttrF(char* tagStr, char* tagEnd, const char* attrName, double defVal);
+void GetSVGColors(char* p, char* tagEnd, COLORREF* fill, COLORREF* stroke, int* uF, int* uS, int defFill);
+void LoadSVG(const char* path, HWND hwnd, double customScale);
+void DrawDimensions(HDC dc);
 
 /* --- Data Structures --- */
 typedef struct { 
@@ -66,10 +74,17 @@ typedef struct {
     int shapeCount; 
 } IconDef;
 
-/* Heap-Allocated Globals */
+typedef struct {
+    int s1, p1, s2, p2; /* Stores references to shape and point indices */
+    double offset; 
+    double textPos; 
+    int mode; /* 0=Aligned, 1=Horizontal, 2=Vertical */
+} Dimension;
+
+/* --- Far Heap-Allocated Globals --- */
 Shape* shapes = NULL; 
 Shape* dragStartSnapshot = NULL;
-Shape** history = NULL; 
+Shape* history[MAX_UNDO]; 
 
 int shapeCount = 0;
 int historyShapeCount[MAX_UNDO]; 
@@ -79,73 +94,72 @@ IconDef parsedIcons[MAX_ICONS];
 int parsedCount = 0, currentIconIdx = -1, currentCaseId = 1;
 char loadedCFile[260] = "";
 
+#define MAX_DIMS 32
+Dimension dims[MAX_DIMS];
+int dimCount = 0;
+int dragDimIdx = -1;
+
 Shape currentShape;
-int isDrawing = 0, currentMode = 0; 
+int isDrawing = 0, currentMode = 3; 
 int selectedShape = -1;
 
-/* Hover & Drag State */
 int hoverShape = -1, hoverPt = -1, hoverSegShape = -1, hoverSegPt = -1;
 double hoverProjX = 0, hoverProjY = 0;
 int isDraggingNodes = 0;
-double shapeCx = 0, shapeCy = 0;
 double dragStartX = 0, dragStartY = 0;
-int isDraggingPoint = 0;
-int isPartialSelection = 0;
 
 int ptSelected[MAX_SHAPES][MAX_POINTS];
-int selOrderS[MAX_TOTAL_POINTS], selOrderP[MAX_TOTAL_POINTS], selOrderCount = 0;
+int selOrderS[MAX_POINTS], selOrderP[MAX_POINTS], selOrderCount = 0;
 
 int startX = 0, startY = 0;
 double currentEndX = 0, currentEndY = 0;
 int snapToGrid = 1;
 
-double textCursorX = 0, textCursorY = 0; 
-int textCursorActive = 0;
+double textCursorX = 0, textCursorY = 0; int textCursorActive = 0;
 long font5x3[128] = {0};
 
-/* Palette & Colors */
 COLORREF palette[16] = {
     RGB(0,0,0), RGB(255,255,255), RGB(128,128,128), RGB(192,192,192),
     RGB(255,0,0), RGB(128,0,0), RGB(255,255,0), RGB(128,128,0),
     RGB(0,255,0), RGB(0,128,0), RGB(0,255,255), RGB(0,128,128),
     RGB(0,0,255), RGB(0,0,128), RGB(255,0,255), RGB(128,0,128)
 };
-COLORREF currentFill = RGB(128, 128, 128); 
-int useFill = 1;
-COLORREF currentStroke = RGB(0, 0, 0); 
-int useStroke = 1;
+COLORREF currentFill = RGB(128, 128, 128); int useFill = 1;
+COLORREF currentStroke = RGB(0, 0, 0); int useStroke = 1;
 
-/* Window Handles & Instance */
 HINSTANCE hInst = NULL;
 HWND hMain, hBtn[28], hStatus;
 HWND hScrlSides, hScrlDepth, hScrlIcon;
+HWND hBtnAddIcon, hBtnDelIcon;
 HWND hDistEdit = NULL; 
 FARPROC oldEditProc = NULL;
 FARPROC subclassThunk = NULL;
-int distEditMode = 0; 
+int distEditMode = 0;
 
-/* Parameters */
 int paramSides = 4, paramStar = 100;
 int canvasSize = 320, scaleFactor = 10, clientW = 0, clientH = 0;
-
-/* Reference Image State */
-HBITMAP hRefBmp = NULL;
-int refAlpha = 128;
-double absRefScale = 1.0, absRefPosX = 0.0, absRefPosY = 0.0;
-double absRefStrX = 1.0, absRefStrY = 1.0;
-HWND hTrkAlpha = NULL, hTrkScale = NULL, hTrkPosX = NULL;
-HWND hTrkPosY = NULL, hTrkStrX = NULL, hTrkStrY = NULL;
 
 const char* const bT[28] = {
     "Select/Edit", "Rotate", "Scale", "Polygon", "Line",
     "Polyline", "Shapes", "Text", "Flood Fill", "Undo",
     "Clear", "Delete", "Import SVG", "Open Ref", "Open .C",
     "Save .C", "Export Code", "Merge", "Move Up", "Move Down",
-    "Align Vert", "Align Horz", "Set Dist", "Set Width", "Set Height", "Duplicate",
-    "Add Icon", "Del Icon"
+    "Align Vert", "Align Horz", "Set Dist", "Set Width", "Set Height", "Duplicate", "Set Angle", "Dimension"
 };
 
+char pendingSvgFile[260] = "";
+
 /* --- Utilities & Initialization --- */
+double CLAMP(double v, double minv, double maxv) {
+    if (v < minv) return minv;
+    if (v > maxv) return maxv;
+    return v;
+}
+
+double Snap(double val) { 
+    return snapToGrid ? round(val) : val; 
+}
+
 void InitFont(void) {
     font5x3['A']=0x25755L; font5x3['B']=0x65656L; font5x3['C']=0x34443L; font5x3['D']=0x65556L; 
     font5x3['E']=0x74747L; font5x3['F']=0x74744L; font5x3['G']=0x34553L; font5x3['H']=0x55755L;
@@ -177,7 +191,7 @@ void RedrawCanvas(HWND hwnd) {
 
 void SaveState(void) { 
     int i; Shape* temp;
-    if (!shapes || !history || !history[0]) return;
+    if (!shapes || !history[0]) return;
     
     if (undoIndex >= MAX_UNDO - 1) {
         temp = history[0];
@@ -190,16 +204,17 @@ void SaveState(void) {
     }
     undoIndex++; 
     historyShapeCount[undoIndex] = shapeCount; 
-    if (shapeCount > 0) memcpy(history[undoIndex], shapes, sizeof(Shape) * shapeCount); 
+    memcpy(history[undoIndex], shapes, sizeof(Shape) * shapeCount); 
     UpdateStatusBar(); 
 }
 
 void Undo(HWND hwnd) { 
     if (undoIndex >= 0) { 
         shapeCount = historyShapeCount[undoIndex]; 
-        if (shapeCount > 0) memcpy(shapes, history[undoIndex], sizeof(Shape) * shapeCount); 
+        memcpy(shapes, history[undoIndex], sizeof(Shape) * shapeCount); 
         undoIndex--; 
     } 
+    if (shapeCount == 0) currentMode = 3;
     UpdateStatusBar(); RedrawCanvas(hwnd); 
 }
 
@@ -213,10 +228,8 @@ void ToggleSelection(int s, int p) {
     int i, j;
     if (s < 0 || s >= MAX_SHAPES || p < 0 || p >= MAX_POINTS) return;
     if (!ptSelected[s][p]) { 
-        if (selOrderCount < MAX_TOTAL_POINTS) {
-            ptSelected[s][p] = 1; 
-            selOrderS[selOrderCount] = s; selOrderP[selOrderCount] = p; selOrderCount++; 
-        }
+        ptSelected[s][p] = 1; 
+        selOrderS[selOrderCount] = s; selOrderP[selOrderCount] = p; selOrderCount++; 
     } else {
         ptSelected[s][p] = 0;
         for(i = 0; i < selOrderCount; i++) {
@@ -229,251 +242,137 @@ void ToggleSelection(int s, int p) {
     UpdateStatusBar();
 }
 
-/* --- Icon Navigation --- */
-void SyncCurrentIcon(void) {
+/* --- File I/O & Icon Management --- */
+void CommitCurrentIcon(void) {
     if (currentIconIdx >= 0 && currentIconIdx < parsedCount) {
-        if (parsedIcons[currentIconIdx].shapes) free(parsedIcons[currentIconIdx].shapes);
-        parsedIcons[currentIconIdx].shapes = (Shape*)malloc(MAX_SHAPES * sizeof(Shape));
-        if (shapeCount > 0 && parsedIcons[currentIconIdx].shapes) memcpy(parsedIcons[currentIconIdx].shapes, shapes, sizeof(Shape) * shapeCount);
+        if (parsedIcons[currentIconIdx].shapes) { 
+            GlobalFreePtr(parsedIcons[currentIconIdx].shapes); 
+            parsedIcons[currentIconIdx].shapes = NULL; 
+        }
+        if (shapeCount > 0) {
+            parsedIcons[currentIconIdx].shapes = (Shape*)GlobalAllocPtr(GHND, sizeof(Shape) * shapeCount);
+            if (parsedIcons[currentIconIdx].shapes) memcpy(parsedIcons[currentIconIdx].shapes, shapes, sizeof(Shape) * shapeCount);
+        }
         parsedIcons[currentIconIdx].shapeCount = shapeCount;
     }
 }
 
 void SwitchToIcon(int idx) {
     if (currentIconIdx == idx) return;
-    SyncCurrentIcon();
+    CommitCurrentIcon();
+    
     currentIconIdx = idx;
+    dimCount = 0; dragDimIdx = -1;
+    
     if (idx >= 0 && idx < parsedCount) {
-        currentCaseId = parsedIcons[idx].caseId; 
-        shapeCount = parsedIcons[idx].shapeCount;
-        if (parsedIcons[idx].shapes) memcpy(shapes, parsedIcons[idx].shapes, sizeof(Shape) * shapeCount); 
-        else shapeCount = 0;
+        currentCaseId = parsedIcons[idx].caseId; shapeCount = parsedIcons[idx].shapeCount;
+        if (parsedIcons[idx].shapes) memcpy(shapes, parsedIcons[idx].shapes, sizeof(Shape) * shapeCount); else shapeCount = 0;
     } else shapeCount = 0;
     undoIndex = -1; ClearSelection(); selectedShape = -1;
+    if (shapeCount == 0) currentMode = 3; else currentMode = 0;
     if (hScrlIcon) SetScrollPos(hScrlIcon, SB_CTL, currentIconIdx >= 0 ? currentIconIdx : 0, TRUE);
     UpdateStatusBar(); RedrawCanvas(hMain);
 }
 
-/* --- C File Parser --- */
 void LoadCFile(const char* path, HWND hwnd) {
-    FILE* f; long sz; char *d, *cur, *endBlock, *st, *pt, *sel, *next, *pC, *bracket, *lineEnd;
+    FILE* f; long sz; char *d, *cur, *endBlock, *st, *pt, *lStr, *next, *pC, *bracket;
     int i, cId, tmpCount; double px, py;
-    Shape* tmpShapes; Shape* exact; Shape s;
-    HGLOBAL hMem;
+    Shape* tmpShapes; Shape* exact; 
+    static Shape s; 
 
     f = fopen(path, "rb"); 
     if (!f) return;
     fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
-    if (sz >= 65000) sz = 65000;
     
-    /* CRITICAL FIX: Safe file loading into global heap to prevent DGROUP Near Exhaustion */
-    hMem = GlobalAlloc(GHND, sz + 1);
-    if (!hMem) { fclose(f); return; }
-    d = (char*)GlobalLock(hMem);
+    if (sz > 60000L) { ShowStatus(" Error: File exceeds 60KB limit."); fclose(f); return; }
     
+    d = (char*)GlobalAllocPtr(GHND, (size_t)sz + 1);
     if (d) {
-        fread(d, 1, (size_t)sz, f); d[sz] = 0; fclose(f);
-        
-        for(i=0; i<MAX_ICONS; i++) { 
-            if (parsedIcons[i].shapes) { free(parsedIcons[i].shapes); parsedIcons[i].shapes = NULL; } 
-        }
-        
-        parsedCount = 0; 
-        currentIconIdx = -1; /* CRITICAL FIX: Break double-free chains */
-        cur = d;
+        fread(d, 1, (size_t)sz, f); d[sz] = '\0'; fclose(f);
+        for(i=0; i<MAX_ICONS; i++) { if (parsedIcons[i].shapes) { GlobalFreePtr(parsedIcons[i].shapes); parsedIcons[i].shapes = NULL; } }
+        parsedCount = 0; cur = d;
         
         while ((cur = strstr(cur, "case ")) != NULL && parsedCount < MAX_ICONS) {
-            cId = atoi(cur + 5); 
-            endBlock = strstr(cur, "break;"); 
-            if (!endBlock) endBlock = cur + strlen(cur);
-            
-            tmpShapes = (Shape*)malloc(MAX_SHAPES * sizeof(Shape));
+            cId = atoi(cur + 5); endBlock = strstr(cur, "break;"); 
+            tmpShapes = (Shape*)GlobalAllocPtr(GHND, MAX_SHAPES * sizeof(Shape));
             if (!tmpShapes) break;
+            
             tmpCount = 0;
-            st = cur;
+            st = cur; if (!endBlock) endBlock = cur + strlen(cur);
             
             while (st < endBlock) {
-                pt = strstr(st, "POINT "); 
-                sel = strstr(st, "SelectObject");
-                next = pt ? pt : sel;
-                if (sel && (!next || sel < next)) next = sel;
+                pt = strstr(st, "POINT "); lStr = strstr(st, "L(");
+                next = pt ? pt : lStr;
+                if (lStr && (!next || lStr < next)) next = lStr;
                 if (!next || next >= endBlock) break;
                 
-                if (next == pt) {
-                    memset(&s, 0, sizeof(Shape));
-                    s.type = 0; s.useFill = 1; s.useStroke = 1; 
-                    s.fill = RGB(128,128,128); s.stroke = RGB(0,0,0);
-                    pC = next; 
-                    bracket = strchr(next, '}');
-                    
-                    if (bracket && bracket > endBlock) bracket = NULL;
+                memset(&s, 0, sizeof(Shape));
+                s.useFill = 1; s.useStroke = 1; s.fill = RGB(128,128,128); s.stroke = RGB(0,0,0);
+                
+                {
+                    char* colorSearch = st;
+                    while(colorSearch < next) {
+                        int cr, cg, cb;
+                        if (sscanf(colorSearch, "CreateSolidBrush(RGB(%d,%d,%d))", &cr, &cg, &cb) == 3) { s.fill = RGB(cr, cg, cb); s.useFill = 1; }
+                        if (sscanf(colorSearch, "CreatePen(PS_SOLID, 1, RGB(%d,%d,%d))", &cr, &cg, &cb) == 3) { s.stroke = RGB(cr, cg, cb); s.useStroke = 1; }
+                        colorSearch++;
+                    }
+                }
 
+                if (next == pt) {
+                    s.type = strstr(next, "Polyline(") ? 2 : 0;
+                    pC = next; bracket = strchr(next, '}');
                     while (bracket && (pC = strstr(pC, "PT(")) != NULL && pC < bracket) { 
-                        if (sscanf(pC, "PT(%lf,%lf)", &px, &py) == 2 && s.ptCount < MAX_POINTS) { 
-                            s.ptsX[s.ptCount]=px; 
-                            s.ptsY[s.ptCount]=py; 
-                            s.ptCount++; 
-                        } 
+                        if (sscanf(pC, "PT(%lf,%lf)", &px, &py) == 2 && s.ptCount < MAX_POINTS) { s.ptsX[s.ptCount]=px; s.ptsY[s.ptCount]=py; s.ptCount++; } 
                         pC += 3; 
                     }
-                    
-                    if (s.ptCount > 0) {
-                        lineEnd = bracket ? strchr(bracket, '\n') : strchr(next, '\n');
-                        if (lineEnd && lineEnd < endBlock) {
-                            char* poly = strstr(lineEnd, "Polyline");
-                            char* polycap = strstr(lineEnd, "POLY");
-                            
-                            if (poly && poly > endBlock) poly = NULL;
-                            if (polycap && polycap > endBlock) polycap = NULL;
-                            
-                            if (poly && (!polycap || poly < polycap)) {
-                                s.type = 2; s.useFill = 0;
-                            }
-                        }
-                    }
-                    
                     if (s.ptCount > 0 && tmpCount < MAX_SHAPES) tmpShapes[tmpCount++] = s;
+                } else if (next == lStr) {
+                    s.type = 1; s.ptCount = 2;
+                    if (sscanf(next, "L(%lf,%lf,%lf,%lf)", &s.ptsX[0], &s.ptsY[0], &s.ptsX[1], &s.ptsY[1]) == 4) {
+                        if (tmpCount < MAX_SHAPES) tmpShapes[tmpCount++] = s;
+                    }
                 }
-                st = next + 1;
+                
+                st = strchr(next, ';');
+                if (!st) st = next + 1;
             }
             
             parsedIcons[parsedCount].caseId = cId; 
             if (tmpCount > 0) {
-                exact = (Shape*)malloc(MAX_SHAPES * sizeof(Shape));
-                if (exact) { 
-                    memcpy(exact, tmpShapes, tmpCount * sizeof(Shape)); 
-                    parsedIcons[parsedCount].shapes = exact; 
-                } else {
-                    parsedIcons[parsedCount].shapes = NULL;
-                }
+                exact = (Shape*)GlobalAllocPtr(GHND, tmpCount * sizeof(Shape));
+                if (exact) { memcpy(exact, tmpShapes, tmpCount * sizeof(Shape)); parsedIcons[parsedCount].shapes = exact; }
+                else { parsedIcons[parsedCount].shapes = NULL; }
             } else { parsedIcons[parsedCount].shapes = NULL; }
-            
             parsedIcons[parsedCount].shapeCount = tmpCount; 
-            parsedCount++; 
-            cur = endBlock;
-            free(tmpShapes);
+            
+            parsedCount++; cur = endBlock;
+            GlobalFreePtr(tmpShapes);
         }
-        GlobalUnlock(hMem);
-        GlobalFree(hMem);
-        
+        GlobalFreePtr(d);
         if (parsedCount > 0) { 
             strcpy(loadedCFile, path); 
             SetScrollRange(hScrlIcon, SB_CTL, 0, parsedCount - 1, TRUE); 
+            currentIconIdx = -1; 
             SwitchToIcon(0); 
             ShowStatus(" C Data File Loaded.");
         } else {
-            ShowStatus(" No valid icons found.");
+            parsedCount = 1; currentIconIdx = -1; currentCaseId = 1;
+            parsedIcons[0].caseId = 1; strcpy(parsedIcons[0].name, "New");
+            parsedIcons[0].shapes = NULL; parsedIcons[0].shapeCount = 0;
+            SetScrollRange(hScrlIcon, SB_CTL, 0, 0, TRUE); 
+            SwitchToIcon(0);
+            ShowStatus(" No valid icons found. Reset to default.");
         }
     } else {
-        GlobalUnlock(hMem);
-        GlobalFree(hMem);
-    }
-}
-
-/* --- C Code Generation --- */
-void WriteIconCCode(FILE* f, int caseId, Shape* sArr, int sCnt) {
-    int cF = -2, cS = -2;
-    int i, p;
-
-    fprintf(f, "case %d: {\n", caseId);
-    
-    for (i = 0; i < sCnt; i++) {
-        Shape* s = &sArr[i]; 
-        int wS = s->useStroke ? s->stroke : -1;
-        if (wS != cS) { 
-            if (wS == -1) fprintf(f, "    SelectObject(hdc, GetStockObject(NULL_PEN));\n"); 
-            else { 
-                char colorName[32] = "gray";
-                if (wS == RGB(255,255,255)) strcpy(colorName, "white");
-                else if (wS == RGB(0,0,0)) strcpy(colorName, "black");
-                else if (wS == RGB(128,128,128)) strcpy(colorName, "gray");
-                else if (wS == RGB(192,192,192)) strcpy(colorName, "ltGray");
-                else if (wS == RGB(255,0,0)) strcpy(colorName, "red");
-                else if (wS == RGB(0,128,0)) strcpy(colorName, "green");
-                else if (wS == RGB(0,0,128)) strcpy(colorName, "blue");
-                else if (wS == RGB(255,255,0)) strcpy(colorName, "yellow");
-                else if (wS == RGB(0,255,255)) strcpy(colorName, "cyan");
-                else if (wS == RGB(255,128,0)) strcpy(colorName, "orange");
-                else if (wS == RGB(128,0,128)) strcpy(colorName, "purple");
-                fprintf(f, "    SelectObject(hdc, t->%sPen);\n", colorName); 
-            }
-            cS = wS; 
-        }
-        if (s->type == 0 || s->type == 2) { 
-            int wF = s->useFill ? s->fill : -1; 
-            if (wF != cF) { 
-                if (wF == -1) fprintf(f, "    SelectObject(hdc, GetStockObject(NULL_BRUSH));\n"); 
-                else { 
-                    char colorName[32] = "gray";
-                    if (wF == RGB(255,255,255)) strcpy(colorName, "white");
-                    else if (wF == RGB(0,0,0)) strcpy(colorName, "black");
-                    else if (wF == RGB(128,128,128)) strcpy(colorName, "gray");
-                    else if (wF == RGB(192,192,192)) strcpy(colorName, "ltGray");
-                    else if (wF == RGB(255,0,0)) strcpy(colorName, "red");
-                    else if (wF == RGB(0,128,0)) strcpy(colorName, "green");
-                    else if (wF == RGB(0,0,128)) strcpy(colorName, "blue");
-                    else if (wF == RGB(255,255,0)) strcpy(colorName, "yellow");
-                    else if (wF == RGB(0,255,255)) strcpy(colorName, "cyan");
-                    else if (wF == RGB(255,128,0)) strcpy(colorName, "orange");
-                    else if (wF == RGB(128,0,128)) strcpy(colorName, "purple");
-                    fprintf(f, "    SelectObject(hdc, t->%s);\n", colorName); 
-                }
-                cF = wF; 
-            } 
-        }
-        
-        if (s->type == 0 && s->ptCount > 2) {
-            fprintf(f, "    POINT p%d[] = { ", i);
-            for (p = 0; p < s->ptCount; p++) { 
-                fprintf(f, "PT(%g,%g)%s", s->ptsX[p], s->ptsY[p], p==s->ptCount-1?"":", "); 
-            }
-            fprintf(f, " }; POLY(p%d);\n", i);
-        } else if (s->type == 2 && s->ptCount >= 2) {
-            fprintf(f, "    POINT p%d[] = { ", i);
-            for (p = 0; p < s->ptCount; p++) { 
-                fprintf(f, "PT(%g,%g)%s", s->ptsX[p], s->ptsY[p], p==s->ptCount-1?"":", "); 
-            }
-            fprintf(f, " }; Polyline(hdc, p%d, %d);\n", i, s->ptCount);
-        } else if (s->type == 1 && s->ptCount == 2) {
-            fprintf(f, "    L(%g,%g,%g,%g);\n", s->ptsX[0], s->ptsY[0], s->ptsX[1], s->ptsY[1]);
-        }
-    } 
-    fprintf(f, "    SelectObject(hdc, GetStockObject(BLACK_PEN));\n    SelectObject(hdc, GetStockObject(WHITE_BRUSH));\n    break;\n}\n");
-}
-
-void ToClipboard(HWND hwnd, const char* text) { 
-    if (OpenClipboard(hwnd)) { 
-        EmptyClipboard(); 
-        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, strlen(text)+1); 
-        if (hMem) {
-            memcpy(GlobalLock(hMem), text, strlen(text)+1); 
-            GlobalUnlock(hMem); 
-            SetClipboardData(CF_TEXT, hMem); 
-        }
-        CloseClipboard(); 
-        ShowStatus("Success: GDI Code exported to clipboard!"); 
-    } 
-}
-
-void ExportCode(HWND hwnd) { 
-    FILE* tmp; long sz; char* buf;
-    tmp = fopen("~tmp_ex.c", "w+b");
-    if (tmp) {
-        WriteIconCCode(tmp, currentCaseId, shapes, shapeCount);
-        fseek(tmp, 0, SEEK_END); sz = ftell(tmp); fseek(tmp, 0, SEEK_SET);
-        buf = (char*)malloc((size_t)sz + 1);
-        if (buf) {
-            fread(buf, 1, (size_t)sz, tmp); buf[sz] = 0;
-            ToClipboard(hwnd, buf);
-            free(buf);
-        }
-        fclose(tmp);
-        remove("~tmp_ex.c");
+        fclose(f); ShowStatus(" Error: Could not allocate buffer for file.");
     }
 }
 
 void DoSaveFile(HWND hwnd) {
-    OPENFILENAME ofn; char szFile[260]; FILE* f; int i;
+    static OPENFILENAME ofn; static char szFile[260]; 
+    FILE* f; int i, j, k;
+    
     memset(&ofn, 0, sizeof(ofn)); szFile[0] = '\0';
     ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
     ofn.lpstrFilter = "C Data Files (*.c)\0*.c\0All Files (*.*)\0*.*\0";
@@ -482,239 +381,278 @@ void DoSaveFile(HWND hwnd) {
     ofn.lpstrDefExt = "c";
     
     if (GetSaveFileName(&ofn)) {
+        CommitCurrentIcon();
         f = fopen(szFile, "w");
         if (f) {
-            if (parsedCount == 0) {
-                WriteIconCCode(f, currentCaseId, shapes, shapeCount);
-            } else {
-                SyncCurrentIcon();
-                for (i = 0; i < parsedCount; i++) {
-                    WriteIconCCode(f, parsedIcons[i].caseId, parsedIcons[i].shapes, parsedIcons[i].shapeCount);
+            for (i = 0; i < parsedCount; i++) {
+                fprintf(f, "case %d: {\n", parsedIcons[i].caseId);
+                for (j = 0; j < parsedIcons[i].shapeCount; j++) {
+                    Shape* s;
+                    if (!parsedIcons[i].shapes) continue;
+                    s = &parsedIcons[i].shapes[j];
+                    
+                    if (s->useFill || s->useStroke) {
+                        fprintf(f, "    {\n");
+                        if (s->useFill) fprintf(f, "        HBRUSH hBr = CreateSolidBrush(RGB(%d,%d,%d)); HGDIOBJ oBr = SelectObject(hdc, hBr);\n", (int)(s->fill & 0xFF), (int)((s->fill >> 8) & 0xFF), (int)((s->fill >> 16) & 0xFF));
+                        if (s->useStroke) fprintf(f, "        HPEN hPen = CreatePen(PS_SOLID, 1, RGB(%d,%d,%d)); HGDIOBJ oPen = SelectObject(hdc, hPen);\n", (int)(s->stroke & 0xFF), (int)((s->stroke >> 8) & 0xFF), (int)((s->stroke >> 16) & 0xFF));
+                    }
+
+                    if (s->type == 0 && s->ptCount > 2) {
+                        fprintf(f, "        POINT p%d[] = { ", j);
+                        for (k = 0; k < s->ptCount; k++) fprintf(f, "PT(%g,%g)%s", s->ptsX[k], s->ptsY[k], k == s->ptCount-1 ? "" : ", ");
+                        fprintf(f, " }; POLY(p%d);\n", j);
+                    } else if (s->type == 1 && s->ptCount == 2) {
+                        fprintf(f, "        L(%g,%g,%g,%g);\n", s->ptsX[0], s->ptsY[0], s->ptsX[1], s->ptsY[1]);
+                    } else if (s->type == 2 && s->ptCount >= 2) {
+                        fprintf(f, "        POINT p%d[] = { ", j);
+                        for (k = 0; k < s->ptCount; k++) fprintf(f, "PT(%g,%g)%s", s->ptsX[k], s->ptsY[k], k == s->ptCount-1 ? "" : ", ");
+                        fprintf(f, " }; Polyline(hdc, p%d, %d);\n", j, s->ptCount);
+                    }
+
+                    if (s->useFill || s->useStroke) {
+                        if (s->useFill) fprintf(f, "        SelectObject(hdc, oBr); DeleteObject(hBr);\n");
+                        if (s->useStroke) fprintf(f, "        SelectObject(hdc, oPen); DeleteObject(hPen);\n");
+                        fprintf(f, "    }\n");
+                    }
                 }
+                fprintf(f, "    break;\n}\n");
             }
-            fclose(f); 
-            strcpy(loadedCFile, szFile);
-            ShowStatus(" File saved successfully.");
+            fclose(f); ShowStatus(" File saved successfully.");
         }
     }
 }
 
-/* --- SVG Parser --- */
-double GetAttr(const char* tag, const char* end, const char* attr, double def) { 
-    char* p = strstr((char*)tag, attr); 
-    if (p && p < end) { p += strlen(attr); return atof(p); } 
-    return def; 
+/* --- SVG Logic --- */
+void MatMul(double* A, double* B, double* out) {
+    out[0] = A[0]*B[0] + A[2]*B[1];
+    out[1] = A[1]*B[0] + A[3]*B[1];
+    out[2] = A[0]*B[2] + A[2]*B[3];
+    out[3] = A[1]*B[2] + A[3]*B[3];
+    out[4] = A[0]*B[4] + A[2]*B[5] + A[4];
+    out[5] = A[1]*B[4] + A[3]*B[5] + A[5];
 }
 
-void ParseSVG(const char* path, HWND hwnd) {
-    FILE* f = fopen(path, "rb"); 
-    long sz;
-    char* d;
-    double gTx = 0, gTy = 0;
-    char* gT;
-    double minX=99999, minY=99999, maxX=-99999, maxY=-99999; 
-    Shape* tmp;
-    int tC = 0, i, p; 
-    char* r;
-    HGLOBAL hMem;
+int GetNextSVGFloat(char** pp, double* val) {
+    char* p = *pp;
+    while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',')) p++;
+    if (!*p || *p == '"' || *p == '\'' || *p == ')' || *p == '<' || *p == '>') return 0;
+    if (isalpha(*p) && *p != 'e' && *p != 'E') return 0; 
+    *val = strtod(p, &p);
+    *pp = p;
+    return 1;
+}
 
+void ParseTransform(char* str, double* mat, char limitChar) {
+    char* p = str; double t[6], temp[6]; int i;
+    while (p && *p && *p != limitChar) {
+        if (strncmp(p, "matrix", 6) == 0) {
+            p += 6; while(*p && *p != '(' && *p != limitChar) p++; if(*p=='(') p++;
+            for(i=0; i<6; i++) { if (!GetNextSVGFloat(&p, &t[i])) t[i] = (i==0||i==3)?1:0; }
+            MatMul(mat, t, temp); for(i=0; i<6; i++) mat[i] = temp[i];
+        } else if (strncmp(p, "translate", 9) == 0) {
+            p += 9; while(*p && *p != '(' && *p != limitChar) p++; if(*p=='(') p++;
+            for(i=0; i<6; i++) t[i] = (i==0||i==3)?1:0;
+            GetNextSVGFloat(&p, &t[4]);
+            if (!GetNextSVGFloat(&p, &t[5])) t[5] = 0;
+            MatMul(mat, t, temp); for(i=0; i<6; i++) mat[i] = temp[i];
+        } else if (strncmp(p, "scale", 5) == 0) {
+            p += 5; while(*p && *p != '(' && *p != limitChar) p++; if(*p=='(') p++;
+            for(i=0; i<6; i++) t[i] = (i==0||i==3)?1:0;
+            GetNextSVGFloat(&p, &t[0]);
+            if (!GetNextSVGFloat(&p, &t[3])) t[3] = t[0];
+            MatMul(mat, t, temp); for(i=0; i<6; i++) mat[i] = temp[i];
+        } else {
+            p++;
+        }
+    }
+}
+
+char* Attr(char* tagStr, char* tagEnd, const char* attrName) {
+    char search[32]; char* a; int i;
+    const char* quotes = "\"'";
+    for (i = 0; i < 2; i++) {
+        sprintf(search, " %s=%c", attrName, quotes[i]);
+        a = strstr(tagStr, search); if (a && a < tagEnd) return a + strlen(search);
+        sprintf(search, "\n%s=%c", attrName, quotes[i]);
+        a = strstr(tagStr, search); if (a && a < tagEnd) return a + strlen(search);
+        sprintf(search, "\t%s=%c", attrName, quotes[i]);
+        a = strstr(tagStr, search); if (a && a < tagEnd) return a + strlen(search);
+        sprintf(search, "<%s=%c", attrName, quotes[i]);
+        a = strstr(tagStr, search); if (a && a < tagEnd) return a + strlen(search);
+    }
+    return NULL;
+}
+
+double AttrF(char* tagStr, char* tagEnd, const char* attrName, double defVal) {
+    char* valStr = Attr(tagStr, tagEnd, attrName);
+    if (valStr) return atof(valStr);
+    return defVal;
+}
+
+void GetSVGColors(char* p, char* tagEnd, COLORREF* fill, COLORREF* stroke, int* uF, int* uS, int defFill) {
+    char* a = strstr(p, "fill:#"); int r, g, b;
+    *uF = defFill; *uS = 1; *fill = RGB(128,128,128); *stroke = RGB(0,0,0);
+    
+    if (a && a < tagEnd && sscanf(a+6, "%02x%02x%02x", &r, &g, &b) == 3) { *fill = RGB(r, g, b); *uF = 1; }
+    else if (strstr(p, "fill:none") && strstr(p, "fill:none") < tagEnd) { *uF = 0; }
+    else {
+        a = Attr(p, tagEnd, "fill");
+        if (a && *a == '#' && sscanf(a+1, "%02x%02x%02x", &r, &g, &b) == 3) { *fill = RGB(r, g, b); *uF = 1; }
+        else if (a && strncmp(a, "none", 4) == 0) *uF = 0;
+    }
+    
+    a = strstr(p, "stroke:#");
+    if (a && a < tagEnd && sscanf(a+8, "%02x%02x%02x", &r, &g, &b) == 3) { *stroke = RGB(r, g, b); *uS = 1; }
+    else if (strstr(p, "stroke:none") && strstr(p, "stroke:none") < tagEnd) { *uS = 0; }
+    else {
+        a = Attr(p, tagEnd, "stroke");
+        if (a && *a == '#' && sscanf(a+1, "%02x%02x%02x", &r, &g, &b) == 3) { *stroke = RGB(r, g, b); *uS = 1; }
+        else if (a && strncmp(a, "none", 4) == 0) *uS = 0;
+    }
+}
+
+void LoadSVG(const char* path, HWND hwnd, double customScale) {
+    FILE* f; long sz; char *d, *p, *tagEnd, *transStr, *dStr, *ptsStr; 
+    int i, isPolyline, sp = 0, oldShapeCount; double matStack[10][6], cMat[6]; 
+    static Shape s;
+    double rx, ry, rw, rh, px, py;
+    
+    f = fopen(path, "rb");
     if (!f) return;
-    fseek(f, 0, SEEK_END); 
-    sz = ftell(f); 
-    fseek(f, 0, SEEK_SET); 
-    if (sz >= 65000) sz = 65000;
+    fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz > 60000L || sz <= 0) { fclose(f); return; }
+    d = (char*)GlobalAllocPtr(GHND, (size_t)sz + 1);
+    if (!d) { fclose(f); return; }
+    fread(d, 1, (size_t)sz, f); d[sz] = '\0'; fclose(f);
     
-    hMem = GlobalAlloc(GHND, sz + 1);
-    if (!hMem) { fclose(f); return; }
-    d = (char*)GlobalLock(hMem);
+    for(i=0;i<6;i++) matStack[0][i] = (i==0||i==3)?1:0;
+    SaveState(); p = d; oldShapeCount = shapeCount;
     
-    fread(d, 1, (size_t)sz, f); 
-    d[sz] = 0; 
-    fclose(f);
-    
-    gT = strstr(d, "<g"); 
-    if (gT) { 
-        char* tr = strstr(gT, "translate("); 
-        if (tr && tr < strchr(gT, '>')) sscanf(tr, "translate(%lf,%lf)", &gTx, &gTy); 
-    }
-    
-    tmp = (Shape*)calloc(MAX_SHAPES, sizeof(Shape)); 
-    r = d;
-    
-    while ((r = strpbrk(r, "<")) != NULL && tC < MAX_SHAPES) {
-        char* eT; double a=1,b=0,c=0,D=1,e=0,F=0;
-        char *mat, *fill, *strk;
-        COLORREF fCol=RGB(128,128,128); 
-        int uF=1, uS=0; 
-        COLORREF sCol=RGB(0,0,0); 
-        Shape s;
-
-        if (strncmp(r, "<rect", 5) != 0 && strncmp(r, "<polygon", 8) != 0 && strncmp(r, "<path", 5) != 0) { r++; continue; }
-        eT = strchr(r, '>'); 
-        if (!eT) break;
+    while ((p = strchr(p, '<')) != NULL && shapeCount < MAX_SHAPES) {
+        p++;
+        if (strncmp(p, "/g", 2) == 0) { if (sp > 0) sp--; continue; }
+        tagEnd = strchr(p, '>'); if (!tagEnd) break;
         
-        memset(&s, 0, sizeof(Shape));
-        mat=strstr(r, "matrix("); 
-        if (mat && mat < eT) sscanf(mat, "matrix(%lf,%lf,%lf,%lf,%lf,%lf)", &a,&b,&c,&D,&e,&F);
+        for(i=0;i<6;i++) cMat[i] = matStack[sp][i];
+        transStr = Attr(p, tagEnd, "transform");
+        if (transStr) ParseTransform(transStr, cMat, '"');
         
-        fill = strstr(r, "fill:#"); 
-        if (fill && fill < eT) { 
-            int rC,gC,bC; 
-            sscanf(fill, "fill:#%2x%2x%2x", &rC,&gC,&bC); 
-            fCol=RGB(rC,gC,bC); 
-        } else if (strstr(r, "fill=\"none\"")) uF=0;
-        
-        strk = strstr(r, "stroke:#"); 
-        if (strk && strk < eT) { 
-            int rC,gC,bC; 
-            sscanf(strk, "stroke:#%2x%2x%2x", &rC,&gC,&bC); 
-            sCol=RGB(rC,gC,bC); uS=1; 
-        }
-        
-        s.type = 0; s.fill = fCol; s.useFill = uF; s.stroke = sCol; s.useStroke = uS;
-
-        if (strncmp(r, "<rect", 5) == 0) {
-            double rx=GetAttr(r, eT, "x=\"", 0), ry=GetAttr(r, eT, "y=\"", 0), 
-                   rw=GetAttr(r, eT, "width=\"", 0), rh=GetAttr(r, eT, "height=\"", 0);
-            s.ptsX[0]=rx; s.ptsY[0]=ry; s.ptsX[1]=rx+rw; s.ptsY[1]=ry; 
-            s.ptsX[2]=rx+rw; s.ptsY[2]=ry+rh; s.ptsX[3]=rx; s.ptsY[3]=ry+rh; 
-            s.ptCount = 4;
-        } else if (strncmp(r, "<polygon", 8) == 0 || strncmp(r, "<path", 5) == 0) {
-            char* pts = strstr(r, strncmp(r,"<path",5)==0 ? "d=\"" : "points=\"");
-            if (pts && pts < eT) {
-                pts += (strncmp(r,"<path",5)==0 ? 3 : 8); 
-                double px, py; int n;
-                while (*pts && *pts != '"' && s.ptCount < MAX_POINTS) {
-                    if (isalpha(*pts)) { pts++; continue; }
-                    if (isspace(*pts) || *pts == ',') { pts++; continue; }
-                    if (sscanf(pts, "%lf%n", &px, &n) == 1) {
-                        pts += n; while(*pts == ' ' || *pts == ',') pts++;
-                        if (sscanf(pts, "%lf%n", &py, &n) == 1) { 
-                            s.ptsX[s.ptCount]=px; s.ptsY[s.ptCount]=py; s.ptCount++; pts += n; 
-                        }
-                    } else pts++;
+        if (p[0] == 'g' && (isspace(p[1]) || p[1] == '>')) {
+            if (sp < 9) { sp++; for(i=0;i<6;i++) matStack[sp][i] = cMat[i]; }
+        } else if (strncmp(p, "rect", 4) == 0) {
+            rx = AttrF(p, tagEnd, "x", 0.0); ry = AttrF(p, tagEnd, "y", 0.0);
+            rw = AttrF(p, tagEnd, "width", 0.0); rh = AttrF(p, tagEnd, "height", 0.0);
+            if (rw > 0 && rh > 0) {
+                memset(&s, 0, sizeof(Shape)); s.type = 0; s.ptCount = 4;
+                GetSVGColors(p, tagEnd, &s.fill, &s.stroke, &s.useFill, &s.useStroke, 1);
+                double px0=rx, py0=ry, px1=rx+rw, py1=ry, px2=rx+rw, py2=ry+rh, px3=rx, py3=ry+rh;
+                s.ptsX[0] = (cMat[0]*px0 + cMat[2]*py0 + cMat[4]); s.ptsY[0] = (cMat[1]*px0 + cMat[3]*py0 + cMat[5]);
+                s.ptsX[1] = (cMat[0]*px1 + cMat[2]*py1 + cMat[4]); s.ptsY[1] = (cMat[1]*px1 + cMat[3]*py1 + cMat[5]);
+                s.ptsX[2] = (cMat[0]*px2 + cMat[2]*py2 + cMat[4]); s.ptsY[2] = (cMat[1]*px2 + cMat[3]*py2 + cMat[5]);
+                s.ptsX[3] = (cMat[0]*px3 + cMat[2]*py3 + cMat[4]); s.ptsY[3] = (cMat[1]*px3 + cMat[3]*py3 + cMat[5]);
+                shapes[shapeCount++] = s;
+            }
+        } else if (strncmp(p, "poly", 4) == 0) {
+            isPolyline = (strncmp(p, "polyline", 8) == 0);
+            ptsStr = Attr(p, tagEnd, "points");
+            if (ptsStr) {
+                memset(&s, 0, sizeof(Shape)); s.type = isPolyline ? 2 : 0;
+                GetSVGColors(p, tagEnd, &s.fill, &s.stroke, &s.useFill, &s.useStroke, !isPolyline);
+                while (s.ptCount < MAX_POINTS) {
+                    if (!GetNextSVGFloat(&ptsStr, &px)) break;
+                    if (!GetNextSVGFloat(&ptsStr, &py)) break;
+                    s.ptsX[s.ptCount] = (cMat[0]*px + cMat[2]*py + cMat[4]); s.ptsY[s.ptCount] = (cMat[1]*px + cMat[3]*py + cMat[5]); s.ptCount++;
                 }
+                if (s.ptCount >= 2) shapes[shapeCount++] = s;
+            }
+        } else if (strncmp(p, "path", 4) == 0) {
+            dStr = Attr(p, tagEnd, "d");
+            if (dStr) {
+                memset(&s, 0, sizeof(Shape)); s.type = 0;
+                GetSVGColors(p, tagEnd, &s.fill, &s.stroke, &s.useFill, &s.useStroke, 1);
+                double curX = 0, curY = 0; char cmd = 'M';
+                while (*dStr && *dStr != '"' && s.ptCount < MAX_POINTS) {
+                    while (*dStr && isspace(*dStr)) dStr++;
+                    if (isalpha(*dStr)) { cmd = *dStr; dStr++; }
+                    if (toupper(cmd) == 'Z') break;
+                    
+                    double argX, argY, ctrlX, ctrlY;
+                    if (toupper(cmd) == 'M' || toupper(cmd) == 'L') {
+                        if (!GetNextSVGFloat(&dStr, &argX) || !GetNextSVGFloat(&dStr, &argY)) break;
+                        if (cmd == 'm' || cmd == 'l') { argX += curX; argY += curY; }
+                        curX = argX; curY = argY;
+                        s.ptsX[s.ptCount] = (cMat[0]*curX + cMat[2]*curY + cMat[4]); s.ptsY[s.ptCount] = (cMat[1]*curX + cMat[3]*curY + cMat[5]); s.ptCount++;
+                        if (toupper(cmd) == 'M') cmd = (cmd == 'M') ? 'L' : 'l';
+                    } else if (toupper(cmd) == 'H') {
+                        if (!GetNextSVGFloat(&dStr, &argX)) break;
+                        if (cmd == 'h') argX += curX; curX = argX;
+                        s.ptsX[s.ptCount] = (cMat[0]*curX + cMat[2]*curY + cMat[4]); s.ptsY[s.ptCount] = (cMat[1]*curX + cMat[3]*curY + cMat[5]); s.ptCount++;
+                    } else if (toupper(cmd) == 'V') {
+                        if (!GetNextSVGFloat(&dStr, &argY)) break;
+                        if (cmd == 'v') argY += curY; curY = argY;
+                        s.ptsX[s.ptCount] = (cMat[0]*curX + cMat[2]*curY + cMat[4]); s.ptsY[s.ptCount] = (cMat[1]*curX + cMat[3]*curY + cMat[5]); s.ptCount++;
+                    } else if (toupper(cmd) == 'Q') {
+                        if (!GetNextSVGFloat(&dStr, &ctrlX) || !GetNextSVGFloat(&dStr, &ctrlY) || !GetNextSVGFloat(&dStr, &argX) || !GetNextSVGFloat(&dStr, &argY)) break;
+                        if (cmd == 'q') { ctrlX += curX; ctrlY += curY; argX += curX; argY += curY; }
+                        double t, px_curve, py_curve; int step;
+                        for (step = 1; step <= 4 && s.ptCount < MAX_POINTS; step++) {
+                            t = step / 4.0; px_curve = (1-t)*(1-t)*curX + 2*(1-t)*t*ctrlX + t*t*argX; py_curve = (1-t)*(1-t)*curY + 2*(1-t)*t*ctrlY + t*t*argY;
+                            s.ptsX[s.ptCount] = (cMat[0]*px_curve + cMat[2]*py_curve + cMat[4]); s.ptsY[s.ptCount] = (cMat[1]*px_curve + cMat[3]*py_curve + cMat[5]); s.ptCount++;
+                        }
+                        curX = argX; curY = argY;
+                    } else if (toupper(cmd) == 'C') {
+                        double cx1, cy1, cx2, cy2;
+                        if (!GetNextSVGFloat(&dStr, &cx1) || !GetNextSVGFloat(&dStr, &cy1) || !GetNextSVGFloat(&dStr, &cx2) || !GetNextSVGFloat(&dStr, &cy2) || !GetNextSVGFloat(&dStr, &argX) || !GetNextSVGFloat(&dStr, &argY)) break;
+                        if (cmd == 'c') { cx1+=curX; cy1+=curY; cx2+=curX; cy2+=curY; argX+=curX; argY+=curY; }
+                        double t, px_curve, py_curve; int step;
+                        for (step = 1; step <= 6 && s.ptCount < MAX_POINTS; step++) {
+                            t = step / 6.0; px_curve = (1-t)*(1-t)*(1-t)*curX + 3*(1-t)*(1-t)*t*cx1 + 3*(1-t)*t*t*cx2 + t*t*t*argX; py_curve = (1-t)*(1-t)*(1-t)*curY + 3*(1-t)*(1-t)*t*cy1 + 3*(1-t)*t*t*cy2 + t*t*t*argY;
+                            s.ptsX[s.ptCount] = (cMat[0]*px_curve + cMat[2]*py_curve + cMat[4]); s.ptsY[s.ptCount] = (cMat[1]*px_curve + cMat[3]*py_curve + cMat[5]); s.ptCount++;
+                        }
+                        curX = argX; curY = argY;
+                    } else {
+                        GetNextSVGFloat(&dStr, &argX);
+                    }
+                }
+                if (s.ptCount >= 2) shapes[shapeCount++] = s;
             }
         }
-        
-        for (i=0; i<s.ptCount; i++) {
-            double nx = a*s.ptsX[i] + c*s.ptsY[i] + e + gTx; 
-            double ny = b*s.ptsX[i] + D*s.ptsY[i] + F + gTy;
-            if (nx<minX)minX=nx; if(nx>maxX)maxX=nx; 
-            if (ny<minY)minY=ny; if(ny>maxY)maxY=ny;
-            s.ptsX[i] = nx; s.ptsY[i] = ny;
-        } 
-        if (s.ptCount >= 2 && tC < MAX_SHAPES) tmp[tC++] = s; 
-        r = eT;
-    } 
-    GlobalUnlock(hMem);
-    GlobalFree(hMem);
+    }
+    GlobalFreePtr(d);
     
-    if (tC > 0) {
-        double w = maxX-minX, ht = maxY-minY; 
-        double maxD = (w>ht?w:ht); 
-        double sf, offX, offY;
-        SaveState(); 
-        shapeCount = 0; 
-        if (maxD==0) maxD=1; 
-        sf = (GRID_SIZE-2.0)/maxD; 
-        offX = ((GRID_SIZE-2.0)-(w*sf))/2.0+1.0; 
-        offY = ((GRID_SIZE-2.0)-(ht*sf))/2.0+1.0;
-        
-        for (i=0; i<tC; i++) { 
-            shapes[shapeCount] = tmp[i]; 
-            for (p=0; p<tmp[i].ptCount; p++) { 
-                shapes[shapeCount].ptsX[p] = (tmp[i].ptsX[p]-minX)*sf+offX; 
-                shapes[shapeCount].ptsY[p] = (tmp[i].ptsY[p]-minY)*sf+offY; 
-            } 
-            shapeCount++; 
+    if (shapeCount > oldShapeCount) {
+        double minX = 99999.0, maxX = -99999.0, minY = 99999.0, maxY = -99999.0;
+        int si, pi;
+        double w, h, scale, offsetX, offsetY;
+        for(si = oldShapeCount; si < shapeCount; si++) {
+            for(pi = 0; pi < shapes[si].ptCount; pi++) {
+                minX = fmin(minX, shapes[si].ptsX[pi]); maxX = fmax(maxX, shapes[si].ptsX[pi]);
+                minY = fmin(minY, shapes[si].ptsY[pi]); maxY = fmax(maxY, shapes[si].ptsY[pi]);
+            }
         }
-    } 
-    UpdateStatusBar(); 
-    InvalidateRect(hwnd, NULL, FALSE); 
-    free(tmp);
-}
-
-/* --- Custom Win16 BMP Loader --- */
-HBITMAP LoadDIBitmap16(const char* path, HDC hdc) {
-    FILE* f = fopen(path, "rb");
-    BITMAPFILEHEADER bfh;
-    BITMAPINFOHEADER bih;
-    int colorTableSize;
-    long imageSize;
-    HGLOBAL hData = NULL, hBmi = NULL;
-    char* pData = NULL;
-    BITMAPINFO* pbmi = NULL;
-    HBITMAP hBmp = NULL;
-    long bytesToRead;
-
-    if (!f) return NULL;
-    fread(&bfh, sizeof(BITMAPFILEHEADER), 1, f);
-    if (bfh.bfType != 0x4D42) { fclose(f); return NULL; }
-
-    fread(&bih, sizeof(BITMAPINFOHEADER), 1, f);
-    colorTableSize = 0;
-    if (bih.biBitCount < 16) {
-        colorTableSize = (bih.biClrUsed ? bih.biClrUsed : (1 << bih.biBitCount)) * sizeof(RGBQUAD);
+        w = maxX - minX; h = maxY - minY;
+        
+        if (customScale < 0.0) { 
+            if (w > 0 && h > 0) {
+                scale = fmin((GRID_SIZE * 0.9) / w, (GRID_SIZE * 0.9) / h);
+                offsetX = (GRID_SIZE - w * scale) / 2.0 - minX * scale;
+                offsetY = (GRID_SIZE - h * scale) / 2.0 - minY * scale;
+            } else { scale = 1.0; offsetX = 0; offsetY = 0; }
+        } else {
+            scale = customScale; offsetX = 0; offsetY = 0;
+        }
+        
+        for(si = oldShapeCount; si < shapeCount; si++) {
+            for(pi = 0; pi < shapes[si].ptCount; pi++) {
+                shapes[si].ptsX[pi] = shapes[si].ptsX[pi] * scale + offsetX;
+                shapes[si].ptsY[pi] = shapes[si].ptsY[pi] * scale + offsetY;
+            }
+        }
     }
-
-    imageSize = bfh.bfSize - bfh.bfOffBits;
-    if (imageSize <= 0) imageSize = bih.biSizeImage;
-    if (imageSize <= 0) imageSize = ((((bih.biWidth * bih.biBitCount) + 31) & ~31) / 8) * abs(bih.biHeight);
-    
-    hData = GlobalAlloc(GHND, imageSize);
-    if (!hData) { fclose(f); return NULL; }
-    pData = (char*)GlobalLock(hData);
-
-    fseek(f, bfh.bfOffBits, SEEK_SET);
-    bytesToRead = imageSize;
-    
-    while(bytesToRead > 0) {
-        unsigned int chunk = (bytesToRead > 60000) ? 60000 : (unsigned int)bytesToRead;
-        unsigned int readCount = fread(pData + (imageSize - bytesToRead), 1, chunk, f);
-        if (readCount == 0) break;
-        bytesToRead -= readCount;
-    }
-
-    fseek(f, sizeof(BITMAPFILEHEADER), SEEK_SET);
-    hBmi = GlobalAlloc(GHND, sizeof(BITMAPINFOHEADER) + colorTableSize);
-    if (!hBmi) { GlobalUnlock(hData); GlobalFree(hData); fclose(f); return NULL; }
-    pbmi = (BITMAPINFO*)GlobalLock(hBmi);
-
-    fread(pbmi, 1, sizeof(BITMAPINFOHEADER) + colorTableSize, f);
-    hBmp = CreateDIBitmap(hdc, &pbmi->bmiHeader, CBM_INIT, pData, pbmi, DIB_RGB_COLORS);
-
-    GlobalUnlock(hBmi); GlobalFree(hBmi);
-    GlobalUnlock(hData); GlobalFree(hData);
-    fclose(f);
-    return hBmp;
-}
-
-/* --- Reference Image Loading --- */
-void LoadReferenceImage(const char* path, HWND hwnd) {
-    HDC hdc;
-    if (hRefBmp) { DeleteObject(hRefBmp); hRefBmp = NULL; }
-    
-    hdc = GetDC(hwnd);
-    hRefBmp = LoadDIBitmap16(path, hdc);
-    ReleaseDC(hwnd, hdc);
-    
-    absRefScale = 1.0; absRefPosX = 0.0; absRefPosY = 0.0; 
-    absRefStrX = 1.0; absRefStrY = 1.0; refAlpha = 128;
-    
-    if (hTrkAlpha) SetScrollPos(hTrkAlpha, SB_CTL, 128, TRUE);
-    if (hTrkScale) SetScrollPos(hTrkScale, SB_CTL, 100, TRUE);
-    if (hTrkPosX) SetScrollPos(hTrkPosX, SB_CTL, 100, TRUE);
-    if (hTrkPosY) SetScrollPos(hTrkPosY, SB_CTL, 100, TRUE);
-    if (hTrkStrX) SetScrollPos(hTrkStrX, SB_CTL, 100, TRUE);
-    if (hTrkStrY) SetScrollPos(hTrkStrY, SB_CTL, 100, TRUE);
-    
-    InvalidateRect(hwnd, NULL, TRUE);
+    UpdateStatusBar(); RedrawCanvas(hwnd);
 }
 
 /* --- Math & Geometry --- */
-double Snap(double val) { return snapToGrid ? round(val) : val; }
-
 void PtToSegProj(double px, double py, double x1, double y1, double x2, double y2, double* prX, double* prY, double* dist) {
     double l2 = (x2-x1)*(x2-x1) + (y2-y1)*(y2-y1); 
     double t;
@@ -728,90 +666,114 @@ int PointInPolyShape(double px, double py, Shape* s) {
     int c = 0, n = s->ptCount, i, j;
     if (n < 3) return 0;
     for (i = 0, j = n - 1; i < n; j = i++) {
-        if (((s->ptsY[i] > py) != (s->ptsY[j] > py)) && 
-            (px < (s->ptsX[j] - s->ptsX[i]) * (py - s->ptsY[i]) / (s->ptsY[j] - s->ptsY[i]) + s->ptsX[i])) 
-            c = !c;
+        if (((s->ptsY[i] > py) != (s->ptsY[j] > py))) {
+            double dy = s->ptsY[j] - s->ptsY[i];
+            if (dy != 0) {
+                if (px < (s->ptsX[j] - s->ptsX[i]) * (py - s->ptsY[i]) / dy + s->ptsX[i]) {
+                    c = !c;
+                }
+            }
+        }
     }
     return c;
 }
 
-int IsPointOnPolyEdge(double px, double py, Shape* s) {
-    int i, j; 
-    double x1, y1, x2, y2, l2, t;
-    for(i = 0; i < s->ptCount; i++) {
-        j = (i + 1) % s->ptCount;
-        x1 = s->ptsX[i]; y1 = s->ptsY[i]; x2 = s->ptsX[j]; y2 = s->ptsY[j];
-        l2 = pow(x2-x1, 2) + pow(y2-y1, 2); 
-        if (l2 < 1e-7) continue;
-        if (fabs((px-x1)*(y2-y1) - (py-y1)*(x2-x1)) / sqrt(l2) < 1e-5) {
-            t = ((px-x1)*(x2-x1) + (py-y1)*(y2-y1)) / l2;
-            if (t >= -1e-5 && t <= 1 + 1e-5) return 1;
-        }
-    } 
-    return 0;
-}
-
 void AddEdgesFromShape(Shape* s1, Shape* s2, Edge* pool, int* edgeCount) {
-    int i, j, a, b, nCnt; 
-    double p1x, p1y, p2x, p2y, p3x, p3y, p4x, p4y, d, t, u, px, py, l2, tx, ty, midX, midY;
-    double nx[MAX_POINTS], ny[MAX_POINTS];
+    int i, j, k, n1 = s1->ptCount, n2 = s2->ptCount;
+    double x1, y1, x2, y2, x3, y3, x4, y4;
+    double den, t, u, ix, iy;
     
-    for (i = 0; i < s1->ptCount; i++) {
-        p1x = s1->ptsX[i]; p1y = s1->ptsY[i];
-        p2x = s1->ptsX[(i+1)%s1->ptCount]; p2y = s1->ptsY[(i+1)%s1->ptCount];
-        nCnt = 0; nx[nCnt] = p1x; ny[nCnt++] = p1y;
+    double* cutsX = (double*)GlobalAllocPtr(GHND, MAX_POINTS * sizeof(double));
+    double* cutsY = (double*)GlobalAllocPtr(GHND, MAX_POINTS * sizeof(double));
+    int cutCount = 0;
+
+    if (!cutsX || !cutsY) {
+        if (cutsX) GlobalFreePtr(cutsX);
+        if (cutsY) GlobalFreePtr(cutsY);
+        return;
+    }
+
+    for (i = 0; i < n1; i++) {
+        int next1 = (i + 1) % n1;
+        x1 = s1->ptsX[i]; y1 = s1->ptsY[i];
+        x2 = s1->ptsX[next1]; y2 = s1->ptsY[next1];
         
-        for (j = 0; j < s2->ptCount; j++) {
-            p3x = s2->ptsX[j]; p3y = s2->ptsY[j];
-            p4x = s2->ptsX[(j+1)%s2->ptCount]; p4y = s2->ptsY[(j+1)%s2->ptCount];
-            d = (p1x-p2x)*(p3y-p4y) - (p1y-p2y)*(p3x-p4x);
-            if (fabs(d) > 1e-7) {
-                t = ((p1x-p3x)*(p3y-p4y) - (p1y-p3y)*(p3x-p4x)) / d;
-                u = ((p1x-p3x)*(p1y-p2y) - (p1y-p3y)*(p1x-p2x)) / d;
-                if (t > 1e-5 && t < 1 - 1e-5 && u > 1e-5 && u < 1 - 1e-5) { 
-                    nx[nCnt] = p1x + t*(p2x-p1x); ny[nCnt++] = p1y + t*(p2y-p1y); 
+        cutCount = 0;
+        cutsX[cutCount] = x1; cutsY[cutCount] = y1; cutCount++;
+        cutsX[cutCount] = x2; cutsY[cutCount] = y2; cutCount++;
+
+        for (j = 0; j < n2; j++) {
+            int next2 = (j + 1) % n2;
+            x3 = s2->ptsX[j]; y3 = s2->ptsY[j];
+            x4 = s2->ptsX[next2]; y4 = s2->ptsY[next2];
+
+            den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+            if (fabs(den) > 1e-8) {
+                t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / den;
+                u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / den;
+                if (t > 1e-5 && t < 1 - 1e-5 && u > -1e-5 && u < 1 + 1e-5) {
+                    ix = x1 + t * (x2 - x1);
+                    iy = y1 + t * (y2 - y1);
+                    if (cutCount < MAX_POINTS) {
+                        cutsX[cutCount] = ix; cutsY[cutCount] = iy; cutCount++;
+                    }
                 }
             }
         }
-        
-        for (j = 0; j < s2->ptCount; j++) {
-            px = s2->ptsX[j]; py = s2->ptsY[j];
-            l2 = pow(p2x-p1x, 2) + pow(p2y-p1y, 2);
-            if (l2 > 1e-7 && fabs((px-p1x)*(p2y-p1y) - (py-p1y)*(p2x-p1x)) / sqrt(l2) < 1e-5) {
-                t = ((px-p1x)*(p2x-p1x) + (py-p1y)*(p2y-p1y)) / l2;
-                if (t > 1e-5 && t < 1 - 1e-5) { nx[nCnt] = px; ny[nCnt++] = py; }
+
+        for (j = 0; j < n2; j++) {
+            double ppx = s2->ptsX[j], ppy = s2->ptsY[j];
+            double prX, prY, dist;
+            PtToSegProj(ppx, ppy, x1, y1, x2, y2, &prX, &prY, &dist);
+            if (dist < 1e-4) {
+                double d_total = sqrt((x2-x1)*(x2-x1) + (y2-y1)*(y2-y1));
+                double d1 = sqrt((ppx-x1)*(ppx-x1) + (ppy-y1)*(ppy-y1));
+                double d2 = sqrt((ppx-x2)*(ppx-x2) + (ppy-y2)*(ppy-y2));
+                if (d1 > 1e-4 && d2 > 1e-4 && d1 + d2 < d_total + 1e-4) {
+                    if (cutCount < MAX_POINTS) {
+                        cutsX[cutCount] = ppx; cutsY[cutCount] = ppy; cutCount++;
+                    }
+                }
             }
         }
 
-        nx[nCnt]=p2x; ny[nCnt++]=p2y;
-        for(a=0; a<nCnt-1; a++) { 
-            for(b=a+1; b<nCnt; b++) { 
-                if (pow(nx[b]-p1x,2) + pow(ny[b]-p1y,2) < pow(nx[a]-p1x,2) + pow(ny[a]-p1y,2)) { 
-                    tx = nx[a]; ty = ny[a]; nx[a] = nx[b]; ny[a] = ny[b]; nx[b] = tx; ny[b] = ty; 
-                } 
-            } 
+        for (j = 0; j < cutCount - 1; j++) {
+            for (k = j + 1; k < cutCount; k++) {
+                double d_j = (cutsX[j]-x1)*(cutsX[j]-x1) + (cutsY[j]-y1)*(cutsY[j]-y1);
+                double d_k = (cutsX[k]-x1)*(cutsX[k]-x1) + (cutsY[k]-y1)*(cutsY[k]-y1);
+                if (d_j > d_k) {
+                    double tx_c = cutsX[j]; cutsX[j] = cutsX[k]; cutsX[k] = tx_c;
+                    double ty_c = cutsY[j]; cutsY[j] = cutsY[k]; cutsY[k] = ty_c;
+                }
+            }
         }
-        for(a=0; a<nCnt-1; a++) {
-            if (pow(nx[a]-nx[a+1], 2) + pow(ny[a]-ny[a+1], 2) < 1e-7) continue;
-            midX = (nx[a]+nx[a+1])/2.0; midY = (ny[a]+ny[a+1])/2.0;
-            if (!PointInPolyShape(midX, midY, s2) || IsPointOnPolyEdge(midX, midY, s2)) { 
-                if (*edgeCount < 256) { 
-                    pool[*edgeCount].x1 = nx[a]; pool[*edgeCount].y1 = ny[a]; 
-                    pool[*edgeCount].x2 = nx[a+1]; pool[*edgeCount].y2 = ny[a+1]; 
-                    (*edgeCount)++; 
+
+        for (j = 0; j < cutCount - 1; j++) {
+            double sx1 = cutsX[j], sy1 = cutsY[j];
+            double sx2 = cutsX[j+1], sy2 = cutsY[j+1];
+            if ((sx1 - sx2)*(sx1 - sx2) + (sy1 - sy2)*(sy1 - sy2) > 1e-8) {
+                double midX = (sx1 + sx2) / 2.0;
+                double midY = (sy1 + sy2) / 2.0;
+                if (!PointInPolyShape(midX, midY, s2)) {
+                    if (*edgeCount < 1024) {
+                        pool[*edgeCount].x1 = sx1; pool[*edgeCount].y1 = sy1;
+                        pool[*edgeCount].x2 = sx2; pool[*edgeCount].y2 = sy2;
+                        (*edgeCount)++;
+                    }
                 }
             }
         }
     }
+
+    GlobalFreePtr(cutsX);
+    GlobalFreePtr(cutsY);
 }
 
 void GenShape(double eX, double eY) {
     int i; double cx, cy, rx, ry;
     if (currentMode == 4) {
-        currentShape.ptCount = 2; 
-        currentShape.ptsX[0] = startX; currentShape.ptsY[0] = startY;
-        currentShape.ptsX[1] = eX; currentShape.ptsY[1] = eY; 
-        return;
+        currentShape.ptCount = 2; currentShape.ptsX[0] = startX; currentShape.ptsY[0] = startY;
+        currentShape.ptsX[1] = eX; currentShape.ptsY[1] = eY; return;
     }
     cx = (startX + eX) / 2.0; cy = (startY + eY) / 2.0; 
     rx = fabs(eX - startX) / 2.0; ry = fabs(eY - startY) / 2.0;
@@ -827,13 +789,12 @@ void GenShape(double eX, double eY) {
     for (i = 0; i < paramSides; i++) { 
         double ang = i * (2.0 * PI / paramSides) - (PI / 2.0);
         double rF = (paramSides>4 && paramStar<100 && i%2!=0) ? fmax(0.2, paramStar/100.0) : 1.0; 
-        currentShape.ptsX[i] = cx + cos(ang) * rx * rF; 
-        currentShape.ptsY[i] = cy + sin(ang) * ry * rF; 
+        currentShape.ptsX[i] = cx + cos(ang) * rx * rF; currentShape.ptsY[i] = cy + sin(ang) * ry * rF; 
     }
 }
 
 /* --- Subclassed Edit Control --- */
-LRESULT CALLBACK _export DistEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+LRESULT FAR PASCAL _export DistEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_GETDLGCODE) return DLGC_WANTALLKEYS;
     if (msg == WM_KEYDOWN && wParam == VK_RETURN) {
         SendMessage(GetParent(hwnd), WM_APP + 1, 0, 0L);
@@ -847,148 +808,76 @@ LRESULT CALLBACK _export DistEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 
 /* --- GDI Rendering Functions --- */
 void DrawGrid(HDC dc) {
-    int i; 
-    HPEN hPen = CreatePen(PS_SOLID, 1, RGB(220, 220, 220));
-    HPEN hOldPen = (HPEN)SelectObject(dc, hPen);
+    int i; HPEN hPen = CreatePen(PS_SOLID, 1, RGB(220, 220, 220));
+    HPEN hOldPen = SelectObject(dc, hPen);
     for (i = 0; i <= GRID_SIZE; i++) {
-        MoveTo(dc, 0, i * scaleFactor); 
-        LineTo(dc, canvasSize, i * scaleFactor);
-        MoveTo(dc, i * scaleFactor, 0); 
-        LineTo(dc, i * scaleFactor, canvasSize);
+        MoveTo(dc, 0, i * scaleFactor); LineTo(dc, canvasSize, i * scaleFactor);
+        MoveTo(dc, i * scaleFactor, 0); LineTo(dc, i * scaleFactor, canvasSize);
     }
     SelectObject(dc, hOldPen); DeleteObject(hPen);
 }
 
 void DrawPalette(HDC dc) {
     int i, col, row, cx = canvasSize + 15;
-    HBRUSH hBr, hOldBr, tempBr; 
-    HPEN hPen = (HPEN)GetStockObject(BLACK_PEN); 
-    HPEN hOldPen = (HPEN)SelectObject(dc, hPen);
+    HBRUSH hBr, hOldBr; HPEN hPen = (HPEN)GetStockObject(BLACK_PEN), hOldPen = SelectObject(dc, hPen);
     
     for (i = 0; i < 16; i++) {
         col = i % 8; row = i / 8;
-        hBr = CreateSolidBrush(palette[i]); 
-        hOldBr = (HBRUSH)SelectObject(dc, hBr);
-        Rectangle(dc, cx + col * 32, 356 + row * 16, cx + col * 32 + 32, 356 + row * 16 + 16);
+        hBr = CreateSolidBrush(palette[i]); hOldBr = SelectObject(dc, hBr);
+        Rectangle(dc, cx + col * 32, 382 + row * 16, cx + col * 32 + 32, 382 + row * 16 + 16);
         SelectObject(dc, hOldBr); DeleteObject(hBr);
     }
     
-    tempBr = useFill ? CreateSolidBrush(currentFill) : NULL;
-    hBr = tempBr ? tempBr : (HBRUSH)GetStockObject(NULL_BRUSH);
-    hOldBr = (HBRUSH)SelectObject(dc, hBr); 
-    Rectangle(dc, cx, 396, cx + 32, 428);
-    SelectObject(dc, hOldBr); 
-    if (tempBr) DeleteObject(tempBr); 
+    hBr = useFill ? CreateSolidBrush(currentFill) : (HBRUSH)GetStockObject(NULL_BRUSH);
+    hOldBr = SelectObject(dc, hBr); Rectangle(dc, cx, 422, cx + 32, 454);
+    SelectObject(dc, hOldBr); if (useFill) DeleteObject(hBr);
     
-    tempBr = useStroke ? CreateSolidBrush(currentStroke) : NULL;
-    hBr = tempBr ? tempBr : (HBRUSH)GetStockObject(NULL_BRUSH);
-    hOldBr = (HBRUSH)SelectObject(dc, hBr); 
-    Rectangle(dc, cx + 80, 396, cx + 112, 428);
-    SelectObject(dc, hOldBr); 
-    if (tempBr) DeleteObject(tempBr); 
+    hBr = useStroke ? CreateSolidBrush(currentStroke) : (HBRUSH)GetStockObject(NULL_BRUSH);
+    hOldBr = SelectObject(dc, hBr); Rectangle(dc, cx + 80, 422, cx + 112, 454);
+    SelectObject(dc, hOldBr); if (useStroke) DeleteObject(hBr);
     
-    SelectObject(dc, hOldPen); 
-    SetBkMode(dc, TRANSPARENT);
-    TextOut(dc, cx + 40, 404, "Fill", 4); 
-    TextOut(dc, cx + 120, 404, "Stroke", 6);
-    TextOut(dc, cx, 440, "Sides:", 6); 
-    TextOut(dc, cx, 465, "Depth:", 6);
+    SelectObject(dc, hOldPen); SetBkMode(dc, TRANSPARENT);
+    TextOut(dc, cx + 40, 430, "Fill", 4); TextOut(dc, cx + 120, 430, "Stroke", 6);
+    TextOut(dc, cx, 466, "Sides:", 6); TextOut(dc, cx, 491, "Depth:", 6);
 }
 
 void RenderShapes(HDC dc, Shape* sArr, int sCnt, int sc, int offX, int offY, Shape* activeShape, int isActDrawing) {
     int i, j;
     for (i = 0; i <= sCnt; i++) {
         Shape* s = (i == sCnt) ? (isActDrawing ? activeShape : NULL) : &sArr[i]; 
-        HBRUSH b, tempB; HPEN p, tempP; HGDIOBJ ob, op; 
-        POINT pA[MAX_POINTS];
-        
+        HBRUSH b; HPEN p; HGDIOBJ ob, op; POINT pA[MAX_POINTS];
         if (!s || s->ptCount == 0) continue;
         
-        tempB = s->useFill ? CreateSolidBrush(s->fill) : NULL;
-        tempP = s->useStroke ? CreatePen(PS_SOLID, 1, s->stroke) : NULL;
-        
-        b = tempB ? tempB : (HBRUSH)GetStockObject(NULL_BRUSH);
-        p = tempP ? tempP : (HPEN)GetStockObject(NULL_PEN);
-        
-        ob = SelectObject(dc, b); 
-        op = SelectObject(dc, p);
+        b = s->useFill ? CreateSolidBrush(s->fill) : (HBRUSH)GetStockObject(NULL_BRUSH);
+        p = s->useStroke ? CreatePen(PS_SOLID, 1, s->stroke) : (HPEN)GetStockObject(NULL_PEN);
+        ob = SelectObject(dc, b); op = SelectObject(dc, p);
         
         for(j=0; j<s->ptCount; j++) { 
-            double vx = offX + s->ptsX[j] * sc;
-            double vy = offY + s->ptsY[j] * sc;
-            if (vx < -16000.0) vx = -16000.0; if (vx > 16000.0) vx = 16000.0;
-            if (vy < -16000.0) vy = -16000.0; if (vy > 16000.0) vy = 16000.0;
-            pA[j].x = (int)round(vx); 
-            pA[j].y = (int)round(vy); 
+            pA[j].x = offX + (int)round(s->ptsX[j] * sc); 
+            pA[j].y = offY + (int)round(s->ptsY[j] * sc); 
         }
         
-        if (s->type == 0) { 
-            SetPolyFillMode(dc, ALTERNATE); Polygon(dc, pA, s->ptCount); 
-        } 
+        if (s->type == 0) { SetPolyFillMode(dc, ALTERNATE); Polygon(dc, pA, s->ptCount); } 
         else Polyline(dc, pA, s->ptCount);
         
         SelectObject(dc, ob); SelectObject(dc, op);
-        if (tempB) DeleteObject(tempB); 
-        if (tempP) DeleteObject(tempP);
-    }
-}
-
-void DrawReferenceImage(HDC dc) {
-    int dstW, dstH, dstX, dstY, oldMode;
-    HDC ht;
-    BITMAP bm;
-    HGDIOBJ hOld;
-
-    if (!hRefBmp) return;
-    
-    dstW = (int)(canvasSize * absRefScale * absRefStrX); 
-    dstH = (int)(canvasSize * absRefScale * absRefStrY);
-    dstX = (canvasSize - dstW) / 2 + (int)absRefPosX; 
-    dstY = (canvasSize - dstH) / 2 + (int)absRefPosY;
-    
-    if (dstW > 0 && dstH > 0) {
-        ht = CreateCompatibleDC(dc); 
-        hOld = SelectObject(ht, hRefBmp); 
-        GetObject(hRefBmp, sizeof(bm), &bm);
-        
-        oldMode = SetStretchBltMode(dc, COLORONCOLOR);
-        StretchBlt(dc, dstX, dstY, dstW, dstH, ht, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY); 
-        SetStretchBltMode(dc, oldMode);
-        
-        SelectObject(ht, hOld);
-        DeleteDC(ht); 
+        if (s->useFill) DeleteObject(b); if (s->useStroke) DeleteObject(p);
     }
 }
 
 void DrawPreview(HDC dc) {
-    int cx = canvasSize + 15, px = cx + 220, py = 394; 
+    int cx = canvasSize + 15;
+    int px = cx + 220, py = 420; 
     HBRUSH hBr = (HBRUSH)GetStockObject(WHITE_BRUSH);
     HPEN hPen = (HPEN)GetStockObject(BLACK_PEN);
     HGDIOBJ hOldBr = SelectObject(dc, hBr);
     HGDIOBJ hOldPen = SelectObject(dc, hPen);
     
     Rectangle(dc, px, py, px + 34, py + 34);
-    SelectObject(dc, hOldBr); 
-    SelectObject(dc, hOldPen);
+    SelectObject(dc, hOldBr); SelectObject(dc, hOldPen);
     
-    if (shapes) {
-        HDC previewDC = CreateCompatibleDC(dc);
-        HBITMAP previewBmp = CreateCompatibleBitmap(dc, 34, 34);
-        HGDIOBJ pOld = SelectObject(previewDC, previewBmp);
-        RECT rPrev; rPrev.left = 0; rPrev.top = 0; rPrev.right = 34; rPrev.bottom = 34;
-
-        FillRect(previewDC, &rPrev, (HBRUSH)GetStockObject(WHITE_BRUSH));
-        RenderShapes(previewDC, shapes, shapeCount, 1, 0, 0, NULL, 0);
-        
-        BitBlt(dc, px, py, 34, 34, previewDC, 0, 0, SRCCOPY);
-        
-        SelectObject(previewDC, pOld);
-        DeleteObject(previewBmp);
-        DeleteDC(previewDC);
-    }
-    
-    SetBkMode(dc, TRANSPARENT); 
-    TextOut(dc, px - 60, py + 8, "Preview:", 8);
+    if (shapes) RenderShapes(dc, shapes, shapeCount, 1, px + 1, py + 1, NULL, 0);
+    SetBkMode(dc, TRANSPARENT); TextOut(dc, px - 60, py + 8, "Preview:", 8);
 }
 
 void DrawNodes(HDC dc) {
@@ -1007,13 +896,8 @@ void DrawNodes(HDC dc) {
             
             if (drawNodes) {
                 for (j = 0; j < shapes[i].ptCount; j++) {
-                    double vx = shapes[i].ptsX[j] * scaleFactor;
-                    double vy = shapes[i].ptsY[j] * scaleFactor;
-                    if (vx < -16000.0) vx = -16000.0; if (vx > 16000.0) vx = 16000.0;
-                    if (vy < -16000.0) vy = -16000.0; if (vy > 16000.0) vy = 16000.0;
-                    px = (int)round(vx);
-                    py = (int)round(vy);
-                    
+                    px = (int)round(shapes[i].ptsX[j] * scaleFactor);
+                    py = (int)round(shapes[i].ptsY[j] * scaleFactor);
                     if (ptSelected[i][j]) SelectObject(dc, hSelBr);
                     else if (hoverShape == i && hoverPt == j) SelectObject(dc, hHovBr);
                     else SelectObject(dc, hUnselBr);
@@ -1026,155 +910,347 @@ void DrawNodes(HDC dc) {
             Ellipse(dc, (int)hoverProjX - 4, (int)hoverProjY - 4, (int)hoverProjX + 5, (int)hoverProjY + 5);
         }
     }
-    SelectObject(dc, hOrigBr); 
-    SelectObject(dc, hOrigPen);
-    DeleteObject(hSelBr); DeleteObject(hUnselBr); 
-    DeleteObject(hHovBr); DeleteObject(hEdgeBr);
+    SelectObject(dc, hOrigBr); SelectObject(dc, hOrigPen);
+    DeleteObject(hSelBr); DeleteObject(hUnselBr); DeleteObject(hHovBr); DeleteObject(hEdgeBr);
+}
+
+void DrawDimensions(HDC dc) {
+    int i; 
+    HPEN hPen = CreatePen(PS_SOLID, 1, RGB(0, 128, 255));
+    HBRUSH hBr = CreateSolidBrush(RGB(0, 128, 255));
+    HPEN hHandlePen = CreatePen(PS_SOLID, 1, RGB(100, 100, 100)); 
+    HBRUSH hHandleBr = CreateSolidBrush(RGB(200, 200, 200)); 
+    HFONT hFont = CreateFont(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
+    HGDIOBJ oldPen = SelectObject(dc, hPen);
+    HGDIOBJ oldBr = SelectObject(dc, hBr);
+    HGDIOBJ oldFont = SelectObject(dc, hFont);
+    
+    SetTextColor(dc, RGB(0, 128, 255));
+    SetBkMode(dc, TRANSPARENT);
+
+    for (i = 0; i < dimCount; i++) {
+        double A1x, A1y, A2x, A2y;
+        double D1x, D1y, D2x, D2y;
+        double dx, dy, ang, nx, ny, val;
+        char buf[32];
+        
+        /* Skip rendering if shapes/points were deleted to prevent crashes */
+        if (dims[i].s1 >= shapeCount || dims[i].s2 >= shapeCount || 
+            dims[i].p1 >= shapes[dims[i].s1].ptCount || dims[i].p2 >= shapes[dims[i].s2].ptCount) {
+            continue;
+        }
+
+        /* Dynamically pull coordinates from the connected nodes */
+        A1x = shapes[dims[i].s1].ptsX[dims[i].p1] * scaleFactor;
+        A1y = shapes[dims[i].s1].ptsY[dims[i].p1] * scaleFactor;
+        A2x = shapes[dims[i].s2].ptsX[dims[i].p2] * scaleFactor;
+        A2y = shapes[dims[i].s2].ptsY[dims[i].p2] * scaleFactor;
+        
+        dx = A2x - A1x; dy = A2y - A1y;
+        
+        if (dims[i].mode == 0) { 
+            ang = atan2(dy, dx);
+            nx = -sin(ang); ny = cos(ang);
+            D1x = A1x + nx * dims[i].offset; D1y = A1y + ny * dims[i].offset;
+            D2x = A2x + nx * dims[i].offset; D2y = A2y + ny * dims[i].offset;
+            val = sqrt(pow(shapes[dims[i].s2].ptsX[dims[i].p2] - shapes[dims[i].s1].ptsX[dims[i].p1], 2) + pow(shapes[dims[i].s2].ptsY[dims[i].p2] - shapes[dims[i].s1].ptsY[dims[i].p1], 2));
+        } else if (dims[i].mode == 1) { 
+            D1x = A1x; D1y = A1y + dims[i].offset;
+            D2x = A2x; D2y = A1y + dims[i].offset;
+            val = fabs(shapes[dims[i].s2].ptsX[dims[i].p2] - shapes[dims[i].s1].ptsX[dims[i].p1]);
+        } else { 
+            D1x = A1x + dims[i].offset; D1y = A1y;
+            D2x = A1x + dims[i].offset; D2y = A2y;
+            val = fabs(shapes[dims[i].s2].ptsY[dims[i].p2] - shapes[dims[i].s1].ptsY[dims[i].p1]);
+        }
+        
+        sprintf(buf, "%.2f", val);
+
+        /* Gap and Leader Lines */
+        {
+            double L1dx = D1x - A1x, L1dy = D1y - A1y;
+            double L1len = sqrt(L1dx*L1dx + L1dy*L1dy);
+            if (L1len > 5.0) {
+                MoveTo(dc, (int)(A1x + L1dx/L1len*5.0), (int)(A1y + L1dy/L1len*5.0));
+                LineTo(dc, (int)(D1x + L1dx/L1len*2.0), (int)(D1y + L1dy/L1len*2.0));
+            }
+            double L2dx = D2x - A2x, L2dy = D2y - A2y;
+            double L2len = sqrt(L2dx*L2dx + L2dy*L2dy);
+            if (L2len > 5.0) {
+                MoveTo(dc, (int)(A2x + L2dx/L2len*5.0), (int)(A2y + L2dy/L2len*5.0));
+                LineTo(dc, (int)(D2x + L2dx/L2len*2.0), (int)(D2y + L2dy/L2len*2.0));
+            }
+        }
+
+        /* Dimension Main Line */
+        MoveTo(dc, (int)D1x, (int)D1y); LineTo(dc, (int)D2x, (int)D2y);
+        
+        /* ANSI Arrows */
+        {
+            double dimDx = D2x - D1x, dimDy = D2y - D1y;
+            double dimLen = sqrt(dimDx*dimDx + dimDy*dimDy);
+            if (dimLen > 0) {
+                double dirX = dimDx/dimLen, dirY = dimDy/dimLen;
+                POINT pts[3];
+                pts[0].x = (int)D1x; pts[0].y = (int)D1y;
+                pts[1].x = (int)(D1x + dirX*10 - dirY*3); pts[1].y = (int)(D1y + dirY*10 + dirX*3);
+                pts[2].x = (int)(D1x + dirX*10 + dirY*3); pts[2].y = (int)(D1y + dirY*10 - dirX*3);
+                Polygon(dc, pts, 3);
+                
+                pts[0].x = (int)D2x; pts[0].y = (int)D2y;
+                pts[1].x = (int)(D2x - dirX*10 - dirY*3); pts[1].y = (int)(D2y - dirY*10 + dirX*3);
+                pts[2].x = (int)(D2x - dirX*10 + dirY*3); pts[2].y = (int)(D2y - dirY*10 - dirX*3);
+                Polygon(dc, pts, 3);
+            }
+        }
+
+        /* Text Label and Handle Box */
+        {
+            double midX = D1x + (D2x - D1x) * dims[i].textPos;
+            double midY = D1y + (D2y - D1y) * dims[i].textPos;
+            DWORD ext;
+            int tW, tH, tx, ty, hx, hy;
+            RECT tR;
+            
+            ext = GetTextExtent(dc, buf, strlen(buf));
+            tW = LOWORD(ext);
+            tH = HIWORD(ext);
+            tx = (int)(midX - tW/2.0);
+            ty = (int)(midY - tH/2.0);
+            
+            tR.left = tx - 2;
+            tR.top = ty - 2;
+            tR.right = tx + tW + 2;
+            tR.bottom = ty + tH + 2;
+            
+            /* Text Box Background */
+            FillRect(dc, &tR, (HBRUSH)GetStockObject(WHITE_BRUSH));
+            TextOut(dc, tx, ty, buf, strlen(buf));
+            
+            /* Draggable handle separated to the right of the text */
+            hx = tx + tW + 8;
+            hy = (int)midY;
+            
+            SelectObject(dc, hHandlePen);
+            SelectObject(dc, hHandleBr);
+            Rectangle(dc, hx - 4, hy - 4, hx + 5, hy + 5);
+            
+            /* Restore Dimension Colors */
+            SelectObject(dc, hPen);
+            SelectObject(dc, hBr);
+        }
+    }
+    
+    SelectObject(dc, oldPen); DeleteObject(hPen); DeleteObject(hHandlePen);
+    SelectObject(dc, oldBr); DeleteObject(hBr); DeleteObject(hHandleBr);
+    SelectObject(dc, oldFont); DeleteObject(hFont);
 }
 
 /* --- Main Windows Procedure --- */
-LRESULT CALLBACK _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    static double dragStartX = 0, dragStartY = 0;
+    static double shapeCx = 0, shapeCy = 0;
+    static int dragType = 0;
+    static int isDraggingPoint = 0;
+
     switch (msg) {
         case WM_CREATE: {
-            int i;
-            shapes = (Shape*)malloc(MAX_SHAPES * sizeof(Shape));
-            dragStartSnapshot = (Shape*)malloc(MAX_SHAPES * sizeof(Shape));
-            history = (Shape**)malloc(MAX_UNDO * sizeof(Shape*));
-            for(i=0; i<MAX_UNDO; i++) history[i] = (Shape*)malloc(MAX_SHAPES * sizeof(Shape));
+            int i; int allocFailed = 0;
             
-            if (!shapes || !dragStartSnapshot || !history || !history[0]) {
-                MessageBox(hwnd, "Failed to allocate memory!", "Error", MB_ICONHAND);
+            shapes = (Shape*)GlobalAllocPtr(GHND, MAX_SHAPES * sizeof(Shape));
+            dragStartSnapshot = (Shape*)GlobalAllocPtr(GHND, MAX_SHAPES * sizeof(Shape));
+            for(i=0; i<MAX_UNDO; i++) {
+                history[i] = (Shape*)GlobalAllocPtr(GHND, MAX_SHAPES * sizeof(Shape));
+                if (!history[i]) allocFailed = 1;
+            }
+            
+            if (!shapes || !dragStartSnapshot || allocFailed) {
+                MessageBox(hwnd, "Failed to allocate memory on Far Heap!", "Error", MB_ICONHAND);
                 PostQuitMessage(0); return -1;
             }
 
             InitFont();
+
+            parsedCount = 1;
+            currentIconIdx = -1; 
+            currentCaseId = 1;
+            parsedIcons[0].caseId = 1;
+            strcpy(parsedIcons[0].name, "New");
+            parsedIcons[0].shapes = NULL;
+            parsedIcons[0].shapeCount = 0;
+
             hStatus = CreateWindow("STATIC", " Ready", WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 0, 0, hwnd, (HMENU)100, hInst, NULL);
             hScrlSides = CreateWindow("SCROLLBAR", "", WS_CHILD|WS_VISIBLE|SBS_HORZ, 0,0,1,1, hwnd, (HMENU)153, hInst, NULL);
             hScrlDepth = CreateWindow("SCROLLBAR", "", WS_CHILD|WS_VISIBLE|SBS_HORZ, 0,0,1,1, hwnd, (HMENU)154, hInst, NULL);
-            hScrlIcon  = CreateWindow("SCROLLBAR", "", WS_CHILD|WS_VISIBLE|SBS_HORZ, 0,0,1,1, hwnd, (HMENU)155, hInst, NULL);
             
-            SetScrollRange(hScrlSides, SB_CTL, 3, 32, FALSE); SetScrollPos(hScrlSides, SB_CTL, paramSides, TRUE);
-            SetScrollRange(hScrlDepth, SB_CTL, 10, 100, FALSE); SetScrollPos(hScrlDepth, SB_CTL, paramStar, TRUE);
+            hBtnAddIcon = CreateWindow("BUTTON", "+", WS_CHILD|WS_VISIBLE, 0,0,1,1, hwnd, (HMENU)151, hInst, NULL);
+            hScrlIcon  = CreateWindow("SCROLLBAR", "", WS_CHILD|WS_VISIBLE|SBS_HORZ, 0,0,1,1, hwnd, (HMENU)155, hInst, NULL);
+            hBtnDelIcon = CreateWindow("BUTTON", "-", WS_CHILD|WS_VISIBLE, 0,0,1,1, hwnd, (HMENU)152, hInst, NULL);
+
+            SetScrollRange(hScrlSides, SB_CTL, -5, 5, FALSE); SetScrollPos(hScrlSides, SB_CTL, 0, TRUE);
+            SetScrollRange(hScrlDepth, SB_CTL, -5, 5, FALSE); SetScrollPos(hScrlDepth, SB_CTL, 0, TRUE);
             SetScrollRange(hScrlIcon,  SB_CTL, 0, 0, FALSE); SetScrollPos(hScrlIcon, SB_CTL, 0, TRUE);
             
-            for(i = 0; i < 28; i++) hBtn[i] = CreateWindow("BUTTON", bT[i], WS_CHILD|WS_VISIBLE, 0,0,1,1, hwnd, (HMENU)(200+i), hInst, NULL);
+            SwitchToIcon(0); 
             
+            for(i = 0; i < 28; i++) hBtn[i] = CreateWindow("BUTTON", bT[i], WS_CHILD|WS_VISIBLE, 0,0,1,1, hwnd, (HMENU)(200+i), hInst, NULL);
             hDistEdit = CreateWindow("EDIT", "", WS_CHILD | WS_BORDER | ES_AUTOHSCROLL, 0, 0, 60, 20, hwnd, (HMENU)300, hInst, NULL);
+            
             subclassThunk = MakeProcInstance((FARPROC)DistEditProc, hInst);
             oldEditProc = (FARPROC)SetWindowLong(hDistEdit, GWL_WNDPROC, (LONG)subclassThunk);
-            
-            hTrkAlpha = CreateWindow("SCROLLBAR", "", WS_CHILD|WS_VISIBLE|SBS_HORZ, 0,0,1,1, hwnd, (HMENU)160, hInst, NULL);
-            hTrkScale = CreateWindow("SCROLLBAR", "", WS_CHILD|WS_VISIBLE|SBS_HORZ, 0,0,1,1, hwnd, (HMENU)161, hInst, NULL);
-            hTrkPosX  = CreateWindow("SCROLLBAR", "", WS_CHILD|WS_VISIBLE|SBS_HORZ, 0,0,1,1, hwnd, (HMENU)162, hInst, NULL);
-            hTrkPosY  = CreateWindow("SCROLLBAR", "", WS_CHILD|WS_VISIBLE|SBS_HORZ, 0,0,1,1, hwnd, (HMENU)163, hInst, NULL);
-            hTrkStrX  = CreateWindow("SCROLLBAR", "", WS_CHILD|WS_VISIBLE|SBS_HORZ, 0,0,1,1, hwnd, (HMENU)164, hInst, NULL);
-            hTrkStrY  = CreateWindow("SCROLLBAR", "", WS_CHILD|WS_VISIBLE|SBS_HORZ, 0,0,1,1, hwnd, (HMENU)165, hInst, NULL);
-            SetScrollRange(hTrkAlpha, SB_CTL, 0, 255, FALSE); SetScrollPos(hTrkAlpha, SB_CTL, refAlpha, TRUE);
-            SetScrollRange(hTrkScale, SB_CTL, 10, 190, FALSE); SetScrollPos(hTrkScale, SB_CTL, 100, TRUE);
-            SetScrollRange(hTrkPosX, SB_CTL, 10, 190, FALSE); SetScrollPos(hTrkPosX, SB_CTL, 100, TRUE);
-            SetScrollRange(hTrkPosY, SB_CTL, 10, 190, FALSE); SetScrollPos(hTrkPosY, SB_CTL, 100, TRUE);
-            SetScrollRange(hTrkStrX, SB_CTL, 10, 190, FALSE); SetScrollPos(hTrkStrX, SB_CTL, 100, TRUE);
-            SetScrollRange(hTrkStrY, SB_CTL, 10, 190, FALSE); SetScrollPos(hTrkStrY, SB_CTL, 100, TRUE);
             break;
         }
         case WM_SIZE: {
-            int cx, w, by, i, cw, ch, spaceW, spaceH, imgBottom, trackW;
-            cw = (int)LOWORD(lParam);
-            ch = (int)HIWORD(lParam);
+            int cx, w, by, i, availW, availH;
+            HDWP hdwp;
             
-            if (cw <= 0 || ch <= 0) return 0;
+            if (!hBtn[27] || !hScrlIcon || !hStatus || wParam == SIZE_MINIMIZED) {
+                return DefWindowProc(hwnd, msg, wParam, lParam);
+            }
             
-            spaceW = cw - PANEL_WIDTH;
-            spaceH = ch - 100;
+            clientW = LOWORD(lParam); clientH = HIWORD(lParam); 
+            availW = clientW - PANEL_WIDTH; availH = clientH - 100;
             
-            if (spaceW < 64) spaceW = 64;
-            if (spaceH < 64) spaceH = 64;
+            if (availW < 10) availW = 10;
+            if (availH < 10) availH = 10;
             
-            scaleFactor = (spaceW < spaceH) ? (spaceW / GRID_SIZE) : (spaceH / GRID_SIZE);
+            scaleFactor = (availW < availH) ? (availW / GRID_SIZE) : (availH / GRID_SIZE);
             if (scaleFactor < 1) scaleFactor = 1; 
             canvasSize = scaleFactor * GRID_SIZE;
             
             cx = canvasSize + 15; w = PANEL_WIDTH - 30; by = 10;
-            for(i = 0; i < 28; i++) {
-                MoveWindow(hBtn[i], cx + (i%2)*(w/2 + 2), by + (i/2)*26, (w/2)-4, 24, TRUE); 
+            
+            hdwp = BeginDeferWindowPos(32);
+            if (hdwp) {
+                for(i = 0; i < 28; i++) {
+                    if (hBtn[i]) {
+                        hdwp = DeferWindowPos(hdwp, hBtn[i], NULL, cx + (i%2)*(w/2 + 2), by + (i/2)*26, (w/2)-4, 24, SWP_NOZORDER | SWP_NOACTIVATE);
+                    }
+                }
+                hdwp = DeferWindowPos(hdwp, hScrlSides, NULL, cx + 50, 466, w - 50, 18, SWP_NOZORDER | SWP_NOACTIVATE);
+                hdwp = DeferWindowPos(hdwp, hScrlDepth, NULL, cx + 50, 491, w - 50, 18, SWP_NOZORDER | SWP_NOACTIVATE);
+                hdwp = DeferWindowPos(hdwp, hBtnAddIcon, NULL, cx, 516, 24, 20, SWP_NOZORDER | SWP_NOACTIVATE);
+                hdwp = DeferWindowPos(hdwp, hScrlIcon, NULL, cx + 26, 516, w - 54, 20, SWP_NOZORDER | SWP_NOACTIVATE);
+                hdwp = DeferWindowPos(hdwp, hBtnDelIcon, NULL, cx + w - 26, 516, 24, 20, SWP_NOZORDER | SWP_NOACTIVATE);
+                hdwp = DeferWindowPos(hdwp, hStatus, NULL, 0, clientH - 20, clientW, 20, SWP_NOZORDER | SWP_NOACTIVATE);
+                
+                EndDeferWindowPos(hdwp);
             }
-            MoveWindow(hScrlSides, cx + 50, 440, w - 50, 18, TRUE);
-            MoveWindow(hScrlDepth, cx + 50, 465, w - 50, 18, TRUE);
-            MoveWindow(hStatus, 0, ch - 20, cw, 20, TRUE);
-            
-            imgBottom = canvasSize + 5;
-            trackW = canvasSize / 2 - 45;
-            if (trackW < 10) trackW = 10;
-            
-            MoveWindow(hScrlIcon, 45, imgBottom, canvasSize - 50, 15, TRUE); imgBottom += 18;
-            MoveWindow(hTrkAlpha, 45, imgBottom, trackW, 15, TRUE);
-            MoveWindow(hTrkScale, 45 + canvasSize/2, imgBottom, trackW, 15, TRUE); imgBottom += 18;
-            MoveWindow(hTrkPosX,  45, imgBottom, trackW, 15, TRUE);
-            MoveWindow(hTrkPosY,  45 + canvasSize/2, imgBottom, trackW, 15, TRUE); imgBottom += 18;
-            MoveWindow(hTrkStrX,  45, imgBottom, trackW, 15, TRUE);
-            MoveWindow(hTrkStrY,  45 + canvasSize/2, imgBottom, trackW, 15, TRUE);
             
             InvalidateRect(hwnd, NULL, TRUE);
             break;
         }
         case WM_HSCROLL: {
-            HWND hTrk = (HWND)lParam;
+            HWND hTrk = (HWND)(UINT)HIWORD(lParam);
+            UINT code = wParam;
+            int pos;
+            int p;
+            double minX, maxX, minY, maxY, cx, cy, rx, ry;
+            int sides;
+            
             if (hTrk == hScrlIcon) {
-                int pos = GetScrollPos(hScrlIcon, SB_CTL);
-                switch(LOWORD(wParam)) { 
+                pos = GetScrollPos(hScrlIcon, SB_CTL);
+                switch(code) { 
                     case SB_LINELEFT: pos--; break; 
                     case SB_LINERIGHT: pos++; break; 
                     case SB_PAGELEFT: pos-=10; break; 
                     case SB_PAGERIGHT: pos+=10; break; 
                     case SB_THUMBTRACK: 
-                    case SB_THUMBPOSITION: pos = HIWORD(wParam); break; 
+                    case SB_THUMBPOSITION: pos = LOWORD(lParam); break; 
                 }
                 if (pos < 0) pos = 0; 
                 if (parsedCount > 0 && pos >= parsedCount) pos = parsedCount - 1;
                 SwitchToIcon(pos);
-            } else if (hTrk == hTrkAlpha) {
-                refAlpha = GetScrollPos(hTrkAlpha, SB_CTL);
-                switch(LOWORD(wParam)) { case SB_THUMBTRACK: case SB_THUMBPOSITION: refAlpha = HIWORD(wParam); break; }
-            } else if (hTrk == hTrkScale) {
-                int p = GetScrollPos(hTrkScale, SB_CTL); 
-                switch(LOWORD(wParam)) { case SB_THUMBTRACK: case SB_THUMBPOSITION: p = HIWORD(wParam); break; }
-                absRefScale *= (p / 100.0); 
-            } else if (hTrk == hTrkPosX) {
-                int p = GetScrollPos(hTrkPosX, SB_CTL); 
-                switch(LOWORD(wParam)) { case SB_THUMBTRACK: case SB_THUMBPOSITION: p = HIWORD(wParam); break; }
-                absRefPosX += (p - 100);
-            } else if (hTrk == hTrkPosY) {
-                int p = GetScrollPos(hTrkPosY, SB_CTL); 
-                switch(LOWORD(wParam)) { case SB_THUMBTRACK: case SB_THUMBPOSITION: p = HIWORD(wParam); break; }
-                absRefPosY += (p - 100);
-            } else if (hTrk == hTrkStrX) {
-                int p = GetScrollPos(hTrkStrX, SB_CTL); 
-                switch(LOWORD(wParam)) { case SB_THUMBTRACK: case SB_THUMBPOSITION: p = HIWORD(wParam); break; }
-                absRefStrX *= (p / 100.0);
-            } else if (hTrk == hTrkStrY) {
-                int p = GetScrollPos(hTrkStrY, SB_CTL); 
-                switch(LOWORD(wParam)) { case SB_THUMBTRACK: case SB_THUMBPOSITION: p = HIWORD(wParam); break; }
-                absRefStrY *= (p / 100.0);
             }
-            if (hTrk == hTrkAlpha || hTrk == hTrkScale || hTrk == hTrkPosX || hTrk == hTrkPosY || hTrk == hTrkStrX || hTrk == hTrkStrY) {
-                SetScrollPos(hTrkAlpha, SB_CTL, refAlpha, TRUE);
-                SetScrollPos(hTrkScale, SB_CTL, 100, TRUE);
-                SetScrollPos(hTrkPosX, SB_CTL, 100, TRUE);
-                SetScrollPos(hTrkPosY, SB_CTL, 100, TRUE);
-                SetScrollPos(hTrkStrX, SB_CTL, 100, TRUE);
-                SetScrollPos(hTrkStrY, SB_CTL, 100, TRUE);
-                InvalidateRect(hMain, NULL, TRUE);
+            else if (hTrk == hScrlSides || hTrk == hScrlDepth) {
+                pos = GetScrollPos(hTrk, SB_CTL);
+                if (code == SB_THUMBTRACK || code == SB_THUMBPOSITION) {
+                    pos = (int)(short)LOWORD(lParam);
+                } else if (code == SB_LINELEFT) {
+                    pos = -1;
+                } else if (code == SB_LINERIGHT) {
+                    pos = 1;
+                } else if (code == SB_PAGELEFT) {
+                    pos = -3;
+                } else if (code == SB_PAGERIGHT) {
+                    pos = 3;
+                } else {
+                    pos = 0;
+                }
+
+                if (pos != 0) {
+                    if (hTrk == hScrlSides) {
+                        paramSides += pos;
+                        if (paramSides < 3) paramSides = 3;
+                        if (paramSides > 32) paramSides = 32;
+
+                        if (selectedShape != -1 && shapes[selectedShape].type == 0) {
+                            SaveState();
+                            minX = 9999; maxX = -9999; minY = 9999; maxY = -9999;
+                            for (p = 0; p < shapes[selectedShape].ptCount; p++) {
+                                minX = fmin(minX, shapes[selectedShape].ptsX[p]);
+                                maxX = fmax(maxX, shapes[selectedShape].ptsX[p]);
+                                minY = fmin(minY, shapes[selectedShape].ptsY[p]);
+                                maxY = fmax(maxY, shapes[selectedShape].ptsY[p]);
+                            }
+                            cx = (minX + maxX) / 2.0;
+                            cy = (minY + maxY) / 2.0;
+                            rx = (maxX - minX) / 2.0; if (rx < 1) rx = 1;
+                            ry = (maxY - minY) / 2.0; if (ry < 1) ry = 1;
+
+                            shapes[selectedShape].ptCount = paramSides;
+                            for (p = 0; p < paramSides; p++) {
+                                double ang = p * (2.0 * PI / paramSides) - (PI / 2.0);
+                                double rF = (paramSides > 4 && paramStar < 100 && p % 2 != 0) ? fmax(0.2, paramStar / 100.0) : 1.0;
+                                shapes[selectedShape].ptsX[p] = cx + cos(ang) * rx * rF;
+                                shapes[selectedShape].ptsY[p] = cy + sin(ang) * ry * rF;
+                            }
+                            RedrawCanvas(hwnd);
+                        }
+                    } else if (hTrk == hScrlDepth) {
+                        paramStar += pos * 5;
+                        if (paramStar < 10) paramStar = 10;
+                        if (paramStar > 100) paramStar = 100;
+
+                        if (selectedShape != -1 && shapes[selectedShape].type == 0) {
+                            SaveState();
+                            minX = 9999; maxX = -9999; minY = 9999; maxY = -9999;
+                            for (p = 0; p < shapes[selectedShape].ptCount; p++) {
+                                minX = fmin(minX, shapes[selectedShape].ptsX[p]);
+                                maxX = fmax(maxX, shapes[selectedShape].ptsX[p]);
+                                minY = fmin(minY, shapes[selectedShape].ptsY[p]);
+                                maxY = fmax(maxY, shapes[selectedShape].ptsY[p]);
+                            }
+                            cx = (minX + maxX) / 2.0;
+                            cy = (minY + maxY) / 2.0;
+                            rx = (maxX - minX) / 2.0; if (rx < 1) rx = 1;
+                            ry = (maxY - minY) / 2.0; if (ry < 1) ry = 1;
+                            sides = shapes[selectedShape].ptCount;
+
+                            for (p = 0; p < sides; p++) {
+                                double ang = p * (2.0 * PI / sides) - (PI / 2.0);
+                                double rF = (sides > 4 && paramStar < 100 && p % 2 != 0) ? fmax(0.2, paramStar / 100.0) : 1.0;
+                                shapes[selectedShape].ptsX[p] = cx + cos(ang) * rx * rF;
+                                shapes[selectedShape].ptsY[p] = cy + sin(ang) * ry * rF;
+                            }
+                            RedrawCanvas(hwnd);
+                        }
+                    }
+                    SetScrollPos(hTrk, SB_CTL, 0, TRUE);
+                    UpdateStatusBar();
+                }
             }
             break;
         }
         case WM_CHAR: {
             if (currentMode == 7 && textCursorActive) {
-                unsigned char c = (unsigned char)toupper((int)wParam);
+                char c = toupper((char)wParam); 
                 int r, c_idx, bit, start_c, glyph;
-                Shape s;
+                static Shape s;
+                
                 if (c == 13) { textCursorY += 6; textCursorX = startX; } 
                 else if (c == 8) { textCursorX = fmax(0, textCursorX - 4); } 
-                else if (c < 128 && (font5x3[c] || c == ' ')) {
+                else if (font5x3[c] || c == ' ') {
                     if (c != ' ') {
                         SaveState(); glyph = font5x3[c];
                         for(r=0; r<5; r++) { 
@@ -1185,14 +1261,12 @@ LRESULT CALLBACK _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                                 else if (!bit && start_c != -1) {
                                     memset(&s, 0, sizeof(Shape));
                                     s.type = 0; s.ptCount = 4;
-                                    s.fill = currentFill; s.stroke = currentStroke; 
-                                    s.useFill = useFill; s.useStroke = useStroke;
+                                    s.fill = currentFill; s.stroke = currentStroke; s.useFill = useFill; s.useStroke = useStroke;
                                     s.ptsX[0] = textCursorX + start_c; s.ptsY[0] = textCursorY + r; 
                                     s.ptsX[1] = textCursorX + c_idx; s.ptsY[1] = textCursorY + r;
                                     s.ptsX[2] = textCursorX + c_idx; s.ptsY[2] = textCursorY + r + 1; 
                                     s.ptsX[3] = textCursorX + start_c; s.ptsY[3] = textCursorY + r + 1;
-                                    if(shapeCount < MAX_SHAPES) shapes[shapeCount++] = s; 
-                                    start_c = -1;
+                                    if(shapeCount < MAX_SHAPES) shapes[shapeCount++] = s; start_c = -1;
                                 }
                             }
                         }
@@ -1206,26 +1280,22 @@ LRESULT CALLBACK _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             int i, j, k;
             if (wParam == 'Z' && (GetKeyState(VK_CONTROL) & 0x8000)) { Undo(hwnd); return 0; }
             if (wParam == VK_ESCAPE) { 
-                if (distEditMode != 0 && IsWindowVisible(hDistEdit)) { 
-                    ShowWindow(hDistEdit, SW_HIDE); distEditMode = 0; RedrawCanvas(hwnd); return 0; 
-                }
+                if (distEditMode != 0 && IsWindowVisible(hDistEdit)) { ShowWindow(hDistEdit, SW_HIDE); distEditMode = 0; RedrawCanvas(hwnd); return 0; }
                 if (isDrawing) { isDrawing = 0; currentShape.ptCount = 0; }
-                if (shapeCount > 0) currentMode = 0; 
-                ClearSelection(); RedrawCanvas(hwnd); return 0;
+                if (shapeCount > 0) currentMode = 0; else currentMode = 3; 
+                ClearSelection(); RedrawCanvas(hwnd); 
+                return 0;
             }
             if (wParam == VK_RETURN) {
                 if (currentMode == 0 && selOrderCount == 2) { SendMessage(hwnd, WM_COMMAND, 222, 0); return 0; } 
-                if (isDrawing && (currentMode == 3 || currentMode == 5) && currentShape.ptCount >= 2) { 
-                    SaveState(); shapes[shapeCount++] = currentShape; 
-                    isDrawing = 0; currentShape.ptCount = 0; 
-                    selectedShape = shapeCount - 1; currentMode = 0; 
-                    UpdateStatusBar(); RedrawCanvas(hwnd); return 0;
+                if (isDrawing && (currentMode >= 3 && currentMode <= 5) && currentShape.ptCount >= 2) { 
+                    SaveState(); shapes[shapeCount++] = currentShape; isDrawing = 0; currentShape.ptCount = 0; selectedShape = shapeCount - 1; currentMode = (shapeCount == 0) ? 3 : 0; UpdateStatusBar(); RedrawCanvas(hwnd); 
+                    return 0;
                 }
             }
             if (wParam == VK_DELETE || wParam == VK_BACK) {
                 if (isDrawing && currentShape.ptCount > 0) { 
-                    currentShape.ptCount--; if (currentShape.ptCount == 0) isDrawing = 0; 
-                    RedrawCanvas(hwnd); 
+                    currentShape.ptCount--; if (currentShape.ptCount == 0) isDrawing = 0; RedrawCanvas(hwnd); 
                 }
                 else if (currentMode == 0 || currentMode == 1 || currentMode == 2) {
                     if (selOrderCount > 0) {
@@ -1233,10 +1303,7 @@ LRESULT CALLBACK _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                         for (i = shapeCount - 1; i >= 0; i--) {
                             for (k = shapes[i].ptCount - 1; k >= 0; k--) {
                                 if (ptSelected[i][k]) {
-                                    for(j = k; j < shapes[i].ptCount - 1; j++) { 
-                                        shapes[i].ptsX[j] = shapes[i].ptsX[j+1]; 
-                                        shapes[i].ptsY[j] = shapes[i].ptsY[j+1]; 
-                                    }
+                                    for(j = k; j < shapes[i].ptCount - 1; j++) { shapes[i].ptsX[j] = shapes[i].ptsX[j+1]; shapes[i].ptsY[j] = shapes[i].ptsY[j+1]; }
                                     shapes[i].ptCount--;
                                 }
                             }
@@ -1245,187 +1312,352 @@ LRESULT CALLBACK _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                                 shapeCount--; 
                             }
                         }
-                        ClearSelection(); selectedShape = -1; UpdateStatusBar(); RedrawCanvas(hwnd);
+                        ClearSelection(); selectedShape = -1; 
+                        if (shapeCount == 0) currentMode = 3;
+                        UpdateStatusBar(); RedrawCanvas(hwnd);
                     }
                 }
             }
             break;
         }
         case WM_LBUTTONDOWN: {
-            int x = LOWORD(lParam), y = HIWORD(lParam), cx = canvasSize + 15, shiftDown, ctrlDown, origCount, i, j, k;
+            int shiftDown, ctrlDown, pSelCount, origCount, i, j, k, hitS, hitP, sHasSel, allSel, isPartialSelection;
             double gx, gy, minX, maxX, minY, maxY;
-            int clickShape = -1, clickPt = -1, clickSegShape = -1, clickSegPt = -1, clickBody = -1;
-            double bestDist = 9999.0;
+            int hitDimDrag = -1, hitDimCycle = -1;
+            int x = (int)(short)LOWORD(lParam); 
+            int y = (int)(short)HIWORD(lParam);
+            int cx = canvasSize + 15;
             
-            if (x >= cx && x < cx + 256 && y >= 356 && y < 388) {
-                int index = ((y - 356) / 16) * 8 + (x - cx) / 32;
-                if (index >= 0 && index < 16) {
-                    currentFill = palette[index]; useFill = 1;
-                    if (selectedShape != -1) { 
-                        SaveState(); shapes[selectedShape].fill = currentFill; shapes[selectedShape].useFill = 1; 
-                    }
-                    InvalidateRect(hwnd, NULL, TRUE); return 0;
-                }
-            }
-            SetFocus(hwnd); SetCapture(hwnd);
-            startX = Snap(x / (double)scaleFactor); startY = Snap(y / (double)scaleFactor);
-            gx = startX; gy = startY;
+            isPartialSelection = 0;
 
-            if (currentMode == 7) { textCursorX = gx; textCursorY = gy; textCursorActive = 1; InvalidateRect(hwnd, NULL, FALSE); return 0; }
-            
-            if (currentMode == 8) {
-                for (i = shapeCount - 1; i >= 0; i--) {
-                    if (PointInPolyShape(gx, gy, &shapes[i]) || IsPointOnPolyEdge(gx, gy, &shapes[i])) { clickBody = i; break; }
+            if (x >= cx && x < cx + 256 && y >= 382 && y < 414) {
+                int index = ((y - 382) / 16) * 8 + (x - cx) / 32;
+                currentFill = palette[index]; useFill = 1;
+                if (selectedShape != -1) { SaveState(); shapes[selectedShape].fill = currentFill; shapes[selectedShape].useFill = 1; }
+                InvalidateRect(hwnd, NULL, TRUE); return 0;
+            }
+
+            if (dimCount > 0) {
+                HDC hdc = GetDC(hwnd);
+                HFONT hFont = CreateFont(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
+                HGDIOBJ oldFont = SelectObject(hdc, hFont);
+
+                for (i = 0; i < dimCount; i++) {
+                    double A1x, A1y, A2x, A2y, D1x, D1y, D2x, D2y;
+                    double midX, midY, val;
+                    char buf[32];
+                    DWORD ext;
+                    int tW, tH, tx, ty, hx, hy;
+                    
+                    if (dims[i].s1 >= shapeCount || dims[i].s2 >= shapeCount || 
+                        dims[i].p1 >= shapes[dims[i].s1].ptCount || dims[i].p2 >= shapes[dims[i].s2].ptCount) continue;
+
+                    A1x = shapes[dims[i].s1].ptsX[dims[i].p1] * scaleFactor;
+                    A1y = shapes[dims[i].s1].ptsY[dims[i].p1] * scaleFactor;
+                    A2x = shapes[dims[i].s2].ptsX[dims[i].p2] * scaleFactor;
+                    A2y = shapes[dims[i].s2].ptsY[dims[i].p2] * scaleFactor;
+                    
+                    if (dims[i].mode == 0) {
+                        double dX = A2x - A1x, dY = A2y - A1y;
+                        double ang = atan2(dY, dX);
+                        double nX = -sin(ang), nY = cos(ang);
+                        D1x = A1x + nX * dims[i].offset; D1y = A1y + nY * dims[i].offset;
+                        D2x = A2x + nX * dims[i].offset; D2y = A2y + nY * dims[i].offset;
+                        val = sqrt(pow(shapes[dims[i].s2].ptsX[dims[i].p2] - shapes[dims[i].s1].ptsX[dims[i].p1], 2) + pow(shapes[dims[i].s2].ptsY[dims[i].p2] - shapes[dims[i].s1].ptsY[dims[i].p1], 2));
+                    } else if (dims[i].mode == 1) {
+                        D1x = A1x; D1y = A1y + dims[i].offset;
+                        D2x = A2x; D2y = A1y + dims[i].offset;
+                        val = fabs(shapes[dims[i].s2].ptsX[dims[i].p2] - shapes[dims[i].s1].ptsX[dims[i].p1]);
+                    } else {
+                        D1x = A1x + dims[i].offset; D1y = A1y;
+                        D2x = A1x + dims[i].offset; D2y = A2y;
+                        val = fabs(shapes[dims[i].s2].ptsY[dims[i].p2] - shapes[dims[i].s1].ptsY[dims[i].p1]);
+                    }
+                    
+                    midX = D1x + (D2x - D1x) * dims[i].textPos;
+                    midY = D1y + (D2y - D1y) * dims[i].textPos;
+                    
+                    sprintf(buf, "%.2f", val);
+                    ext = GetTextExtent(hdc, buf, strlen(buf));
+                    tW = LOWORD(ext);
+                    tH = HIWORD(ext);
+                    tx = (int)(midX - tW/2.0);
+                    ty = (int)(midY - tH/2.0);
+                    hx = tx + tW + 8;
+                    hy = (int)midY;
+                    
+                    if (x >= tx - 2 && x <= tx + tW + 2 && y >= ty - 2 && y <= ty + tH + 2) { hitDimDrag = i; break; }
+                    if (x >= hx - 4 && x <= hx + 5 && y >= hy - 4 && y <= hy + 5) { hitDimCycle = i; break; }
                 }
-                if (clickBody != -1) { SaveState(); shapes[clickBody].fill = currentFill; shapes[clickBody].useFill = 1; RedrawCanvas(hwnd); }
+
+                SelectObject(hdc, oldFont);
+                DeleteObject(hFont);
+                ReleaseDC(hwnd, hdc);
+            }
+
+            if (hitDimDrag != -1) {
+                dragDimIdx = hitDimDrag;
+                SetFocus(hwnd); SetCapture(hwnd);
+                return 0;
+            } else if (hitDimCycle != -1) {
+                dims[hitDimCycle].mode = (dims[hitDimCycle].mode + 1) % 3;
+                RedrawCanvas(hwnd);
                 return 0;
             }
+
+            SetFocus(hwnd); SetCapture(hwnd);
             
+            startX = CLAMP(Snap(x / (double)scaleFactor), 0, GRID_SIZE); 
+            startY = CLAMP(Snap(y / (double)scaleFactor), 0, GRID_SIZE);
+            gx = startX; gy = startY;
+
+            if (currentMode == 7) { 
+                textCursorX = gx; textCursorY = gy; textCursorActive = 1; InvalidateRect(hwnd, NULL, FALSE); return 0;
+            }
+            
+            if (currentMode == 8) { 
+                int fillHit = -1;
+                double exactX = x / (double)scaleFactor;
+                double exactY = y / (double)scaleFactor;
+                for (i = shapeCount - 1; i >= 0; i--) {
+                    if (shapes[i].type == 0 && PointInPolyShape(exactX, exactY, &shapes[i])) {
+                        fillHit = i;
+                        break;
+                    }
+                }
+                if (fillHit != -1) {
+                    SaveState();
+                    shapes[fillHit].fill = currentFill;
+                    shapes[fillHit].useFill = 1;
+                    selectedShape = fillHit;
+                    UpdateStatusBar();
+                    RedrawCanvas(hwnd);
+                }
+                ReleaseCapture();
+                return 0;
+            }
+
             if (currentMode == 0 || currentMode == 1 || currentMode == 2) { 
-                shiftDown = (GetKeyState(VK_SHIFT) & 0x8000); ctrlDown  = (GetKeyState(VK_CONTROL) & 0x8000);
+                shiftDown = (GetKeyState(VK_SHIFT) & 0x8000);
+                ctrlDown  = (GetKeyState(VK_CONTROL) & 0x8000);
+                hitS = -1; hitP = -1; sHasSel = 0; allSel = 1;
                 
                 for (i = shapeCount - 1; i >= 0; i--) {
                     for (j = 0; j < shapes[i].ptCount; j++) {
-                        double d = sqrt(pow(shapes[i].ptsX[j]*scaleFactor - x, 2) + pow(shapes[i].ptsY[j]*scaleFactor - y, 2));
-                        if (d < 15.0 && d < bestDist) { clickShape = i; clickPt = j; bestDist = d; }
+                        int px = (int)round(shapes[i].ptsX[j] * scaleFactor);
+                        int py = (int)round(shapes[i].ptsY[j] * scaleFactor);
+                        if (sqrt(pow(px - x, 2) + pow(py - y, 2)) <= 8.0) { hitS = i; hitP = j; break; }
+                    }
+                    if (hitS != -1) break;
+                }
+
+                if (hitS == -1) {
+                    for (i = shapeCount - 1; i >= 0; i--) {
+                        if (shapes[i].type == 0 && PointInPolyShape(gx, gy, &shapes[i])) { hitS = i; break; }
                     }
                 }
-                if (clickPt == -1) {
-                    bestDist = 9999.0;
+
+                if (hitS == -1) {
                     for (i = shapeCount - 1; i >= 0; i--) {
+                        minX = 9999; maxX = -9999; minY = 9999; maxY = -9999;
+                        for (j = 0; j < shapes[i].ptCount; j++) {
+                            minX = fmin(minX, shapes[i].ptsX[j]); maxX = fmax(maxX, shapes[i].ptsX[j]);
+                            minY = fmin(minY, shapes[i].ptsY[j]); maxY = fmax(maxY, shapes[i].ptsY[j]);
+                        }
+                        if (gx >= minX && gx <= maxX && gy >= minY && gy <= maxY) { hitS = i; break; }
+                    }
+                }
+
+                if (hitS == -1 && shiftDown && (currentMode == 0 || currentMode == 1 || currentMode == 2)) {
+                    double bestDist = 9999.0;
+                    int insertShape = -1, insertPt = -1;
+                    double insertX = 0, insertY = 0;
+                    for (i = 0; i < shapeCount; i++) {
                         if (shapes[i].ptCount >= MAX_POINTS) continue;
                         for (j = 0; j < (shapes[i].type == 0 ? shapes[i].ptCount : shapes[i].ptCount - 1); j++) {
-                            int np = (j + 1) % shapes[i].ptCount; double prX, prY, d;
-                            PtToSegProj((double)x, (double)y, shapes[i].ptsX[j]*scaleFactor, shapes[i].ptsY[j]*scaleFactor, shapes[i].ptsX[np]*scaleFactor, shapes[i].ptsY[np]*scaleFactor, &prX, &prY, &d);
-                            if (d < 10.0 && d < bestDist) { clickSegShape = i; clickSegPt = j; hoverProjX = prX; hoverProjY = prY; bestDist = d; }
+                            int nj = (j + 1) % shapes[i].ptCount;
+                            double prX, prY, d;
+                            PtToSegProj(gx, gy, shapes[i].ptsX[j], shapes[i].ptsY[j], shapes[i].ptsX[nj], shapes[i].ptsY[nj], &prX, &prY, &d);
+                            if (d < (10.0 / scaleFactor) && d < bestDist) {
+                                bestDist = d; insertShape = i; insertPt = j; insertX = prX; insertY = prY;
+                            }
                         }
                     }
-                }
-                if (clickPt == -1 && clickSegShape == -1) {
-                    for (i = shapeCount - 1; i >= 0; i--) {
-                        if (PointInPolyShape(gx, gy, &shapes[i]) || IsPointOnPolyEdge(gx, gy, &shapes[i])) { clickBody = i; break; }
+                    if (insertShape != -1) {
+                        int idx;
+                        SaveState();
+                        idx = insertPt + 1;
+                        for (k = shapes[insertShape].ptCount; k > idx; k--) {
+                            shapes[insertShape].ptsX[k] = shapes[insertShape].ptsX[k-1];
+                            shapes[insertShape].ptsY[k] = shapes[insertShape].ptsY[k-1];
+                        }
+                        shapes[insertShape].ptsX[idx] = insertX;
+                        shapes[insertShape].ptsY[idx] = insertY;
+                        shapes[insertShape].ptCount++;
+                        ClearSelection();
+                        ToggleSelection(insertShape, idx);
+                        selectedShape = insertShape;
+                        RedrawCanvas(hwnd);
+                        return 0;
                     }
                 }
 
-                if (clickPt != -1) {
-                    if (shiftDown) ToggleSelection(clickShape, clickPt);
-                    else if (!ptSelected[clickShape][clickPt]) { ClearSelection(); ToggleSelection(clickShape, clickPt); }
-                    selectedShape = clickShape;
-                } else if (clickSegShape != -1 && shiftDown) {
-                    SaveState(); i = clickSegShape; j = clickSegPt;
-                    for(k = shapes[i].ptCount; k > j + 1; k--) { shapes[i].ptsX[k] = shapes[i].ptsX[k-1]; shapes[i].ptsY[k] = shapes[i].ptsY[k-1]; }
-                    shapes[i].ptsX[j+1] = Snap(hoverProjX / scaleFactor); shapes[i].ptsY[j+1] = Snap(hoverProjY / scaleFactor); 
-                    shapes[i].ptCount++;
-                    ClearSelection(); ToggleSelection(i, j+1); selectedShape = i;
-                } else if (clickBody != -1) {
-                    int sHasSel = 0, allSel = 1;
-                    for(j = 0; j < shapes[clickBody].ptCount; j++) { if (ptSelected[clickBody][j]) sHasSel = 1; else allSel = 0; }
+                if (hitS != -1) {
+                    for(j = 0; j < shapes[hitS].ptCount; j++) if(ptSelected[hitS][j]) sHasSel = 1;
+                    
                     if (shiftDown) {
-                        for(j = 0; j < shapes[clickBody].ptCount; j++) {
-                            if (allSel && ptSelected[clickBody][j]) ToggleSelection(clickBody, j);
-                            else if (!allSel && !ptSelected[clickBody][j]) ToggleSelection(clickBody, j);
+                        if (hitP != -1) ToggleSelection(hitS, hitP);
+                        else {
+                            for(j = 0; j < shapes[hitS].ptCount; j++) if(!ptSelected[hitS][j]) allSel = 0;
+                            for(j = 0; j < shapes[hitS].ptCount; j++) {
+                                if (allSel && ptSelected[hitS][j]) ToggleSelection(hitS, j);
+                                else if (!allSel && !ptSelected[hitS][j]) ToggleSelection(hitS, j);
+                            }
                         }
-                    } else if (!sHasSel) {
-                        ClearSelection(); for(j = 0; j < shapes[clickBody].ptCount; j++) ToggleSelection(clickBody, j);
+                    } else {
+                        if (hitP != -1) {
+                            if (!ptSelected[hitS][hitP]) { ClearSelection(); ToggleSelection(hitS, hitP); }
+                        } else if (!sHasSel) {
+                            ClearSelection();
+                            for(j = 0; j < shapes[hitS].ptCount; j++) ToggleSelection(hitS, j);
+                        }
                     }
-                    selectedShape = clickBody;
-                } else { ClearSelection(); selectedShape = -1; }
-
-                if (selectedShape != -1) {
+                    selectedShape = hitS;
                     currentFill = shapes[selectedShape].fill; useFill = shapes[selectedShape].useFill; 
                     currentStroke = shapes[selectedShape].stroke; useStroke = shapes[selectedShape].useStroke;
-                    
-                    if (ctrlDown && selOrderCount > 0) {
+                } else {
+                    ClearSelection(); selectedShape = -1;
+                }
+
+                if (selectedShape != -1) {
+                    pSelCount = 0;
+                    for (i = 0; i < shapeCount; i++) {
+                        int cnt = 0;
+                        for(j = 0; j < shapes[i].ptCount; j++) if(ptSelected[i][j]) cnt++;
+                        if (cnt > 0 && cnt < shapes[i].ptCount) isPartialSelection = 1;
+                        pSelCount += cnt;
+                    }
+                    if (ctrlDown && pSelCount == shapes[selectedShape].ptCount && shapeCount < MAX_SHAPES) {
                         origCount = shapeCount; SaveState();
                         for (i = 0; i < origCount; i++) {
-                            int sHasSel = 0; for(j = 0; j < shapes[i].ptCount; j++) if(ptSelected[i][j]) sHasSel = 1;
+                            sHasSel = 0; for(j = 0; j < shapes[i].ptCount; j++) if(ptSelected[i][j]) sHasSel = 1;
                             if (sHasSel && shapeCount < MAX_SHAPES) { 
                                 shapes[shapeCount] = shapes[i]; 
-                                for(j = 0; j < shapes[i].ptCount; j++) {
-                                    if(ptSelected[i][j]) { ToggleSelection(i, j); ToggleSelection(shapeCount, j); }
-                                } 
+                                for(j = 0; j < shapes[i].ptCount; j++) if(ptSelected[i][j]) { ToggleSelection(i, j); ToggleSelection(shapeCount, j); } 
                                 shapeCount++; 
                             }
                         }
                     }
-                    
                     memcpy(dragStartSnapshot, shapes, sizeof(Shape) * shapeCount);
-                    isDraggingNodes = 1; dragStartX = startX; dragStartY = startY;
+                    dragType = (currentMode == 0) ? (shiftDown ? 3 : 1) : (currentMode == 1 ? 3 : 4); 
+                    dragStartX = startX; dragStartY = startY; 
+                    isDraggingPoint = isPartialSelection;
+                    
                     minX = 9999; maxX = -9999; minY = 9999; maxY = -9999;
                     for(i = 0; i < shapeCount; i++) {
                         for(j = 0; j < shapes[i].ptCount; j++) {
-                            if (ptSelected[i][j]) { 
-                                minX = fmin(minX, shapes[i].ptsX[j]); maxX = fmax(maxX, shapes[i].ptsX[j]); 
-                                minY = fmin(minY, shapes[i].ptsY[j]); maxY = fmax(maxY, shapes[i].ptsY[j]); 
-                            }
+                            if (ptSelected[i][j]) { minX = fmin(minX, shapes[i].ptsX[j]); maxX = fmax(maxX, shapes[i].ptsX[j]); minY = fmin(minY, shapes[i].ptsY[j]); maxY = fmax(maxY, shapes[i].ptsY[j]); }
                         }
                     }
                     shapeCx = (minX + maxX)/2.0; shapeCy = (minY + maxY)/2.0;
                 }
                 RedrawCanvas(hwnd); return 0;
             }
-            else if (currentMode == 4 || currentMode == 6) {
-                currentEndX = startX; currentEndY = startY; isDrawing = 1;
-                currentShape.type = (currentMode == 4) ? 1 : 0;
+            else if (currentMode == 6) { 
+                currentEndX = gx; currentEndY = gy; isDrawing = 1;
+                currentShape.type = 0; 
                 currentShape.useFill = useFill; currentShape.fill = currentFill;
                 currentShape.useStroke = useStroke; currentShape.stroke = currentStroke;
-                if (currentMode == 4) { currentShape.ptCount = 2; currentShape.ptsX[0] = startX; currentShape.ptsY[0] = startY; currentShape.ptsX[1] = currentEndX; currentShape.ptsY[1] = currentEndY; }
-                else GenShape(currentEndX, currentEndY);
-                RedrawCanvas(hwnd);
+                GenShape(currentEndX, currentEndY); RedrawCanvas(hwnd);
             }
-            else if (currentMode == 3 || currentMode == 5) {
+            else if (currentMode >= 3 && currentMode <= 5) { 
                 if (!isDrawing) {
-                    isDrawing = 1; currentShape.type = (currentMode == 3) ? 0 : 2; 
-                    currentShape.useFill = (currentMode == 3) ? useFill : 0; currentShape.fill = currentFill;
-                    currentShape.useStroke = useStroke; currentShape.stroke = currentStroke;
-                    currentShape.ptsX[0] = startX; currentShape.ptsY[0] = startY;
-                    currentShape.ptsX[1] = startX; currentShape.ptsY[1] = startY; 
+                    isDrawing = 1; 
+                    currentShape.type = (currentMode == 4) ? 1 : (currentMode == 5 ? 2 : 0);
+                    currentShape.useFill = (currentMode == 3) ? useFill : 0; 
+                    currentShape.fill = currentFill;
+                    currentShape.useStroke = 1; 
+                    currentShape.stroke = currentStroke;
+                    currentShape.ptsX[0] = gx; currentShape.ptsY[0] = gy;
+                    currentShape.ptsX[1] = gx; currentShape.ptsY[1] = gy; 
                     currentShape.ptCount = 2;
                 } else if (currentShape.ptCount < MAX_POINTS) {
-                    currentShape.ptsX[currentShape.ptCount-1] = startX; currentShape.ptsY[currentShape.ptCount-1] = startY;
+                    currentShape.ptsX[currentShape.ptCount-1] = gx; currentShape.ptsY[currentShape.ptCount-1] = gy;
                     currentShape.ptCount++; 
-                    currentShape.ptsX[currentShape.ptCount-1] = startX; currentShape.ptsY[currentShape.ptCount-1] = startY;
+                    currentShape.ptsX[currentShape.ptCount-1] = gx; currentShape.ptsY[currentShape.ptCount-1] = gy;
                 }
                 RedrawCanvas(hwnd);
             }
             break;
         }
         case WM_MOUSEMOVE: {
-            double nx, ny, dx, dy, bestDist, prX, prY, d, newX, newY;
-            int x = LOWORD(lParam), y = HIWORD(lParam), i, j, p, np;
-            nx = Snap(x / (double)scaleFactor); ny = Snap(y / (double)scaleFactor);
+            double nx, ny, dx, dy, bestDist, prX, prY, d, newX, newY, minX, maxX, minY, maxY;
+            int x, y, i, j, p, np, ctrlDown;
+            double diff, ox, oy, d1, d2, scale;
             
-            if (isDraggingNodes) {
+            x = (int)(short)LOWORD(lParam); 
+            y = (int)(short)HIWORD(lParam);
+            
+            nx = CLAMP(Snap(x / (double)scaleFactor), 0, GRID_SIZE);
+            ny = CLAMP(Snap(y / (double)scaleFactor), 0, GRID_SIZE);
+            
+            if (dragDimIdx != -1) {
+                Dimension* dptr = &dims[dragDimIdx];
+                if (dptr->s1 < shapeCount && dptr->s2 < shapeCount && 
+                    dptr->p1 < shapes[dptr->s1].ptCount && dptr->p2 < shapes[dptr->s2].ptCount) {
+                    
+                    double A1x = shapes[dptr->s1].ptsX[dptr->p1] * scaleFactor;
+                    double A1y = shapes[dptr->s1].ptsY[dptr->p1] * scaleFactor;
+                    double A2x = shapes[dptr->s2].ptsX[dptr->p2] * scaleFactor;
+                    double A2y = shapes[dptr->s2].ptsY[dptr->p2] * scaleFactor;
+                    
+                    if (dptr->mode == 0) {
+                        double dimDx = A2x - A1x, dimDy = A2y - A1y;
+                        double ang = atan2(dimDy, dimDx);
+                        double nX = -sin(ang), nY = cos(ang);
+                        dptr->offset = ((x - A1x) * nX + (y - A1y) * nY);
+                        double len2 = dimDx*dimDx + dimDy*dimDy;
+                        if (len2 > 0) dptr->textPos = ((x - A1x) * dimDx + (y - A1y) * dimDy) / len2;
+                    } else if (dptr->mode == 1) {
+                        dptr->offset = y - A1y;
+                        double dimDx = A2x - A1x;
+                        if (dimDx != 0) dptr->textPos = (x - A1x) / dimDx;
+                    } else if (dptr->mode == 2) {
+                        dptr->offset = x - A1x;
+                        double dimDy = A2y - A1y;
+                        if (dimDy != 0) dptr->textPos = (y - A1y) / dimDy;
+                    }
+                    if (dptr->textPos < 0.0) dptr->textPos = 0.0;
+                    if (dptr->textPos > 1.0) dptr->textPos = 1.0;
+                    RedrawCanvas(hwnd);
+                }
+                return 0;
+            }
+            
+            if (dragType > 0) {
+                ctrlDown = (GetKeyState(VK_CONTROL) & 0x8000);
                 dx = nx - dragStartX; dy = ny - dragStartY;
-                if (dx != 0 || dy != 0) {
-                    if (currentMode == 1) { 
-                        double theta = atan2(ny - shapeCy, nx - shapeCx) - atan2(dragStartY - shapeCy, dragStartX - shapeCx);
-                        for(i = 0; i < shapeCount; i++) {
-                            for(j = 0; j < shapes[i].ptCount; j++) {
-                                if (ptSelected[i][j]) {
-                                    double ox = dragStartSnapshot[i].ptsX[j]; double oy = dragStartSnapshot[i].ptsY[j];
-                                    newX = shapeCx + (ox - shapeCx)*cos(theta) - (oy - shapeCy)*sin(theta);
-                                    newY = shapeCy + (ox - shapeCx)*sin(theta) + (oy - shapeCy)*cos(theta);
-                                    shapes[i].ptsX[j] = snapToGrid ? round(newX) : newX; shapes[i].ptsY[j] = snapToGrid ? round(newY) : newY;
-                                }
+                
+                if (dragType == 1) {
+                    minX = GRID_SIZE; maxX = 0; minY = GRID_SIZE; maxY = 0;
+                    for(i = 0; i < shapeCount; i++) {
+                        for(j = 0; j < shapes[i].ptCount; j++) {
+                            if (ptSelected[i][j]) {
+                                minX = fmin(minX, dragStartSnapshot[i].ptsX[j]);
+                                maxX = fmax(maxX, dragStartSnapshot[i].ptsX[j]);
+                                minY = fmin(minY, dragStartSnapshot[i].ptsY[j]);
+                                maxY = fmax(maxY, dragStartSnapshot[i].ptsY[j]);
                             }
                         }
-                    } 
-                    else if (currentMode == 2) { 
-                        double d0 = sqrt(pow(dragStartX - shapeCx, 2) + pow(dragStartY - shapeCy, 2));
-                        double d1 = sqrt(pow(nx - shapeCx, 2) + pow(ny - shapeCy, 2));
-                        double S = (d0 > 0.001) ? (d1 / d0) : 1.0;
-                        for(i = 0; i < shapeCount; i++) {
-                            for(j = 0; j < shapes[i].ptCount; j++) {
-                                if (ptSelected[i][j]) {
-                                    double ox = dragStartSnapshot[i].ptsX[j]; double oy = dragStartSnapshot[i].ptsY[j];
-                                    newX = shapeCx + (ox - shapeCx)*S; newY = shapeCy + (oy - shapeCy)*S;
-                                    shapes[i].ptsX[j] = snapToGrid ? round(newX) : newX; shapes[i].ptsY[j] = snapToGrid ? round(newY) : newY;
-                                }
-                            }
-                        }
-                    } 
-                    else { 
+                    }
+                    if (minX + dx < 0) dx = -minX; 
+                    if (maxX + dx > GRID_SIZE) dx = GRID_SIZE - maxX; 
+                    if (minY + dy < 0) dy = -minY; 
+                    if (maxY + dy > GRID_SIZE) dy = GRID_SIZE - maxY;
+
+                    if (ctrlDown && isDraggingPoint) { if (fabs(dx) > fabs(dy)) dy = 0; else dx = 0; }
+                    
+                    if (dx != 0 || dy != 0) {
                         for(i = 0; i < shapeCount; i++) {
                             for(j = 0; j < shapes[i].ptCount; j++) {
                                 if (ptSelected[i][j]) {
@@ -1435,10 +1667,39 @@ LRESULT CALLBACK _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                             }
                         }
                     }
+                } else if (dragType == 3) {
+                    diff = atan2(ny - shapeCy, nx - shapeCx) - atan2(dragStartY - shapeCy, dragStartX - shapeCx);
+                    if (snapToGrid) diff = round(diff / (PI/12.0)) * (PI/12.0);
+                    for(i = 0; i < shapeCount; i++) {
+                        for(j = 0; j < shapes[i].ptCount; j++) {
+                            if (ptSelected[i][j]) {
+                                ox = dragStartSnapshot[i].ptsX[j] - shapeCx; 
+                                oy = dragStartSnapshot[i].ptsY[j] - shapeCy;
+                                shapes[i].ptsX[j] = shapeCx + (ox * cos(diff) - oy * sin(diff)); 
+                                shapes[i].ptsY[j] = shapeCy + (ox * sin(diff) + oy * cos(diff));
+                            }
+                        }
+                    }
+                } else if (dragType == 4) {
+                    d1 = sqrt(pow(dragStartX - shapeCx, 2) + pow(dragStartY - shapeCy, 2));
+                    d2 = sqrt(pow(nx - shapeCx, 2) + pow(ny - shapeCy, 2));
+                    if (d1 > 0.01) {
+                        scale = d2 / d1;
+                        for(i = 0; i < shapeCount; i++) {
+                            for(j = 0; j < shapes[i].ptCount; j++) {
+                                if (ptSelected[i][j]) {
+                                    newX = shapeCx + ((dragStartSnapshot[i].ptsX[j] - shapeCx) * scale);
+                                    newY = shapeCy + ((dragStartSnapshot[i].ptsY[j] - shapeCy) * scale);
+                                    shapes[i].ptsX[j] = snapToGrid ? round(newX) : newX; shapes[i].ptsY[j] = snapToGrid ? round(newY) : newY;
+                                }
+                            }
+                        }
+                    }
                 }
                 RedrawCanvas(hwnd);
             } else if (currentMode == 0 || currentMode == 1 || currentMode == 2) {
                 hoverShape = -1; hoverPt = -1; hoverSegShape = -1; hoverSegPt = -1; bestDist = 9999.0;
+                
                 if (selectedShape != -1 && selectedShape < shapeCount) {
                     for (p = 0; p < shapes[selectedShape].ptCount; p++) {
                         d = sqrt(pow(shapes[selectedShape].ptsX[p]*scaleFactor - x, 2) + pow(shapes[selectedShape].ptsY[p]*scaleFactor - y, 2));
@@ -1466,13 +1727,12 @@ LRESULT CALLBACK _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 }
                 InvalidateRect(hwnd, NULL, FALSE);
             } else if (isDrawing) {
-                if (currentMode == 4 || currentMode == 6) { 
-                    currentEndX = nx; currentEndY = ny; 
-                    if (currentMode == 4) { currentShape.ptsX[1] = currentEndX; currentShape.ptsY[1] = currentEndY; }
-                    else GenShape(currentEndX, currentEndY); 
+                if (currentMode == 6) { 
+                    currentEndX = nx; currentEndY = ny; GenShape(currentEndX, currentEndY); 
                 } 
-                else if (currentMode == 3 || currentMode == 5) { 
-                    currentShape.ptsX[currentShape.ptCount-1] = nx; currentShape.ptsY[currentShape.ptCount-1] = ny; 
+                else if (currentMode >= 3 && currentMode <= 5) { 
+                    currentShape.ptsX[currentShape.ptCount-1] = nx; 
+                    currentShape.ptsY[currentShape.ptCount-1] = ny; 
                 }
                 RedrawCanvas(hwnd);
             }
@@ -1480,135 +1740,221 @@ LRESULT CALLBACK _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         }
         case WM_LBUTTONUP: {
             ReleaseCapture();
-            if (isDraggingNodes) { isDraggingNodes = 0; SaveState(); }
-            else if (isDrawing && (currentMode == 4 || currentMode == 6)) {
+            if (dragDimIdx != -1) dragDimIdx = -1;
+            if (dragType > 0) { dragType = 0; SaveState(); }
+            else if (isDrawing && currentMode == 6) {
                 isDrawing = 0;
-                if (currentShape.ptCount > 0 && shapeCount < MAX_SHAPES) { 
-                    SaveState(); shapes[shapeCount++] = currentShape; 
-                    selectedShape = shapeCount-1; currentShape.ptCount = 0; UpdateStatusBar(); 
+                if (currentShape.ptCount >= 2 && shapeCount < MAX_SHAPES) { 
+                    SaveState(); shapes[shapeCount++] = currentShape; selectedShape = shapeCount-1; currentShape.ptCount = 0; currentMode = 0; UpdateStatusBar(); 
                 }
                 RedrawCanvas(hwnd);
             }
             break;
         }
         case WM_RBUTTONDOWN: {
-            int x = LOWORD(lParam), y = HIWORD(lParam), i, p, k;
+            int x = (int)(short)LOWORD(lParam); 
+            int y = (int)(short)HIWORD(lParam);
+            int i, p, k;
             if (currentMode == 0 || currentMode == 1 || currentMode == 2) {
                 for (i = 0; i < shapeCount; i++) {
                     for (p = 0; p < shapes[i].ptCount; p++) {
-                        int px = (int)round(shapes[i].ptsX[p] * scaleFactor), py = (int)round(shapes[i].ptsY[p] * scaleFactor);
+                        int px = (int)round(shapes[i].ptsX[p] * scaleFactor);
+                        int py = (int)round(shapes[i].ptsY[p] * scaleFactor);
                         if (sqrt(pow(px - x, 2) + pow(py - y, 2)) <= 8.0) {
                             if (shapes[i].ptCount > (shapes[i].type == 0 ? 3 : 2)) {
                                 SaveState();
                                 for (k = p; k < shapes[i].ptCount - 1; k++) {
-                                    shapes[i].ptsX[k] = shapes[i].ptsX[k+1]; shapes[i].ptsY[k] = shapes[i].ptsY[k+1];
+                                    shapes[i].ptsX[k] = shapes[i].ptsX[k+1];
+                                    shapes[i].ptsY[k] = shapes[i].ptsY[k+1];
                                 }
-                                shapes[i].ptCount--; ClearSelection(); RedrawCanvas(hwnd);
+                                shapes[i].ptCount--;
+                                ClearSelection();
+                                RedrawCanvas(hwnd);
                             }
                             return 0;
                         }
                     }
                 }
+            } else if (isDrawing && (currentMode >= 3 && currentMode <= 5)) { 
+                if (currentShape.ptCount >= (currentMode == 3 ? 3 : 2) && shapeCount < MAX_SHAPES) {
+                    SaveState(); shapes[shapeCount++] = currentShape; selectedShape = shapeCount - 1; currentMode = 0;
+                }
+                currentShape.ptCount = 0; isDrawing = 0; RedrawCanvas(hwnd); 
+            } else { 
+                currentShape.ptCount = 0; isDrawing = 0; if (shapeCount > 0) currentMode = 0; else currentMode = 3; RedrawCanvas(hwnd); 
             }
             break;
         }
         case WM_APP + 1: { 
-            char buf[32]; 
-            double newDist, dx, dy, minX, maxX, minY, maxY, cx, cy, oldVal, scale; 
+            char buf[32]; double newDist, dx, dy, minX, maxX, minY, maxY, cx, cy, oldVal, scale; 
             int p, s1, p1, s2, p2;
-            
-            GetWindowText(hDistEdit, buf, 32); 
-            newDist = atof(buf);
-            if (newDist > 10000.0) newDist = 10000.0;
-            if (newDist < -10000.0) newDist = -10000.0;
+            GetWindowText(hDistEdit, buf, 32); newDist = atof(buf);
             
             if (distEditMode == 0 && selOrderCount == 2) {
-                double dist;
                 s1 = selOrderS[0]; p1 = selOrderP[0]; s2 = selOrderS[1]; p2 = selOrderP[1];
-                
-                if (s1 >= 0 && s1 < MAX_SHAPES && s2 >= 0 && s2 < MAX_SHAPES &&
-                    p1 >= 0 && p1 < MAX_POINTS && p2 >= 0 && p2 < MAX_POINTS) {
-                    
-                    dx = shapes[s2].ptsX[p2] - shapes[s1].ptsX[p1]; 
-                    dy = shapes[s2].ptsY[p2] - shapes[s1].ptsY[p1];
-                    dist = sqrt(dx*dx + dy*dy);
-                    
-                    if (dist > 0.0) { 
-                        SaveState(); 
-                        shapes[s2].ptsX[p2] = shapes[s1].ptsX[p1] + dx * (newDist / dist); 
-                        shapes[s2].ptsY[p2] = shapes[s1].ptsY[p1] + dy * (newDist / dist);
-                    }
-                }
-            } else if ((distEditMode == 1 || distEditMode == 2) && selectedShape >= 0 && selectedShape < MAX_SHAPES) {
+                dx = shapes[s2].ptsX[p2] - shapes[s1].ptsX[p1]; dy = shapes[s2].ptsY[p2] - shapes[s1].ptsY[p1];
+                SaveState(); shapes[s2].ptsX[p2] = shapes[s1].ptsX[p1] + dx * (newDist / sqrt(dx*dx + dy*dy)); 
+                shapes[s2].ptsY[p2] = shapes[s1].ptsY[p1] + dy * (newDist / sqrt(dx*dx + dy*dy));
+            } else if ((distEditMode == 1 || distEditMode == 2) && selectedShape != -1) {
                 minX = 9999; maxX = -9999; minY = 9999; maxY = -9999;
-                for(p=0; p<shapes[selectedShape].ptCount; p++) { 
-                    minX = fmin(minX, shapes[selectedShape].ptsX[p]); maxX = fmax(maxX, shapes[selectedShape].ptsX[p]); 
-                    minY = fmin(minY, shapes[selectedShape].ptsY[p]); maxY = fmax(maxY, shapes[selectedShape].ptsY[p]); 
-                }
+                for(p=0; p<shapes[selectedShape].ptCount; p++) { minX = fmin(minX, shapes[selectedShape].ptsX[p]); maxX = fmax(maxX, shapes[selectedShape].ptsX[p]); minY = fmin(minY, shapes[selectedShape].ptsY[p]); maxY = fmax(maxY, shapes[selectedShape].ptsY[p]); }
                 cx = (minX + maxX)/2.0; cy = (minY + maxY)/2.0; oldVal = (distEditMode == 1) ? (maxX - minX) : (maxY - minY);
-                
-                if (oldVal > 0.0) {
+                if (oldVal > 0) {
                     scale = newDist / oldVal; SaveState();
                     for(p=0; p<shapes[selectedShape].ptCount; p++) {
                         if (distEditMode == 1) shapes[selectedShape].ptsX[p] = cx + (shapes[selectedShape].ptsX[p] - cx) * scale;
                         else shapes[selectedShape].ptsY[p] = cy + (shapes[selectedShape].ptsY[p] - cy) * scale;
                     }
                 }
+            } else if (distEditMode == 3) {
+                double cScale = atof(buf);
+                if (cScale <= 0.0) cScale = 1.0;
+                LoadSVG(pendingSvgFile, hwnd, cScale);
+            } else if (distEditMode == 4 && selOrderCount == 2) {
+                s1 = selOrderS[0]; p1 = selOrderP[0]; s2 = selOrderS[1]; p2 = selOrderP[1];
+                dx = shapes[s2].ptsX[p2] - shapes[s1].ptsX[p1]; dy = shapes[s2].ptsY[p2] - shapes[s1].ptsY[p1];
+                double cDist = sqrt(dx*dx + dy*dy);
+                double nAng = atof(buf);
+                SaveState(); 
+                shapes[s2].ptsX[p2] = shapes[s1].ptsX[p1] + cos(nAng * PI / 180.0) * cDist;
+                shapes[s2].ptsY[p2] = shapes[s1].ptsY[p1] + sin(nAng * PI / 180.0) * cDist;
             }
-            ShowWindow(hDistEdit, SW_HIDE); RedrawCanvas(hwnd); SetFocus(hwnd); 
+            ShowWindow(hDistEdit, SW_HIDE); distEditMode = 0; RedrawCanvas(hwnd); SetFocus(hwnd); 
             break;
         }
         case WM_COMMAND: {
-            UINT id = wParam; int btnId = id - 200, i, j, k;
+            UINT id = wParam;
+            int btnId = id - 200;
+            int i, j, k;
 
-            if (btnId >= 0 && btnId < 28) {
-                if (btnId >= 0 && btnId <= 6) { currentMode = btnId; isDrawing = 0; isDraggingNodes = 0; ClearSelection(); UpdateStatusBar(); InvalidateRect(hwnd, NULL, TRUE); }
-                else if (btnId == 7) { currentMode = 7; textCursorActive = 0; UpdateStatusBar(); }
-                else if (btnId == 8) { currentMode = 8; UpdateStatusBar(); }
-                else if (btnId == 9) Undo(hwnd);
-                else if (btnId == 10) { SaveState(); shapeCount = 0; selectedShape = -1; ClearSelection(); UpdateStatusBar(); RedrawCanvas(hwnd); }
-                else if (btnId == 11) SendMessage(hwnd, WM_KEYDOWN, VK_DELETE, 0);
-                else if (btnId == 12) { 
-                    OPENFILENAME ofn; char szFile[260]; memset(&ofn, 0, sizeof(ofn)); szFile[0] = '\0';
-                    ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd; 
-                    ofn.lpstrFilter = "SVG Files (*.svg)\0*.svg\0"; ofn.lpstrFile = szFile; ofn.nMaxFile = sizeof(szFile); 
-                    ofn.Flags = OFN_FILEMUSTEXIST;
-                    if (GetOpenFileName(&ofn)) ParseSVG(szFile, hwnd); 
+            if (id == 151) { 
+                if (parsedCount < MAX_ICONS) {
+                    int newId = 1;
+                    for(i=0; i<parsedCount; i++) if(parsedIcons[i].caseId >= newId) newId = parsedIcons[i].caseId + 1;
+                    parsedIcons[parsedCount].caseId = newId;
+                    strcpy(parsedIcons[parsedCount].name, "New");
+                    parsedIcons[parsedCount].shapes = NULL;
+                    parsedIcons[parsedCount].shapeCount = 0;
+                    parsedCount++;
+                    SetScrollRange(hScrlIcon, SB_CTL, 0, parsedCount - 1, TRUE);
+                    SwitchToIcon(parsedCount - 1);
                 }
-                else if (btnId == 13) { 
-                    OPENFILENAME ofn; char szFile[260]; memset(&ofn, 0, sizeof(ofn)); szFile[0] = '\0';
-                    ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd; 
-                    ofn.lpstrFilter = "Image Files (*.bmp)\0*.bmp\0"; ofn.lpstrFile = szFile; ofn.nMaxFile = sizeof(szFile); 
-                    ofn.Flags = OFN_FILEMUSTEXIST;
-                    if (GetOpenFileName(&ofn)) LoadReferenceImage(szFile, hwnd); 
-                }
-                else if (btnId == 14) { 
-                    OPENFILENAME ofn; char szFile[260]; memset(&ofn, 0, sizeof(ofn)); szFile[0] = '\0';
-                    ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd; 
-                    ofn.lpstrFilter = "C Data Files (*.c)\0*.c\0"; ofn.lpstrFile = szFile; ofn.nMaxFile = sizeof(szFile); 
-                    ofn.Flags = OFN_FILEMUSTEXIST;
-                    if (GetOpenFileName(&ofn)) LoadCFile(szFile, hwnd); 
-                }
-                else if (btnId == 15) DoSaveFile(hwnd);
-                else if (btnId == 16) ExportCode(hwnd);
-                else if (btnId == 17) { 
-                    int selShapes[MAX_SHAPES]; int numSelShapes = 0;
-                    for (i = 0; i < shapeCount; i++) {
-                        int hasSel = 0;
-                        for (j = 0; j < shapes[i].ptCount; j++) if (ptSelected[i][j]) hasSel = 1;
-                        if (hasSel) selShapes[numSelShapes++] = i;
+                SetFocus(hwnd); break;
+            }
+            else if (id == 152) { 
+                if (parsedCount > 0 && currentIconIdx >= 0) {
+                    if (parsedIcons[currentIconIdx].shapes) {
+                        GlobalFreePtr(parsedIcons[currentIconIdx].shapes);
+                        parsedIcons[currentIconIdx].shapes = NULL;
+                    }
+                    for(i=currentIconIdx; i<parsedCount-1; i++) parsedIcons[i] = parsedIcons[i+1];
+                    parsedCount--;
+                    if (parsedCount > 0) {
+                        parsedIcons[parsedCount].shapes = NULL; 
+                        parsedIcons[parsedCount].shapeCount = 0;
                     }
                     
-                    if (numSelShapes == 2 && shapes[selShapes[0]].type == 0 && shapes[selShapes[1]].type == 0) {
-                        int s1 = selShapes[0], s2 = selShapes[1], edgeCount = 0, fCount = 0, loopsFound = 0, loopStartIdx, firstEdge, found, cleanCnt;
-                        double cx, cy, clnX[MAX_POINTS], clnY[MAX_POINTS];
-                        Edge* pool = (Edge*)malloc(256 * sizeof(Edge));
-                        Edge* filtered = (Edge*)malloc(256 * sizeof(Edge));
-                        int* keep = (int*)malloc(256 * sizeof(int));
-                        int* used = (int*)malloc(256 * sizeof(int));
-                        Shape merged;
+                    if (parsedCount == 0) { 
+                        parsedCount = 1; currentIconIdx = -1; currentCaseId = 1;
+                        parsedIcons[0].caseId = 1;
+                        strcpy(parsedIcons[0].name, "New");
+                        parsedIcons[0].shapes = NULL; parsedIcons[0].shapeCount = 0;
+                        shapeCount = 0; 
+                        SetScrollRange(hScrlIcon, SB_CTL, 0, 0, TRUE); 
+                        SwitchToIcon(0);
+                        currentMode = 3;
+                        UpdateStatusBar(); RedrawCanvas(hwnd); 
+                    } else { 
+                        int nIdx = currentIconIdx >= parsedCount ? parsedCount - 1 : currentIconIdx; 
+                        currentIconIdx = -1; 
+                        SetScrollRange(hScrlIcon, SB_CTL, 0, parsedCount - 1, TRUE);
+                        SwitchToIcon(nIdx); 
+                    }
+                }
+                SetFocus(hwnd); break;
+            }
+
+            if (btnId >= 0 && btnId < 28) {
+                if (btnId >= 0 && btnId <= 6) { currentMode = btnId; isDrawing = 0; dragType = 0; ClearSelection(); UpdateStatusBar(); InvalidateRect(hwnd, NULL, TRUE); }
+                else if (btnId == 7) { currentMode = 7; textCursorActive = 0; }
+                else if (btnId == 8) { currentMode = 8; isDrawing = 0; dragType = 0; ClearSelection(); UpdateStatusBar(); InvalidateRect(hwnd, NULL, TRUE); }
+                else if (btnId == 9) Undo(hwnd);
+                else if (btnId == 10) { 
+                    SaveState(); shapeCount = 0; selectedShape = -1; ClearSelection(); currentMode = 3; UpdateStatusBar(); RedrawCanvas(hwnd);
+                }
+                else if (btnId == 11) { SendMessage(hwnd, WM_KEYDOWN, VK_DELETE, 0); }
+                else if (btnId == 12) { 
+                    static OPENFILENAME ofn; static char szFile[260];
+                    memset(&ofn, 0, sizeof(ofn)); szFile[0] = '\0';
+                    ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd; 
+                    ofn.lpstrFilter = "SVG Files (*.svg)\0*.svg\0"; 
+                    ofn.lpstrFile = szFile; ofn.nMaxFile = sizeof(szFile); ofn.Flags = OFN_FILEMUSTEXIST;
+                    if (GetOpenFileName(&ofn)) { 
+                        int res = MessageBox(hwnd, "Scale SVG to fit canvas?\n(Select NO to enter custom scale)", "SVG Import", MB_YESNOCANCEL | MB_ICONQUESTION);
+                        if (res == IDYES) {
+                            LoadSVG(szFile, hwnd, -1.0);
+                        } else if (res == IDNO) {
+                            strcpy(pendingSvgFile, szFile);
+                            distEditMode = 3;
+                            SetWindowText(hDistEdit, "1.0");
+                            MoveWindow(hDistEdit, canvasSize/2, canvasSize/2, 60, 20, TRUE);
+                            ShowWindow(hDistEdit, SW_SHOW); SetFocus(hDistEdit);
+                        }
+                    }
+                }
+                else if (btnId == 14) { 
+                    static OPENFILENAME ofn; static char szFile[260];
+                    memset(&ofn, 0, sizeof(ofn)); szFile[0] = '\0';
+                    ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd; ofn.lpstrFilter = "C Data Files (*.c)\0*.c\0"; ofn.lpstrFile = szFile; ofn.nMaxFile = sizeof(szFile); ofn.Flags = OFN_FILEMUSTEXIST;
+                    if (GetOpenFileName(&ofn)) LoadCFile(szFile, hwnd); 
+                }
+                else if (btnId == 15) { DoSaveFile(hwnd); }
+                else if (btnId == 16) { 
+                    if (shapeCount > 0 && OpenClipboard(hwnd)) {
+                        HGLOBAL hGlb; char* pBuf; int bSz = 4096; char tmp[128]; int pIdx;
+                        EmptyClipboard();
+                        hGlb = GlobalAlloc(GMEM_MOVEABLE | GMEM_DDESHARE, bSz);
+                        if (hGlb) {
+                            pBuf = (char*)GlobalLock(hGlb); pBuf[0] = '\0';
+                            for (i = 0; i < shapeCount; i++) {
+                                Shape* ps = &shapes[i];
+                                if (ps->type == 0 && ps->ptCount > 2) {
+                                    sprintf(tmp, "POINT p%d[] = { ", i); strcat(pBuf, tmp);
+                                    for (pIdx = 0; pIdx < ps->ptCount; pIdx++) {
+                                        sprintf(tmp, "PT(%g,%g)%s", ps->ptsX[pIdx], ps->ptsY[pIdx], pIdx == ps->ptCount-1 ? "" : ", ");
+                                        strcat(pBuf, tmp);
+                                    }
+                                    sprintf(tmp, " }; POLY(p%d);\r\n", i); strcat(pBuf, tmp);
+                                }
+                            }
+                            GlobalUnlock(hGlb); SetClipboardData(CF_TEXT, hGlb);
+                        }
+                        CloseClipboard(); ShowStatus(" Code copied to clipboard.");
+                    }
+                }
+                else if (btnId == 17) { 
+                    int distinctShapes[2]; int distinctCount = 0;
+                    int s1, s2, edgeCount, fCount, loopsFound, loopStartIdx, firstEdge, found, cleanCnt;
+                    double cx, cy;
+                    double *clnX, *clnY; Edge *pool, *filtered; int *keep, *used;
+                    static Shape merged;
+
+                    for (i = 0; i < selOrderCount; i++) {
+                        int sId = selOrderS[i]; found = 0;
+                        for (j = 0; j < distinctCount; j++) { if (distinctShapes[j] == sId) { found = 1; break; } }
+                        if (!found) { if (distinctCount < 2) distinctShapes[distinctCount++] = sId; else { distinctCount++; break; } }
+                    }
+
+                    if (distinctCount == 2 && shapes[distinctShapes[0]].type == 0 && shapes[distinctShapes[1]].type == 0) {
+                        s1 = distinctShapes[0]; s2 = distinctShapes[1]; edgeCount = 0; fCount = 0; loopsFound = 0;
+                        clnX = (double*)GlobalAllocPtr(GHND, MAX_POINTS * sizeof(double));
+                        clnY = (double*)GlobalAllocPtr(GHND, MAX_POINTS * sizeof(double));
+                        pool = (Edge*)GlobalAllocPtr(GHND, 1024 * sizeof(Edge));
+                        filtered = (Edge*)GlobalAllocPtr(GHND, 1024 * sizeof(Edge));
+                        keep = (int*)GlobalAllocPtr(GHND, 1024 * sizeof(int));
+                        used = (int*)GlobalAllocPtr(GHND, 1024 * sizeof(int));
                         
-                        if (pool && filtered && keep && used) {
+                        if (pool && filtered && keep && used && clnX && clnY) {
                             SaveState(); 
                             AddEdgesFromShape(&shapes[s1], &shapes[s2], pool, &edgeCount); 
                             AddEdgesFromShape(&shapes[s2], &shapes[s1], pool, &edgeCount);
@@ -1618,8 +1964,8 @@ LRESULT CALLBACK _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                                 if (!keep[i]) continue;
                                 for(j=i+1; j<edgeCount; j++) {
                                     if (!keep[j]) continue;
-                                    if ((fabs(pool[i].x1 - pool[j].x1) < 1e-5 && fabs(pool[i].y1 - pool[j].y1) < 1e-5 && fabs(pool[i].x2 - pool[j].x2) < 1e-5 && fabs(pool[i].y2 - pool[j].y2) < 1e-5) ||
-                                        (fabs(pool[i].x1 - pool[j].x2) < 1e-5 && fabs(pool[i].y1 - pool[j].y2) < 1e-5 && fabs(pool[i].x2 - pool[j].x1) < 1e-5 && fabs(pool[i].y2 - pool[j].y1) < 1e-5)) {
+                                    if ((fabs(pool[i].x1 - pool[j].x1) < 1e-4 && fabs(pool[i].y1 - pool[j].y1) < 1e-4 && fabs(pool[i].x2 - pool[j].x2) < 1e-4 && fabs(pool[i].y2 - pool[j].y2) < 1e-4) ||
+                                        (fabs(pool[i].x1 - pool[j].x2) < 1e-4 && fabs(pool[i].y1 - pool[j].y2) < 1e-4 && fabs(pool[i].x2 - pool[j].x1) < 1e-4 && fabs(pool[i].y2 - pool[j].y1) < 1e-4)) {
                                         keep[i] = 0; keep[j] = 0; break;
                                     }
                                 }
@@ -1628,27 +1974,32 @@ LRESULT CALLBACK _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                             for(i=0; i<edgeCount; i++) if (keep[i]) filtered[fCount++] = pool[i];
                             
                             if (fCount > 0) {
-                                merged = shapes[s1]; merged.ptCount = 0; memset(used, 0, 256 * sizeof(int));
+                                merged = shapes[s1]; merged.ptCount = 0; 
+                                memset(used, 0, 1024 * sizeof(int));
                                 
                                 while(1) {
-                                    firstEdge = -1; for(j=0; j<fCount; j++) if(!used[j]) { firstEdge = j; break; }
+                                    firstEdge = -1;
+                                    for(j=0; j<fCount; j++) if(!used[j]) { firstEdge = j; break; }
                                     if (firstEdge == -1) break;
                                     
-                                    cx = filtered[firstEdge].x1; cy = filtered[firstEdge].y1; loopStartIdx = merged.ptCount;
+                                    cx = filtered[firstEdge].x1; cy = filtered[firstEdge].y1;
+                                    loopStartIdx = merged.ptCount;
                                     
                                     while(1) {
-                                        found = -1; if (merged.ptCount >= MAX_POINTS - 2) break;
+                                        found = -1;
+                                        if (merged.ptCount >= MAX_POINTS - 2) break;
                                         merged.ptsX[merged.ptCount] = cx; merged.ptsY[merged.ptCount] = cy; merged.ptCount++;
                                         
                                         for (j=0; j<fCount; j++) {
                                             if (!used[j]) {
-                                                if (fabs(filtered[j].x1 - cx) < 1e-5 && fabs(filtered[j].y1 - cy) < 1e-5) { found = j; cx = filtered[j].x2; cy = filtered[j].y2; break; }
-                                                if (fabs(filtered[j].x2 - cx) < 1e-5 && fabs(filtered[j].y2 - cy) < 1e-5) { found = j; cx = filtered[j].x1; cy = filtered[j].y1; break; }
+                                                if (fabs(filtered[j].x1 - cx) < 1e-4 && fabs(filtered[j].y1 - cy) < 1e-4) { found = j; cx = filtered[j].x2; cy = filtered[j].y2; break; }
+                                                if (fabs(filtered[j].x2 - cx) < 1e-4 && fabs(filtered[j].y2 - cy) < 1e-4) { found = j; cx = filtered[j].x1; cy = filtered[j].y1; break; }
                                             }
                                         }
                                         if (found != -1) used[found] = 1; else break;
                                     }
-                                    if (loopsFound > 0 && merged.ptCount < MAX_POINTS - 2) {
+                                    
+                                    if (loopsFound > 0 && loopStartIdx > 0 && merged.ptCount < MAX_POINTS - 2) {
                                         merged.ptsX[merged.ptCount] = merged.ptsX[loopStartIdx]; merged.ptsY[merged.ptCount] = merged.ptsY[loopStartIdx]; merged.ptCount++;
                                         merged.ptsX[merged.ptCount] = merged.ptsX[loopStartIdx - 1]; merged.ptsY[merged.ptCount] = merged.ptsY[loopStartIdx - 1]; merged.ptCount++;
                                     }
@@ -1656,55 +2007,57 @@ LRESULT CALLBACK _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                                 }
                                 
                                 cleanCnt = 0; 
-                                for (i=0; i<merged.ptCount; i++) { 
-                                    if (cleanCnt == 0 || pow(merged.ptsX[i]-clnX[cleanCnt-1], 2) + pow(merged.ptsY[i]-clnY[cleanCnt-1], 2) > 1e-5) { 
-                                        clnX[cleanCnt] = merged.ptsX[i]; clnY[cleanCnt++] = merged.ptsY[i]; 
-                                    } 
+                                for (i=0; i<merged.ptCount; i++) { if (cleanCnt == 0 || pow(merged.ptsX[i]-clnX[cleanCnt-1], 2) + pow(merged.ptsY[i]-clnY[cleanCnt-1], 2) > 1e-4) { clnX[cleanCnt] = merged.ptsX[i]; clnY[cleanCnt++] = merged.ptsY[i]; } }
+                                if (cleanCnt > 1 && pow(clnX[0]-clnX[cleanCnt-1], 2) + pow(clnY[0]-clnY[cleanCnt-1], 2) < 1e-4) cleanCnt--;
+merged.ptCount = cleanCnt; for(i=0; i<cleanCnt; i++) { merged.ptsX[i]=clnX[i]; merged.ptsY[i]=clnY[i]; }
+                                
+                                {
+                                    int keepIdx = (s1 < s2) ? s1 : s2;
+                                    int delIdx = (s1 > s2) ? s1 : s2;
+                                    
+                                    shapes[keepIdx] = merged;
+                                    
+                                    for(k = delIdx; k < shapeCount - 1; k++) {
+                                        shapes[k] = shapes[k + 1];
+                                    }
+                                    shapeCount--;
+                                    
+                                    ClearSelection(); 
+                                    selectedShape = keepIdx; 
+                                    for(i = 0; i < shapes[keepIdx].ptCount; i++) {
+                                        ToggleSelection(keepIdx, i);
+                                    }
                                 }
-                                if (cleanCnt > 1 && pow(clnX[0]-clnX[cleanCnt-1], 2) + pow(clnY[0]-clnY[cleanCnt-1], 2) < 1e-5) cleanCnt--;
-                                merged.ptCount = cleanCnt; 
-                                for(i=0; i<cleanCnt; i++) { merged.ptsX[i]=clnX[i]; merged.ptsY[i]=clnY[i]; }
-                                
-                                shapes[s1] = merged;
-                                if (s2 > s1) { for(k=s2; k<shapeCount-1; k++) shapes[k] = shapes[k+1]; shapeCount--; }
-                                else { for(k=s1; k<shapeCount-1; k++) shapes[k] = shapes[k+1]; shapeCount--; s1--; }
-                                
-                                ClearSelection(); selectedShape = s1; for(i=0; i<shapes[s1].ptCount; i++) ToggleSelection(s1, i);
                             }
                         }
-                        if (pool) free(pool); if (filtered) free(filtered); if (keep) free(keep); if (used) free(used);
+                        if (pool) GlobalFreePtr(pool); if (filtered) GlobalFreePtr(filtered); if (keep) GlobalFreePtr(keep); if (used) GlobalFreePtr(used);
+                        if (clnX) GlobalFreePtr(clnX); if (clnY) GlobalFreePtr(clnY);
                         UpdateStatusBar(); RedrawCanvas(hwnd);
                     }
                 }
                 else if (btnId == 18) { 
-                    if (selectedShape != -1 && selectedShape < shapeCount - 1) { 
-                        Shape temp; SaveState(); 
-                        temp = shapes[selectedShape]; shapes[selectedShape] = shapes[selectedShape + 1]; shapes[selectedShape + 1] = temp; selectedShape++; 
-                        RedrawCanvas(hwnd); 
-                    } 
+                    if (selectedShape != -1 && selectedShape < shapeCount - 1) { static Shape temp; SaveState(); temp = shapes[selectedShape]; shapes[selectedShape] = shapes[selectedShape + 1]; shapes[selectedShape + 1] = temp; selectedShape++; RedrawCanvas(hwnd); } 
                 }
                 else if (btnId == 19) { 
-                    if (selectedShape > 0) { 
-                        Shape temp; SaveState(); 
-                        temp = shapes[selectedShape]; shapes[selectedShape] = shapes[selectedShape - 1]; shapes[selectedShape - 1] = temp; selectedShape--; 
-                        RedrawCanvas(hwnd); 
-                    } 
+                    if (selectedShape > 0) { static Shape temp; SaveState(); temp = shapes[selectedShape]; shapes[selectedShape] = shapes[selectedShape - 1]; shapes[selectedShape - 1] = temp; selectedShape--; RedrawCanvas(hwnd); } 
                 }
-                else if (btnId == 20) { if (selOrderCount == 2) { SaveState(); shapes[selOrderS[1]].ptsX[selOrderP[1]] = shapes[selOrderS[0]].ptsX[selOrderP[0]]; RedrawCanvas(hwnd); } }
-                else if (btnId == 21) { if (selOrderCount == 2) { SaveState(); shapes[selOrderS[1]].ptsY[selOrderP[1]] = shapes[selOrderS[0]].ptsY[selOrderP[0]]; RedrawCanvas(hwnd); } }
+                else if (btnId == 20) { 
+                    if (selOrderCount == 2) { SaveState(); shapes[selOrderS[1]].ptsX[selOrderP[1]] = shapes[selOrderS[0]].ptsX[selOrderP[0]]; RedrawCanvas(hwnd); } 
+                }
+                else if (btnId == 21) { 
+                    if (selOrderCount == 2) { SaveState(); shapes[selOrderS[1]].ptsY[selOrderP[1]] = shapes[selOrderS[0]].ptsY[selOrderP[0]]; RedrawCanvas(hwnd); } 
+                }
                 else if (btnId == 22 || btnId == 23 || btnId == 24) { 
                     if (btnId == 22 && selOrderCount == 2) {
-                        int s1 = selOrderS[0], p1 = selOrderP[0], s2 = selOrderS[1], p2 = selOrderP[1];
-                        double dx = shapes[s2].ptsX[p2] - shapes[s1].ptsX[p1], dy = shapes[s2].ptsY[p2] - shapes[s1].ptsY[p1];
-                        int px = (int)round(shapes[s2].ptsX[p2] * scaleFactor) + 10, py = (int)round(shapes[s2].ptsY[p2] * scaleFactor) + 10;
-                        char buf[32]; distEditMode = 0; sprintf(buf, "%.2f", sqrt(dx*dx + dy*dy));
+                        int s1_l = selOrderS[0], p1_l = selOrderP[0], s2_l = selOrderS[1], p2_l = selOrderP[1];
+                        double dx = shapes[s2_l].ptsX[p2_l] - shapes[s1_l].ptsX[p1_l], dy = shapes[s2_l].ptsY[p2_l] - shapes[s1_l].ptsY[p1_l];
+                        int px = (int)round(shapes[s2_l].ptsX[p2_l] * scaleFactor) + 10, py = (int)round(shapes[s2_l].ptsY[p2_l] * scaleFactor) + 10;
+                        char buf[32]; distEditMode = 0; 
+                        sprintf(buf, "%.2f", sqrt(dx*dx + dy*dy));
                         SetWindowText(hDistEdit, buf); MoveWindow(hDistEdit, px, py, 60, 20, TRUE); ShowWindow(hDistEdit, SW_SHOW); SetFocus(hDistEdit);
                     } else if (selectedShape != -1 && shapes[selectedShape].ptCount > 0) {
                         double minX = 9999, maxX = -9999, minY = 9999, maxY = -9999, val; int p; char buf[32];
-                        for(p=0; p<shapes[selectedShape].ptCount; p++) { 
-                            minX = fmin(minX, shapes[selectedShape].ptsX[p]); maxX = fmax(maxX, shapes[selectedShape].ptsX[p]); 
-                            minY = fmin(minY, shapes[selectedShape].ptsY[p]); maxY = fmax(maxY, shapes[selectedShape].ptsY[p]); 
-                        }
+                        for(p=0; p<shapes[selectedShape].ptCount; p++) { minX = fmin(minX, shapes[selectedShape].ptsX[p]); maxX = fmax(maxX, shapes[selectedShape].ptsX[p]); minY = fmin(minY, shapes[selectedShape].ptsY[p]); maxY = fmax(maxY, shapes[selectedShape].ptsY[p]); }
                         val = (btnId == 23) ? (maxX - minX) : (maxY - minY); distEditMode = (btnId == 23) ? 1 : 2;
                         sprintf(buf, "%.2f", val); SetWindowText(hDistEdit, buf); 
                         MoveWindow(hDistEdit, (int)((minX+maxX)/2.0 * scaleFactor), (int)((minY+maxY)/2.0 * scaleFactor), 60, 20, TRUE); 
@@ -1714,86 +2067,80 @@ LRESULT CALLBACK _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 else if (btnId == 25) { 
                     if (selectedShape != -1 && shapeCount < MAX_SHAPES) { SaveState(); shapes[shapeCount] = shapes[selectedShape]; selectedShape = shapeCount++; RedrawCanvas(hwnd); }
                 }
-                else if (btnId == 26) {
-                    if (parsedCount < MAX_ICONS) {
-                        SyncCurrentIcon();
-                        parsedIcons[parsedCount].caseId = (parsedCount > 0) ? parsedIcons[parsedCount-1].caseId + 1 : 1;
-                        parsedIcons[parsedCount].shapeCount = 0;
-                        parsedIcons[parsedCount].shapes = NULL;
-                        parsedCount++;
-                        SetScrollRange(hScrlIcon, SB_CTL, 0, parsedCount - 1, TRUE);
-                        SwitchToIcon(parsedCount - 1);
+                else if (btnId == 26) { 
+                    if (selOrderCount == 2) {
+                        int s1_l = selOrderS[0], p1_l = selOrderP[0], s2_l = selOrderS[1], p2_l = selOrderP[1];
+                        double dx = shapes[s2_l].ptsX[p2_l] - shapes[s1_l].ptsX[p1_l];
+                        double dy = shapes[s2_l].ptsY[p2_l] - shapes[s1_l].ptsY[p1_l];
+                        double ang = atan2(dy, dx) * 180.0 / PI;
+                        int px = (int)round(shapes[s2_l].ptsX[p2_l] * scaleFactor) + 10;
+                        int py = (int)round(shapes[s2_l].ptsY[p2_l] * scaleFactor) + 10;
+                        char buf[32]; distEditMode = 4;
+                        if (ang < 0) ang += 360.0;
+                        sprintf(buf, "%.2f", ang);
+                        SetWindowText(hDistEdit, buf); MoveWindow(hDistEdit, px, py, 60, 20, TRUE); ShowWindow(hDistEdit, SW_SHOW); SetFocus(hDistEdit);
+                    } else {
+                        ShowStatus(" Select exactly 2 nodes to set angle.");
                     }
                 }
-                else if (btnId == 27) {
-                    if (parsedCount > 0 && currentIconIdx >= 0) {
-                        if (parsedIcons[currentIconIdx].shapes) free(parsedIcons[currentIconIdx].shapes);
-                        for(i = currentIconIdx; i < parsedCount - 1; i++) {
-                            parsedIcons[i] = parsedIcons[i+1];
+                else if (btnId == 27) { 
+                    if (selOrderCount == 2) {
+                        if (dimCount < MAX_DIMS) {
+                            dims[dimCount].s1 = selOrderS[0];
+                            dims[dimCount].p1 = selOrderP[0];
+                            dims[dimCount].s2 = selOrderS[1];
+                            dims[dimCount].p2 = selOrderP[1];
+                            dims[dimCount].offset = 20.0;
+                            dims[dimCount].textPos = 0.5;
+                            dims[dimCount].mode = 0;
+                            dimCount++;
                         }
-                        parsedCount--;
-                        parsedIcons[parsedCount].shapes = NULL;
-                        SetScrollRange(hScrlIcon, SB_CTL, 0, parsedCount > 0 ? parsedCount - 1 : 0, TRUE);
-                        
-                        if (parsedCount == 0) {
-                            shapeCount = 0; currentIconIdx = -1; currentCaseId = 1; RedrawCanvas(hwnd); UpdateStatusBar();
-                        } else {
-                            currentIconIdx = -1;
-                            SwitchToIcon(0);
-                        }
+                        ClearSelection(); RedrawCanvas(hwnd);
+                    } else {
+                        ShowStatus(" Dimension tool needs exactly 2 nodes selected.");
                     }
                 }
             }
-            if (id != 300 && (id < 222 || id > 224)) SetFocus(hwnd); 
-            break;
+            if (id != 300 && (id < 222 || id > 224) && id != 226) SetFocus(hwnd); break;
         }
         case WM_PAINT: {
-            PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
+            PAINTSTRUCT ps; HDC hdc; HPEN pCur; HGDIOBJ old;
+            hdc = BeginPaint(hwnd, &ps);
             if (shapes) {
-                int imgBottom = canvasSize + 5;
                 DrawGrid(hdc); RenderShapes(hdc, shapes, shapeCount, scaleFactor, 0, 0, &currentShape, isDrawing);
-                DrawReferenceImage(hdc);
+                
                 if (currentMode == 0 || currentMode == 1 || currentMode == 2) DrawNodes(hdc);
                 if (currentMode == 7 && textCursorActive) {
-                    HPEN pCur = CreatePen(PS_SOLID, 2, RGB(255,165,0)); 
-                    HGDIOBJ old = SelectObject(hdc, pCur);
+                    pCur = CreatePen(PS_SOLID, 2, RGB(255,165,0)); old = SelectObject(hdc, pCur);
                     MoveTo(hdc, (int)(textCursorX*scaleFactor), (int)(textCursorY*scaleFactor)); 
                     LineTo(hdc, (int)(textCursorX*scaleFactor), (int)((textCursorY+5)*scaleFactor));
                     SelectObject(hdc, old); DeleteObject(pCur);
                 }
-                DrawPalette(hdc); DrawPreview(hdc); 
                 
-                SetBkMode(hdc, TRANSPARENT);
-                TextOut(hdc, 5, imgBottom - 2, "Icon", 4);
-                TextOut(hdc, 5, imgBottom + 16, "Alph", 4);
-                TextOut(hdc, 5 + canvasSize/2, imgBottom + 16, "Zoom", 4);
-                TextOut(hdc, 5, imgBottom + 34, "PanX", 4);
-                TextOut(hdc, 5 + canvasSize/2, imgBottom + 34, "PanY", 4);
-                TextOut(hdc, 5, imgBottom + 52, "StrX", 4);
-                TextOut(hdc, 5 + canvasSize/2, imgBottom + 52, "StrY", 4);
+                DrawDimensions(hdc);
+                DrawPalette(hdc); DrawPreview(hdc); 
             }
             EndPaint(hwnd, &ps);
             break;
         }
         case WM_DESTROY: {
             int i;
-            if (shapes) free(shapes);
-            if (dragStartSnapshot) free(dragStartSnapshot);
-            if (history) {
-                for(i=0; i<MAX_UNDO; i++) if (history[i]) free(history[i]);
-                free(history);
+            if (hDistEdit && oldEditProc) {
+                SetWindowLong(hDistEdit, GWL_WNDPROC, (LONG)oldEditProc);
             }
-            for(i=0; i<MAX_ICONS; i++) if (parsedIcons[i].shapes) { free(parsedIcons[i].shapes); parsedIcons[i].shapes = NULL; }
-            if (hRefBmp) DeleteObject(hRefBmp);
+            if (shapes) GlobalFreePtr(shapes);
+            if (dragStartSnapshot) GlobalFreePtr(dragStartSnapshot);
+            for(i=0; i<MAX_UNDO; i++) if (history[i]) GlobalFreePtr(history[i]);
+            for(i=0; i<parsedCount; i++) if (parsedIcons[i].shapes) GlobalFreePtr(parsedIcons[i].shapes);
+            
             if (subclassThunk) FreeProcInstance(subclassThunk);
-            PostQuitMessage(0); 
-            break;
+            
+            PostQuitMessage(0); break;
         }
         default: return DefWindowProc(hwnd, msg, wParam, lParam);
     }
     return 0L;
 }
-
 int PASCAL WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpszCmdLine, int nCmdShow) {
     MSG msg; WNDCLASS wc; hInst = hInstance;
     if (!hPrevInstance) {
@@ -1804,9 +2151,8 @@ int PASCAL WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpszCmdLi
         wc.lpszMenuName = NULL; wc.lpszClassName = "IconEditClass";
         if (!RegisterClass(&wc)) return FALSE;
     }
-    hMain = CreateWindow("IconEditClass", "Win16 C Pro Vector Editor", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 680, 560, NULL, NULL, hInstance, NULL);
-    if (!hMain) return FALSE; 
-    ShowWindow(hMain, nCmdShow); UpdateWindow(hMain);
+    hMain = CreateWindow("IconEditClass", "Win16 C Pro Vector Editor", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 680, 560, NULL, NULL, hInstance, NULL);
+    if (!hMain) return FALSE; ShowWindow(hMain, nCmdShow); UpdateWindow(hMain);
     while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
     return msg.wParam;
 }
