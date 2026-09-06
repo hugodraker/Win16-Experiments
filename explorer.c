@@ -7,6 +7,8 @@
  * Using OpenWatcom on Windows:
  *   wcl -ml -za99 -bt=windows -l=windows -k16k -zq -os -s explorer.c shell.lib commdlg.lib
  *
+ * PUBLIC DOMAIN NOTICE
+ * Free and unencumbered software released into the public domain.
  * ============================================================================
  */
 
@@ -22,12 +24,24 @@
 #include <ctype.h>
 #include <malloc.h>
 
+/* --- MEMORY FIX: Route all allocations to the Far Heap to prevent DGROUP stack collisions --- */
+#define malloc _fmalloc
+#define free _ffree
+
 #ifndef SS_NOTIFY
 #define SS_NOTIFY 0x0100L
 #endif
 
 #ifndef DEFAULT_GUI_FONT
 #define DEFAULT_GUI_FONT ANSI_VAR_FONT
+#endif
+
+#ifndef WS_EX_CLIENTEDGE
+#define WS_EX_CLIENTEDGE 0x00000200L
+#endif
+
+#ifndef GWL_ID
+#define GWL_ID (-12)
 #endif
 
 #define MAX_PATH 260
@@ -49,6 +63,13 @@
 
 #define PROMPT_RENAME 1
 #define PROMPT_NEWFOLDER 2
+
+typedef struct {
+    char pathOrId[MAX_PATH];
+    BOOL isVirtual;
+    int activeTab;
+    int viewMode;
+} WindowState;
 
 typedef struct {
     char id[16];
@@ -95,7 +116,7 @@ typedef struct {
     char name[MAX_PATH];
 } TempSubDir;
 
-/* --- Leak-proof dynamic arrays --- */
+/* --- Global State --- */
 IniShortcut FAR* g_IniShortcuts[MAX_INI_SHORTCUTS];
 int g_IniShortcutCount = 0;
 char g_szExplorerIni[MAX_PATH];
@@ -105,20 +126,21 @@ int g_ExpandedCount = 0;
 
 HINSTANCE g_hInst;
 HWND g_hwndMain;
-int g_DesktopSelectedIndex = -1;
+BOOL g_bIsWindowed = FALSE;
 
-/* Explorer View State Variables */
+HBRUSH g_hbrDesktop = NULL;
+HBRUSH g_hbrWindow = NULL;
+HBRUSH g_hbrHighlight = NULL;
+
 int g_SplitX = 200;
 int g_SortCol = 0;   
 int g_SortOrder = 1; 
-int g_ViewMode = 3; /* 0=Large, 1=Small, 2=List, 3=Details */
+int g_GlobalViewMode = 3; 
 BOOL g_bDraggingSplitter = FALSE;
-char g_CurrentPathOrId[MAX_PATH] = "0"; 
-BOOL g_CurrentIsVirtual = TRUE;
 BOOL g_bShowToolbar = TRUE;
 BOOL g_bShowStatusBar = TRUE;
+BOOL g_bStopSearch = FALSE;
 
-/* Context / Editing Variables */
 char g_ContextId[MAX_PATH] = "";
 BOOL g_ContextIsFolder = FALSE;
 BOOL g_ContextIsVirtual = TRUE;
@@ -127,19 +149,17 @@ int g_PromptMode = 0;
 char g_PromptValue[MAX_PATH] = "";
 char g_PromptLabel[64] = "";
 
-/* Grid Selection Tracking Variables */
 char g_SelectedListItemPath[MAX_PATH] = "";
 char g_SelectedListItemName[64] = "";
 BOOL g_SelectedListItemIsVirtual = FALSE;
 BOOL g_SelectedListItemIsDir = FALSE;
 
-/* --- Clipboard & Copy/Move --- */
 char g_ClipPath[MAX_PATH] = "";
 char g_ClipName[64] = "";
 char g_ClipId[16] = "";
 BOOL g_ClipIsVirtual = FALSE;
 BOOL g_ClipIsDir = FALSE;
-int g_ClipOp = 0; /* 1=Copy, 2=Cut */
+int g_ClipOp = 0; 
 
 typedef struct {
     char src[MAX_PATH];
@@ -154,12 +174,11 @@ BOOL g_DelIsDir = FALSE;
 BOOL g_bCancelDel = FALSE;
 HWND g_hDelDlg = NULL;
 
-int g_ReplaceMode = 0; /* 0=Prompt, 1=All, 2=Skip, 3=Cancel */
+int g_ReplaceMode = 0; 
 char g_ReplaceTarget[MAX_PATH] = "";
 int g_ProgressTick = 0;
 int g_ReplaceResult = 0;
 
-/* --- Global Subclass Instances (Leak Fix) --- */
 static FARPROC g_lpfnOldTreeProc = NULL;
 static FARPROC g_lpfnOldListProc = NULL;
 static FARPROC g_lpfnOldToolbarProc = NULL;
@@ -170,30 +189,35 @@ static FARPROC g_lpfnListProcInst = NULL;
 static FARPROC g_lpfnToolbarProcInst = NULL;
 static FARPROC g_lpfnInlineEditProcInst = NULL;
 
-/* --- Dragging State --- */
 static BOOL g_bListDragging = FALSE;
-
-/* --- Inline Rename Support --- */
 static char g_InlineRenameOldPath[MAX_PATH];
 static char g_InlineRenameId[16];
 static BOOL g_InlineRenameIsVirtual;
 
-/* --- Prototypes --- */
-static void RebuildTree(HWND hTree);
-static void RebuildList(HWND hwnd);
+static void RebuildTree(HWND hTree, WindowState FAR* state);
+static void RebuildList(HWND hwnd, WindowState FAR* state);
 static void LoadConfig(void);
 static void SaveConfig(void);
 static void LoadIniShortcuts(void);
-void ChangeViewMode(HWND hwnd, int mode);
+void ChangeViewMode(HWND hwnd, int mode, WindowState FAR* state);
 static void SaveIniEntry(IniShortcut FAR* item);
+void HandleListCommand(HWND hwndParent, WPARAM wp, LPARAM lp, WindowState FAR* state);
+static void ShowContextMenu(HWND hwnd, int x, int y, BOOL isDir, BOOL isBackground, int currentViewMode);
+void GetNewIniId(char* outId);
+void DoRecursiveSearch(ListItemData FAR* FAR* arr, const char* searchDir, const char* pattern, int* count, int filterType, unsigned long filterBytes, const char* containing);
+void LayoutListItems(HWND hList, ListItemData FAR* FAR* arr, int count, int viewMode);
+void HandleDrawItem(HWND hwnd, WPARAM wp, LPARAM lp);
 
-/* --- Helpers --- */
+void ShowTabControls(HWND hwnd, int tab) {
+    int i;
+    for (i = 600; i <= 610; i++) ShowWindow(GetDlgItem(hwnd, i), tab == 0 ? SW_SHOW : SW_HIDE);
+    for (i = 700; i <= 710; i++) ShowWindow(GetDlgItem(hwnd, i), tab == 1 ? SW_SHOW : SW_HIDE);
+    for (i = 800; i <= 810; i++) ShowWindow(GetDlgItem(hwnd, i), tab == 2 ? SW_SHOW : SW_HIDE);
+}
 
 void ProcessMessages(void) {
     MSG msg;
-    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&msg); DispatchMessage(&msg);
-    }
+    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
 }
 
 void UpdateProgressGauge(HWND hDlg) {
@@ -201,19 +225,16 @@ void UpdateProgressGauge(HWND hDlg) {
     HWND hGauge = GetDlgItem(hDlg, 102);
     if (hGauge) {
         HDC hdc = GetDC(hGauge); RECT rc; GetClientRect(hGauge, &rc);
-        HBRUSH hBlue = CreateSolidBrush(GetSysColor(COLOR_HIGHLIGHT));
-        HBRUSH hWhite = CreateSolidBrush(GetSysColor(COLOR_WINDOW));
         int w = (rc.right * g_ProgressTick) / 100;
-        RECT rFill = rc; rFill.right = w; FillRect(hdc, &rFill, hBlue);
-        RECT rClear = rc; rClear.left = w; FillRect(hdc, &rClear, hWhite);
-        DeleteObject(hBlue); DeleteObject(hWhite); ReleaseDC(hGauge, hdc);
+        RECT rFill = rc; rFill.right = w; FillRect(hdc, &rFill, g_hbrHighlight);
+        RECT rClear = rc; rClear.left = w; FillRect(hdc, &rClear, g_hbrWindow);
+        ReleaseDC(hGauge, hdc);
     }
 }
 
 int ShowModalReplaceDialog(HWND hParent) {
     HWND hDlg; MSG msg; int res; g_ReplaceResult = 0;
-    hDlg = CreateWindowEx(WS_EX_DLGMODALFRAME, "ReplaceDlgClass", "Confirm Replace", WS_POPUP|WS_CAPTION|WS_VISIBLE|WS_SYSMENU, 
-        (GetSystemMetrics(SM_CXSCREEN)-320)/2, (GetSystemMetrics(SM_CYSCREEN)-140)/2, 320, 140, hParent, NULL, g_hInst, NULL);
+    hDlg = CreateWindowEx(WS_EX_DLGMODALFRAME, "ReplaceDlgClass", "Confirm Replace", WS_POPUP|WS_CAPTION|WS_VISIBLE|WS_SYSMENU, (GetSystemMetrics(SM_CXSCREEN)-320)/2, (GetSystemMetrics(SM_CYSCREEN)-140)/2, 320, 140, hParent, NULL, g_hInst, NULL);
     EnableWindow(hParent, FALSE);
     while (g_ReplaceResult == 0 && GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
     res = g_ReplaceResult; EnableWindow(hParent, TRUE); DestroyWindow(hDlg);
@@ -224,137 +245,84 @@ BOOL DoCopyFile(HWND hDlg, const char* src, const char* dst) {
     FILE *fs, *fd; char *buf; size_t n;
     if (g_bCancelDel) return FALSE;
     if (access(dst, 0) == 0) {
-        if (g_ReplaceMode == 1) { /* Yes to All */ }
-        else if (g_ReplaceMode == 2) { return TRUE; /* Skip */ }
-        else {
-            lstrcpy(g_ReplaceTarget, dst);
-            int res = ShowModalReplaceDialog(hDlg);
-            if (res == 4) { g_ReplaceMode = 3; return FALSE; } 
-            if (res == 3) { return TRUE; } 
-            if (res == 2) { g_ReplaceMode = 1; } 
-        }
+        if (g_ReplaceMode == 1) { } else if (g_ReplaceMode == 2) { return TRUE; } 
+        else { lstrcpy(g_ReplaceTarget, dst); int res = ShowModalReplaceDialog(hDlg); if (res == 4) { g_ReplaceMode = 3; return FALSE; } if (res == 3) { return TRUE; } if (res == 2) { g_ReplaceMode = 1; } }
     }
     if (g_ReplaceMode == 3) return FALSE;
-    fs = fopen(src, "rb"); fd = fopen(dst, "wb");
-    if (!fs || !fd) { if (fs) fclose(fs); if (fd) fclose(fd); return FALSE; }
+    fs = fopen(src, "rb"); fd = fopen(dst, "wb"); if (!fs || !fd) { if (fs) fclose(fs); if (fd) fclose(fd); return FALSE; }
     buf = (char*)malloc(4096);
-    if (buf) {
-        while ((n = fread(buf, 1, 4096, fs)) > 0) { 
-            fwrite(buf, 1, n, fd); UpdateProgressGauge(hDlg); ProcessMessages(); 
-            if (g_bCancelDel) break;
-        }
-        free(buf);
-    }
-    fclose(fs); fclose(fd);
-    if (g_bCancelDel) remove(dst);
-    return !g_bCancelDel;
+    if (buf) { while ((n = fread(buf, 1, 4096, fs)) > 0) { fwrite(buf, 1, n, fd); UpdateProgressGauge(hDlg); ProcessMessages(); if (g_bCancelDel) break; } free(buf); }
+    fclose(fs); fclose(fd); if (g_bCancelDel) remove(dst); return !g_bCancelDel;
 }
 
 void DoCopyFolder(HWND hDlg, const char* src, const char* dst) {
-    struct find_t file; char *search; char *sPath; char *dPath;
-    HGLOBAL hMem; char FAR* fileBuf; int count = 0, i;
-    
-    if (strstr(dst, src) == dst) {
-        MessageBox(hDlg, "Cannot copy a folder into itself.", "Error", MB_OK|MB_ICONHAND);
-        g_ReplaceMode = 3; return;
-    }
-    
-    mkdir(dst);
-    search = (char*)malloc(MAX_PATH); if (!search) return;
-    lstrcpy(search, src);
-    if (search[0] != '\0' && search[lstrlen(search)-1] != '\\') lstrcat(search, "\\");
-    lstrcat(search, "*.*");
-    
-    hMem = GlobalAlloc(GHND, 4096L * 14L);
-    if (!hMem) { free(search); return; }
-    fileBuf = (char FAR*)GlobalLock(hMem);
-    
+    struct find_t file; char *search; char *sPath; char *dPath; char FAR* FAR* subDirs; int dirCount = 0; int i;
+    if (strstr(dst, src) == dst) { MessageBox(hDlg, "Cannot copy a folder into itself.", "Error", MB_OK|MB_ICONHAND); g_ReplaceMode = 3; return; }
+    mkdir(dst); search = (char*)malloc(MAX_PATH + 16); if (!search) return;
+    lstrcpy(search, src); if (search[0] != '\0' && search[lstrlen(search)-1] != '\\') lstrcat(search, "\\"); lstrcat(search, "*.*");
+    subDirs = (char FAR* FAR*)malloc(512 * sizeof(char FAR*));
     if (_dos_findfirst(search, _A_NORMAL|_A_SUBDIR|_A_RDONLY|_A_ARCH|_A_HIDDEN|_A_SYSTEM, &file) == 0) {
-        do {
-            if (lstrcmp(file.name, ".") != 0 && lstrcmp(file.name, "..") != 0 && count < 4096) {
-                lstrcpy((char FAR*)(fileBuf + count * 14), file.name);
-                count++;
-            }
-        } while (_dos_findnext(&file) == 0);
-    }
-    free(search);
-    
-    sPath = (char*)malloc(MAX_PATH); dPath = (char*)malloc(MAX_PATH);
-    if (sPath && dPath) {
-        for (i = 0; i < count; i++) {
-            char fname[16]; char fullS[MAX_PATH];
-            lstrcpy(fname, (char FAR*)(fileBuf + i * 14));
-            lstrcpy(sPath, src); if (sPath[lstrlen(sPath)-1] != '\\') lstrcat(sPath, "\\"); lstrcat(sPath, fname);
-            lstrcpy(dPath, dst); if (dPath[lstrlen(dPath)-1] != '\\') lstrcat(dPath, "\\"); lstrcat(dPath, fname);
-            
-            if (_dos_findfirst(sPath, _A_NORMAL|_A_SUBDIR|_A_RDONLY|_A_ARCH|_A_HIDDEN|_A_SYSTEM, &file) == 0) {
+        sPath = (char*)malloc(MAX_PATH + 16); dPath = (char*)malloc(MAX_PATH + 16);
+        if (sPath && dPath && subDirs) {
+            do {
                 if (g_ReplaceMode == 3 || g_bCancelDel) break;
                 UpdateProgressGauge(hDlg); ProcessMessages();
-                if (file.attrib & _A_SUBDIR) DoCopyFolder(hDlg, sPath, dPath);
-                else DoCopyFile(hDlg, sPath, dPath);
+                if (lstrcmp(file.name, ".") != 0 && lstrcmp(file.name, "..") != 0) {
+                    if (file.attrib & _A_SUBDIR) {
+                        if (dirCount < 512) { subDirs[dirCount] = (char FAR*)malloc(16); if (subDirs[dirCount]) lstrcpy(subDirs[dirCount++], file.name); }
+                    } else {
+                        lstrcpy(sPath, src); if (sPath[lstrlen(sPath)-1] != '\\') lstrcat(sPath, "\\"); lstrcat(sPath, file.name);
+                        lstrcpy(dPath, dst); if (dPath[lstrlen(dPath)-1] != '\\') lstrcat(dPath, "\\"); lstrcat(dPath, file.name);
+                        DoCopyFile(hDlg, sPath, dPath);
+                    }
+                }
+            } while (_dos_findnext(&file) == 0);
+            for (i = 0; i < dirCount; i++) {
+                if (g_ReplaceMode != 3 && !g_bCancelDel) {
+                    lstrcpy(sPath, src); if (sPath[lstrlen(sPath)-1] != '\\') lstrcat(sPath, "\\"); lstrcat(sPath, subDirs[i]);
+                    lstrcpy(dPath, dst); if (dPath[lstrlen(dPath)-1] != '\\') lstrcat(dPath, "\\"); lstrcat(dPath, subDirs[i]);
+                    DoCopyFolder(hDlg, sPath, dPath);
+                } free(subDirs[i]);
             }
-        }
-    }
-    if (sPath) free(sPath); if (dPath) free(dPath);
-    GlobalUnlock(hMem); GlobalFree(hMem);
+        } if (sPath) free(sPath); if (dPath) free(dPath);
+    } if (subDirs) free(subDirs); free(search);
 }
 
 BOOL DoDeleteFolder(const char* path) {
-    struct find_t file; char *search; char *child;
-    HGLOBAL hMem; char FAR* fileBuf; int count = 0, i;
-    
-    search = (char*)malloc(MAX_PATH); if (!search) return FALSE;
-    lstrcpy(search, path);
-    if (search[0] != '\0' && search[lstrlen(search)-1] != '\\') lstrcat(search, "\\");
-    lstrcat(search, "*.*");
-    
-    hMem = GlobalAlloc(GHND, 4096L * 14L);
-    if (!hMem) { free(search); return FALSE; }
-    fileBuf = (char FAR*)GlobalLock(hMem);
-    
+    struct find_t file; char *search; char *child; char FAR* FAR* subDirs; int dirCount = 0; int i;
+    search = (char*)malloc(MAX_PATH + 16); if (!search) return FALSE;
+    lstrcpy(search, path); if (search[0] != '\0' && search[lstrlen(search)-1] != '\\') lstrcat(search, "\\"); lstrcat(search, "*.*");
+    subDirs = (char FAR* FAR*)malloc(512 * sizeof(char FAR*));
     if (_dos_findfirst(search, _A_NORMAL|_A_SUBDIR|_A_RDONLY|_A_ARCH|_A_HIDDEN|_A_SYSTEM, &file) == 0) {
-        do {
-            if (lstrcmp(file.name, ".") != 0 && lstrcmp(file.name, "..") != 0 && count < 4096) {
-                lstrcpy((char FAR*)(fileBuf + count * 14), file.name);
-                count++;
-            }
-        } while (_dos_findnext(&file) == 0);
-    }
-    free(search);
-    
-    child = (char*)malloc(MAX_PATH);
-    if (child) {
-        for (i = 0; i < count; i++) {
-            char fname[16];
-            lstrcpy(fname, (char FAR*)(fileBuf + i * 14));
-            lstrcpy(child, path); if (child[lstrlen(child)-1] != '\\') lstrcat(child, "\\"); lstrcat(child, fname);
-            
-            if (_dos_findfirst(child, _A_NORMAL|_A_SUBDIR|_A_RDONLY|_A_ARCH|_A_HIDDEN|_A_SYSTEM, &file) == 0) {
+        child = (char*)malloc(MAX_PATH + 16);
+        if (child && subDirs) {
+            do {
                 if (g_bCancelDel) break;
-                if (g_hDelDlg) { UpdateProgressGauge(g_hDelDlg); ProcessMessages(); }
-                if (g_hDelDlg) { HWND hLbl = GetDlgItem(g_hDelDlg, 101); if (hLbl) { SetWindowText(hLbl, child); UpdateWindow(hLbl); } }
-                if (file.attrib & _A_SUBDIR) { DoDeleteFolder(child); if (!g_bCancelDel) rmdir(child); }
-                else remove(child);
+                if (g_hDelDlg) UpdateProgressGauge(g_hDelDlg); ProcessMessages();
+                if (lstrcmp(file.name, ".") != 0 && lstrcmp(file.name, "..") != 0) {
+                    if (file.attrib & _A_SUBDIR) {
+                        if (dirCount < 512) { subDirs[dirCount] = (char FAR*)malloc(16); if (subDirs[dirCount]) lstrcpy(subDirs[dirCount++], file.name); }
+                    } else {
+                        lstrcpy(child, path); if (child[lstrlen(child)-1] != '\\') lstrcat(child, "\\"); lstrcat(child, file.name);
+                        if (g_hDelDlg) { HWND hLbl = GetDlgItem(g_hDelDlg, 101); if (hLbl) { SetWindowText(hLbl, child); UpdateWindow(hLbl); } }
+                        remove(child);
+                    }
+                }
+            } while (_dos_findnext(&file) == 0);
+            for (i = 0; i < dirCount; i++) {
+                if (!g_bCancelDel) {
+                    lstrcpy(child, path); if (child[lstrlen(child)-1] != '\\') lstrcat(child, "\\"); lstrcat(child, subDirs[i]);
+                    if (g_hDelDlg) { HWND hLbl = GetDlgItem(g_hDelDlg, 101); if (hLbl) { SetWindowText(hLbl, child); UpdateWindow(hLbl); } }
+                    DoDeleteFolder(child); if (!g_bCancelDel) rmdir(child);
+                } free(subDirs[i]);
             }
-        }
-        free(child);
-    }
-    GlobalUnlock(hMem); GlobalFree(hMem);
-    return !g_bCancelDel;
+        } if (child) free(child);
+    } if (subDirs) free(subDirs); free(search); return !g_bCancelDel;
 }
 
 BOOL NameExists(const char* parentId, const char* name, BOOL isVirtual) {
-    if (isVirtual) {
-        int i; for (i=0; i<g_IniShortcutCount; i++) {
-            if (lstrcmp(g_IniShortcuts[i]->parentId, parentId) == 0 && lstrcmpi(g_IniShortcuts[i]->name, name) == 0) return TRUE;
-        }
-    } else {
-        char path[MAX_PATH]; lstrcpy(path, parentId);
-        if (path[0] && path[lstrlen(path)-1] != '\\') lstrcat(path, "\\");
-        lstrcat(path, name);
-        if (access(path, 0) == 0) return TRUE;
-    }
-    return FALSE;
+    if (isVirtual) { int i; for (i=0; i<g_IniShortcutCount; i++) { if (lstrcmp(g_IniShortcuts[i]->parentId, parentId) == 0 && lstrcmpi(g_IniShortcuts[i]->name, name) == 0) return TRUE; } } 
+    else { char path[MAX_PATH + 16]; lstrcpy(path, parentId); if (path[0] && path[lstrlen(path)-1] != '\\') lstrcat(path, "\\"); lstrcat(path, name); if (access(path, 0) == 0) return TRUE; } return FALSE;
 }
 
 void FormatDateStr(unsigned date, unsigned time, char* out) {
@@ -363,22 +331,12 @@ void FormatDateStr(unsigned date, unsigned time, char* out) {
 }
 
 void FormatSizeStr(unsigned long bytes, char* out) {
-    if (bytes < 1024) sprintf(out, "%lu bytes", bytes);
-    else if (bytes < 1048576) sprintf(out, "%lu KB", bytes / 1024);
-    else sprintf(out, "%lu.%02lu MB", bytes / 1048576, (bytes % 1048576) * 100 / 1048576);
+    if (bytes < 1024) sprintf(out, "%lu bytes", bytes); else if (bytes < 1048576) sprintf(out, "%lu KB", bytes / 1024); else sprintf(out, "%lu.%02lu MB", bytes / 1048576, (bytes % 1048576) * 100 / 1048576);
 }
 
 void GetExtension(const char* filename, char* extOut) {
     char* dot = strrchr(filename, '.');
-    if (dot) { 
-        int i = 0; dot++; 
-        while (*dot && i < 15) { 
-            extOut[i++] = (char)toupper((unsigned char)*dot); 
-            dot++; 
-        } 
-        extOut[i] = '\0'; 
-    } 
-    else lstrcpy(extOut, "");
+    if (dot) { int i = 0; dot++; while (*dot && i < 15) { extOut[i++] = (char)toupper((unsigned char)*dot); dot++; } extOut[i] = '\0'; } else lstrcpy(extOut, "");
 }
 
 BOOL BrowseFile(HWND hwnd, char* outPath, const char* filter) {
@@ -392,123 +350,63 @@ void CreateCenteredDialog(HINSTANCE hInst, HWND hwndParent, const char* classNam
     EnableWindow(hwndParent, FALSE);
 }
 
-/* --- Tree Expansion Sync --- */
-
 BOOL IsExpanded(const char* pathOrId) {
     int i; for (i = 0; i < g_ExpandedCount; i++) { if (g_ExpandedNodes[i] && lstrcmpi(g_ExpandedNodes[i], pathOrId) == 0) return TRUE; } return FALSE;
 }
 
 void ToggleExpand(const char* pathOrId) {
     int i;
-    for (i = 0; i < g_ExpandedCount; i++) {
-        if (g_ExpandedNodes[i] && lstrcmpi(g_ExpandedNodes[i], pathOrId) == 0) {
-            free(g_ExpandedNodes[i]); g_ExpandedCount--;
-            if (i < g_ExpandedCount) g_ExpandedNodes[i] = g_ExpandedNodes[g_ExpandedCount];
-            return;
-        }
-    }
-    if (g_ExpandedCount < MAX_EXPANDED_NODES) {
-        g_ExpandedNodes[g_ExpandedCount] = (char FAR*)malloc(MAX_PATH);
-        if (g_ExpandedNodes[g_ExpandedCount]) {
-            lstrcpy(g_ExpandedNodes[g_ExpandedCount++], pathOrId);
-        }
-    }
+    for (i = 0; i < g_ExpandedCount; i++) { if (g_ExpandedNodes[i] && lstrcmpi(g_ExpandedNodes[i], pathOrId) == 0) { free(g_ExpandedNodes[i]); g_ExpandedCount--; if (i < g_ExpandedCount) g_ExpandedNodes[i] = g_ExpandedNodes[g_ExpandedCount]; return; } }
+    if (g_ExpandedCount < MAX_EXPANDED_NODES) { g_ExpandedNodes[g_ExpandedCount] = (char FAR*)malloc(MAX_PATH); if (g_ExpandedNodes[g_ExpandedCount]) { lstrcpy(g_ExpandedNodes[g_ExpandedCount++], pathOrId); } }
 }
 
 void ExpandAllParentsVirtual(const char* id) {
-    int i;
-    for (i = 0; i < g_IniShortcutCount; i++) {
-        if (lstrcmp(g_IniShortcuts[i]->id, id) == 0) {
-            if (lstrcmp(g_IniShortcuts[i]->parentId, "0") != 0) {
-                ExpandAllParentsVirtual(g_IniShortcuts[i]->parentId);
-                if (!IsExpanded(g_IniShortcuts[i]->parentId)) ToggleExpand(g_IniShortcuts[i]->parentId);
-            } break;
-        }
-    }
+    int i; for (i = 0; i < g_IniShortcutCount; i++) { if (lstrcmp(g_IniShortcuts[i]->id, id) == 0) { if (lstrcmp(g_IniShortcuts[i]->parentId, "0") != 0) { ExpandAllParentsVirtual(g_IniShortcuts[i]->parentId); if (!IsExpanded(g_IniShortcuts[i]->parentId)) ToggleExpand(g_IniShortcuts[i]->parentId); } break; } }
 }
 
 void ExpandAllParentsFS(const char* path) {
-    char temp[MAX_PATH]; char* p; lstrcpy(temp, path); p = temp;
-    if (!IsExpanded("0")) ToggleExpand("0");
-    while (*p) {
-        if (*p == '\\' && p > temp) { char saved = *(p+1); *(p+1) = '\0'; if (!IsExpanded(temp)) ToggleExpand(temp); *(p+1) = saved; }
-        p++;
-    }
+    char temp[MAX_PATH]; char* p; lstrcpy(temp, path); p = temp; if (!IsExpanded("0")) ToggleExpand("0");
+    while (*p) { if (*p == '\\' && p > temp) { char saved = *(p+1); *(p+1) = '\0'; if (!IsExpanded(temp)) ToggleExpand(temp); *(p+1) = saved; } p++; }
 }
 
-/* --- INI Parsing --- */
-
 static void ParseIniEntry(const char* id, const char* val, IniShortcut FAR* out) {
-    const char* p = val; int i; char FAR* dests[7];
-    int maxLens[7] = {64, MAX_PATH, MAX_PATH, MAX_PATH, 8, 16, 16};
+    const char* p = val; int i; char FAR* dests[7]; int maxLens[7] = {64, MAX_PATH, MAX_PATH, MAX_PATH, 8, 16, 16};
     dests[0] = out->name; dests[1] = out->exe; dests[2] = out->params; dests[3] = out->icon; dests[4] = out->minimizedStr; dests[5] = out->parentId; dests[6] = out->hotkey;
     lstrcpy(out->id, id);
-    for (i = 0; i < 7; i++) {
-        char FAR* d = dests[i]; int c = 0; int maxL = maxLens[i];
-        while (*p && *p != '|') { if (c < maxL - 1) d[c++] = *p; p++; }
-        d[c] = '\0'; if (*p == '|') p++;
-    }
-    {
-        int flags = atoi(out->minimizedStr); out->minimized = (flags & 1) != 0; out->isFolder = (flags & 2) != 0;
-        if (out->exe[0] == '\0' && flags == 0 && lstrcmp(out->minimizedStr, "0") == 0) out->isFolder = TRUE;
-    }
+    for (i = 0; i < 7; i++) { char FAR* d = dests[i]; int c = 0; int maxL = maxLens[i]; while (*p && *p != '|') { if (c < maxL - 1) d[c++] = *p; p++; } d[c] = '\0'; if (*p == '|') p++; }
+    { int flags = atoi(out->minimizedStr); out->minimized = (flags & 1) != 0; out->isFolder = (flags & 2) != 0; if (out->exe[0] == '\0' && flags == 0 && lstrcmp(out->minimizedStr, "0") == 0) out->isFolder = TRUE; }
 }
 
 static void LoadIniShortcuts(void) {
     char *keys = (char*)malloc(4096); char *val = (char*)malloc(512); char *pKey, *p; int i;
-    
-    for (i = 0; i < g_IniShortcutCount; i++) {
-        if (g_IniShortcuts[i]) { free(g_IniShortcuts[i]); g_IniShortcuts[i] = NULL; }
-    }
-    g_IniShortcutCount = 0;
-    
-    if (!keys || !val) { if (keys) free(keys); if (val) free(val); return; }
-    
-    GetModuleFileName(g_hInst, g_szExplorerIni, MAX_PATH);
-    p = strrchr(g_szExplorerIni, '\\');
+    for (i = 0; i < g_IniShortcutCount; i++) { if (g_IniShortcuts[i]) { free(g_IniShortcuts[i]); g_IniShortcuts[i] = NULL; } }
+    g_IniShortcutCount = 0; if (!keys || !val) { if (keys) free(keys); if (val) free(val); return; }
+    GetModuleFileName(g_hInst, g_szExplorerIni, MAX_PATH); p = strrchr(g_szExplorerIni, '\\');
     if (p) { *(p + 1) = '\0'; lstrcat(g_szExplorerIni, "explorer.ini"); } else { lstrcpy(g_szExplorerIni, "explorer.ini"); }
-    
     GetPrivateProfileString("Shortcut", NULL, "", keys, 4096, g_szExplorerIni);
     if (keys[0] == '\0') {
         WritePrivateProfileString("Shortcut", "00000001", "Programs||||2|0|", g_szExplorerIni);
         WritePrivateProfileString("Shortcut", "00000005", "Search|winfile.exe||2|0|0|", g_szExplorerIni);
         GetPrivateProfileString("Shortcut", NULL, "", keys, 4096, g_szExplorerIni);
     }
-    
     pKey = keys;
     while (*pKey) {
         if (g_IniShortcutCount < MAX_INI_SHORTCUTS) {
             g_IniShortcuts[g_IniShortcutCount] = (IniShortcut FAR*)malloc(sizeof(IniShortcut));
-            if (g_IniShortcuts[g_IniShortcutCount]) {
-                GetPrivateProfileString("Shortcut", pKey, "", val, 512, g_szExplorerIni);
-                ParseIniEntry(pKey, val, g_IniShortcuts[g_IniShortcutCount]); 
-                g_IniShortcutCount++;
-            }
+            if (g_IniShortcuts[g_IniShortcutCount]) { GetPrivateProfileString("Shortcut", pKey, "", val, 512, g_szExplorerIni); ParseIniEntry(pKey, val, g_IniShortcuts[g_IniShortcutCount]); g_IniShortcutCount++; }
         } pKey += lstrlen(pKey) + 1;
     }
     free(keys); free(val);
-
     {
         int d;
         for (d = 0; d < 26 && g_IniShortcutCount < MAX_INI_SHORTCUTS; d++) {
             int type = GetDriveType(d);
             if (type == DRIVE_REMOVABLE || type == DRIVE_FIXED || type == DRIVE_REMOTE) {
-                char drvPath[8]; sprintf(drvPath, "%c:\\", 'A' + d);
-                BOOL exists = FALSE; int j;
-                for (j = 0; j < g_IniShortcutCount; j++) {
-                    if (lstrcmpi(g_IniShortcuts[j]->exe, drvPath) == 0 && lstrcmp(g_IniShortcuts[j]->parentId, "0") == 0) { 
-                        exists = TRUE; break; 
-                    }
-                }
+                char drvPath[8]; sprintf(drvPath, "%c:\\", 'A' + d); BOOL exists = FALSE; int j;
+                for (j = 0; j < g_IniShortcutCount; j++) { if (lstrcmpi(g_IniShortcuts[j]->exe, drvPath) == 0 && lstrcmp(g_IniShortcuts[j]->parentId, "0") == 0) { exists = TRUE; break; } }
                 if (!exists) {
                     IniShortcut FAR* sh = (IniShortcut FAR*)malloc(sizeof(IniShortcut));
-                    if (sh) {
-                        sprintf(sh->id, "DRV_%c", 'A' + d);
-                        sprintf(sh->name, "Local Disk (%c:)", 'A' + d);
-                        lstrcpy(sh->exe, drvPath); sh->params[0] = '\0'; sh->icon[0] = '\0'; sh->hotkey[0] = '\0';
-                        lstrcpy(sh->parentId, "0"); sh->minimized = 0; sh->isFolder = TRUE; lstrcpy(sh->minimizedStr, "2");
-                        g_IniShortcuts[g_IniShortcutCount++] = sh;
-                    }
+                    if (sh) { sprintf(sh->id, "DRV_%c", 'A' + d); sprintf(sh->name, "Local Disk (%c:)", 'A' + d); lstrcpy(sh->exe, drvPath); sh->params[0] = '\0'; sh->icon[0] = '\0'; sh->hotkey[0] = '\0'; lstrcpy(sh->parentId, "0"); sh->minimized = 0; sh->isFolder = TRUE; lstrcpy(sh->minimizedStr, "2"); g_IniShortcuts[g_IniShortcutCount++] = sh; }
                 }
             }
         }
@@ -516,118 +414,68 @@ static void LoadIniShortcuts(void) {
 }
 
 void GetNewIniId(char* outId) {
-    int maxId = 0, i;
-    for (i = 0; i < g_IniShortcutCount; i++) { int id = atoi(g_IniShortcuts[i]->id); if (id > maxId) maxId = id; }
-    sprintf(outId, "%08d", maxId + 1);
+    int maxId = 0, i; for (i = 0; i < g_IniShortcutCount; i++) { int id = atoi(g_IniShortcuts[i]->id); if (id > maxId) maxId = id; } sprintf(outId, "%08d", maxId + 1);
 }
 
 static void SaveIniEntry(IniShortcut FAR* item) {
-    char *val = (char*)malloc(1024); int flags;
-    if (!val) return;
+    char *val = (char*)malloc(1024); int flags; if (!val) return;
     flags = (item->minimized ? 1 : 0) | (item->isFolder ? 2 : 0);
     sprintf(val, "%s|%s|%s|%s|%d|%s|%s", item->name, item->exe, item->params, item->icon, flags, item->parentId, item->hotkey);
-    WritePrivateProfileString("Shortcut", item->id, val, g_szExplorerIni);
-    free(val);
+    WritePrivateProfileString("Shortcut", item->id, val, g_szExplorerIni); free(val);
 }
 
 static void LoadConfig(void) {
     LoadIniShortcuts();
-    g_SplitX = GetPrivateProfileInt("Settings", "SplitX", 200, g_szExplorerIni); g_SortCol = GetPrivateProfileInt("Settings", "SortCol", 0, g_szExplorerIni); g_SortOrder = GetPrivateProfileInt("Settings", "SortOrder", 1, g_szExplorerIni); g_bShowToolbar = GetPrivateProfileInt("Settings", "Toolbar", 1, g_szExplorerIni); g_bShowStatusBar = GetPrivateProfileInt("Settings", "StatusBar", 1, g_szExplorerIni); g_ViewMode = GetPrivateProfileInt("Settings", "ViewMode", 3, g_szExplorerIni);
-    if (g_SplitX < 50) g_SplitX = 50; if (g_ViewMode < 0 || g_ViewMode > 3) g_ViewMode = 3;
+    g_SplitX = GetPrivateProfileInt("Settings", "SplitX", 200, g_szExplorerIni); g_SortCol = GetPrivateProfileInt("Settings", "SortCol", 0, g_szExplorerIni); g_SortOrder = GetPrivateProfileInt("Settings", "SortOrder", 1, g_szExplorerIni); g_bShowToolbar = GetPrivateProfileInt("Settings", "Toolbar", 1, g_szExplorerIni); g_bShowStatusBar = GetPrivateProfileInt("Settings", "StatusBar", 1, g_szExplorerIni); g_GlobalViewMode = GetPrivateProfileInt("Settings", "ViewMode", 3, g_szExplorerIni);
+    if (g_SplitX < 50) g_SplitX = 50; if (g_GlobalViewMode < 0 || g_GlobalViewMode > 3) g_GlobalViewMode = 3;
 }
 
 static void SaveConfig(void) {
     char buf[16];
-    sprintf(buf, "%d", g_SplitX); WritePrivateProfileString("Settings", "SplitX", buf, g_szExplorerIni); sprintf(buf, "%d", g_SortCol); WritePrivateProfileString("Settings", "SortCol", buf, g_szExplorerIni); sprintf(buf, "%d", g_SortOrder); WritePrivateProfileString("Settings", "SortOrder", buf, g_szExplorerIni); sprintf(buf, "%d", g_bShowToolbar); WritePrivateProfileString("Settings", "Toolbar", buf, g_szExplorerIni); sprintf(buf, "%d", g_bShowStatusBar); WritePrivateProfileString("Settings", "StatusBar", buf, g_szExplorerIni); sprintf(buf, "%d", g_ViewMode); WritePrivateProfileString("Settings", "ViewMode", buf, g_szExplorerIni);
+    sprintf(buf, "%d", g_SplitX); WritePrivateProfileString("Settings", "SplitX", buf, g_szExplorerIni); sprintf(buf, "%d", g_SortCol); WritePrivateProfileString("Settings", "SortCol", buf, g_szExplorerIni); sprintf(buf, "%d", g_SortOrder); WritePrivateProfileString("Settings", "SortOrder", buf, g_szExplorerIni); sprintf(buf, "%d", g_bShowToolbar); WritePrivateProfileString("Settings", "Toolbar", buf, g_szExplorerIni); sprintf(buf, "%d", g_bShowStatusBar); WritePrivateProfileString("Settings", "StatusBar", buf, g_szExplorerIni); sprintf(buf, "%d", g_GlobalViewMode); WritePrivateProfileString("Settings", "ViewMode", buf, g_szExplorerIni);
 }
-
-/* --- List Sorting --- */
 
 int CompareListItems(ListItemData FAR* FAR* a, ListItemData FAR* FAR* b) {
     ListItemData FAR* ia = *a; ListItemData FAR* ib = *b; int cmp = 0;
     if (ia->isDir != ib->isDir) return ib->isDir - ia->isDir;
-    switch (g_SortCol) {
-        case 0: cmp = lstrcmpi(ia->name, ib->name); break;
-        case 1: cmp = (ia->size > ib->size) ? 1 : (ia->size < ib->size ? -1 : 0); break;
-        case 2: cmp = lstrcmpi(ia->ext, ib->ext); if(cmp==0) cmp = lstrcmpi(ia->name, ib->name); break;
-        case 3: if (ia->date != ib->date) cmp = (ia->date > ib->date) ? 1 : -1; else cmp = (ia->time > ib->time) ? 1 : (ia->time < ib->time ? -1 : 0); break;
-    } return cmp * g_SortOrder;
+    switch (g_SortCol) { case 0: cmp = lstrcmpi(ia->name, ib->name); break; case 1: cmp = (ia->size > ib->size) ? 1 : (ia->size < ib->size ? -1 : 0); break; case 2: cmp = lstrcmpi(ia->ext, ib->ext); if(cmp==0) cmp = lstrcmpi(ia->name, ib->name); break; case 3: if (ia->date != ib->date) cmp = (ia->date > ib->date) ? 1 : -1; else cmp = (ia->time > ib->time) ? 1 : (ia->time < ib->time ? -1 : 0); break; }
+    return cmp * g_SortOrder;
 }
 
 void SortListItems(ListItemData FAR* FAR* arr, int count) {
     int gap = count; BOOL swapped = TRUE; int i;
-    while (gap > 1 || swapped) {
-        gap = (gap * 10) / 13; if (gap == 9 || gap == 10) gap = 11; if (gap < 1) gap = 1;
-        swapped = FALSE;
-        for (i = 0; i < count - gap; i++) {
-            if (CompareListItems(&arr[i], &arr[i + gap]) > 0) {
-                ListItemData FAR* temp = arr[i]; arr[i] = arr[i + gap]; arr[i + gap] = temp; swapped = TRUE;
-            }
-        }
-    }
+    while (gap > 1 || swapped) { gap = (gap * 10) / 13; if (gap == 9 || gap == 10) gap = 11; if (gap < 1) gap = 1; swapped = FALSE; for (i = 0; i < count - gap; i++) { if (CompareListItems(&arr[i], &arr[i + gap]) > 0) { ListItemData FAR* temp = arr[i]; arr[i] = arr[i + gap]; arr[i + gap] = temp; swapped = TRUE; } } }
 }
 
-int CompareSubDirs(TempSubDir FAR* FAR* a, TempSubDir FAR* FAR* b) {
-    TempSubDir FAR* ia = *a; TempSubDir FAR* ib = *b; return lstrcmpi(ia->name, ib->name);
-}
+int CompareSubDirs(TempSubDir FAR* FAR* a, TempSubDir FAR* FAR* b) { TempSubDir FAR* ia = *a; TempSubDir FAR* ib = *b; return lstrcmpi(ia->name, ib->name); }
 
 void SortSubDirs(TempSubDir FAR* FAR* arr, int count) {
     int gap = count; BOOL swapped = TRUE; int i;
-    while (gap > 1 || swapped) {
-        gap = (gap * 10) / 13; if (gap == 9 || gap == 10) gap = 11; if (gap < 1) gap = 1;
-        swapped = FALSE;
-        for (i = 0; i < count - gap; i++) {
-            if (CompareSubDirs(&arr[i], &arr[i + gap]) > 0) {
-                TempSubDir FAR* temp = arr[i]; arr[i] = arr[i + gap]; arr[i + gap] = temp; swapped = TRUE;
-            }
-        }
-    }
+    while (gap > 1 || swapped) { gap = (gap * 10) / 13; if (gap == 9 || gap == 10) gap = 11; if (gap < 1) gap = 1; swapped = FALSE; for (i = 0; i < count - gap; i++) { if (CompareSubDirs(&arr[i], &arr[i + gap]) > 0) { TempSubDir FAR* temp = arr[i]; arr[i] = arr[i + gap]; arr[i + gap] = temp; swapped = TRUE; } } }
 }
-
-/* --- Data Population --- */
 
 void AddTreeItem(HWND hTree, const char* name, const char* pathOrId, int level, BOOL hasChildren, BOOL isVirtual, BOOL* parentLastChildArr, BOOL isLast) {
     TreeItemData FAR* item = (TreeItemData FAR*)malloc(sizeof(TreeItemData)); int pos, i;
     if (!item) return; lstrcpy(item->pathOrId, pathOrId); lstrcpyn(item->displayName, name, 63); item->level = level; item->hasChildren = hasChildren; item->expanded = IsExpanded(pathOrId); item->isVirtual = isVirtual;
     for (i = 0; i < level; i++) item->isLastChild[i] = parentLastChildArr[i]; item->isLastChild[level] = isLast;
-    
-    pos = SendMessage(hTree, LB_ADDSTRING, 0, (LPARAM)item); 
-    if (pos < 0) {
-        free(item);
-    }
+    pos = SendMessage(hTree, LB_ADDSTRING, 0, (LPARAM)item); if (pos < 0) { free(item); }
 }
 
 void RecursiveAddTreeFS(HWND hTree, const char* path, int level, BOOL* parentLastChildArr) {
-    struct find_t file; char *searchPath; TempSubDir FAR* FAR* dirs; int dirCount = 0, i;
-    
-    dirs = (TempSubDir FAR* FAR*)malloc(512 * sizeof(TempSubDir FAR*)); 
-    searchPath = (char*)malloc(MAX_PATH);
-    if (!dirs || !searchPath) { if(dirs) free(dirs); if(searchPath) free(searchPath); return; }
+    struct find_t file; char searchPath[MAX_PATH + 16]; TempSubDir FAR* FAR* dirs; int dirCount = 0, i;
+    dirs = (TempSubDir FAR* FAR*)malloc(256 * sizeof(TempSubDir FAR*)); 
+    if (!dirs) return;
     
     lstrcpy(searchPath, path); if (searchPath[0] != '\0' && searchPath[lstrlen(searchPath)-1] != '\\') lstrcat(searchPath, "\\"); lstrcat(searchPath, "*.*");
-    
-    if (_dos_findfirst(searchPath, _A_NORMAL | _A_SUBDIR | _A_RDONLY | _A_ARCH, &file) == 0) {
-        do {
-            if ((file.attrib & _A_SUBDIR) && lstrcmp(file.name, ".") != 0 && lstrcmp(file.name, "..") != 0 && dirCount < 512) {
-                dirs[dirCount] = (TempSubDir FAR*)malloc(sizeof(TempSubDir));
-                if (dirs[dirCount]) { lstrcpy(dirs[dirCount]->name, file.name); dirCount++; }
-            }
-        } while (_dos_findnext(&file) == 0);
-    }
-    free(searchPath);
+    if (_dos_findfirst(searchPath, _A_NORMAL | _A_SUBDIR | _A_RDONLY | _A_ARCH, &file) == 0) { do { if ((file.attrib & _A_SUBDIR) && lstrcmp(file.name, ".") != 0 && lstrcmp(file.name, "..") != 0 && dirCount < 256) { dirs[dirCount] = (TempSubDir FAR*)malloc(sizeof(TempSubDir)); if (dirs[dirCount]) { lstrcpy(dirs[dirCount]->name, file.name); dirCount++; } } } while (_dos_findnext(&file) == 0); }
     SortSubDirs(dirs, dirCount);
     
     for (i = 0; i < dirCount; i++) {
-        char *fullPath = (char*)malloc(MAX_PATH);
-        BOOL isExp, isLast = (i == dirCount - 1);
-        if (fullPath) {
-            lstrcpy(fullPath, path); if (fullPath[0] != '\0' && fullPath[lstrlen(fullPath)-1] != '\\') lstrcat(fullPath, "\\"); lstrcat(fullPath, dirs[i]->name);
-            isExp = IsExpanded(fullPath); AddTreeItem(hTree, dirs[i]->name, fullPath, level, TRUE, FALSE, parentLastChildArr, isLast); 
-            if (isExp && level < MAX_TREE_LEVEL - 1) {
-                BOOL newArr[MAX_TREE_LEVEL]; int j; for (j = 0; j < level; j++) newArr[j] = parentLastChildArr[j]; newArr[level] = isLast; RecursiveAddTreeFS(hTree, fullPath, level + 1, newArr);
-            }
-            free(fullPath);
-        } free(dirs[i]);
+        char fullPath[MAX_PATH + 16]; BOOL isExp, isLast = (i == dirCount - 1);
+        lstrcpy(fullPath, path); if (fullPath[0] != '\0' && fullPath[lstrlen(fullPath)-1] != '\\') lstrcat(fullPath, "\\"); lstrcat(fullPath, dirs[i]->name);
+        isExp = IsExpanded(fullPath); AddTreeItem(hTree, dirs[i]->name, fullPath, level, TRUE, FALSE, parentLastChildArr, isLast); 
+        if (isExp && level < MAX_TREE_LEVEL - 1) { BOOL newArr[MAX_TREE_LEVEL]; int j; for (j = 0; j < level; j++) newArr[j] = parentLastChildArr[j]; newArr[level] = isLast; RecursiveAddTreeFS(hTree, fullPath, level + 1, newArr); }
+        free(dirs[i]);
     } free(dirs);
 }
 
@@ -648,122 +496,120 @@ void RecursiveAddTreeVirtual(HWND hTree, const char* parentId, int level, BOOL* 
     }
 }
 
-static void RebuildTree(HWND hTree) {
+static void RebuildTree(HWND hTree, WindowState FAR* state) {
     int i, count; char targetSel[MAX_PATH]; BOOL rootArr[MAX_TREE_LEVEL];
-    memset(rootArr, 0, sizeof(rootArr)); SendMessage(hTree, WM_SETREDRAW, FALSE, 0); lstrcpy(targetSel, g_CurrentPathOrId); SendMessage(hTree, LB_RESETCONTENT, 0, 0);
+    memset(rootArr, 0, sizeof(rootArr)); SendMessage(hTree, WM_SETREDRAW, FALSE, 0); lstrcpy(targetSel, state->pathOrId); SendMessage(hTree, LB_RESETCONTENT, 0, 0);
     AddTreeItem(hTree, "Desktop", "0", 0, TRUE, TRUE, rootArr, TRUE);
-    if (IsExpanded("0")) {
-        BOOL newArr[MAX_TREE_LEVEL]; newArr[0] = TRUE; RecursiveAddTreeVirtual(hTree, "0", 1, newArr);
-    }
+    if (IsExpanded("0")) { BOOL newArr[MAX_TREE_LEVEL]; newArr[0] = TRUE; RecursiveAddTreeVirtual(hTree, "0", 1, newArr); }
     count = SendMessage(hTree, LB_GETCOUNT, 0, 0);
     for (i = 0; i < count; i++) { TreeItemData FAR* item = (TreeItemData FAR*)SendMessage(hTree, LB_GETITEMDATA, i, 0); if (item && lstrcmpi(item->pathOrId, targetSel) == 0) { SendMessage(hTree, LB_SETCURSEL, i, 0); break; } }
     SendMessage(hTree, WM_SETREDRAW, TRUE, 0); InvalidateRect(hTree, NULL, TRUE);
 }
 
-void ChangeViewMode(HWND hwnd, int mode) {
-    HWND hOldList = GetDlgItem(hwnd, ID_LIST);
-    DWORD style = WS_CHILD | WS_VISIBLE | LBS_OWNERDRAWFIXED | LBS_NOTIFY | WS_BORDER | LBS_EXTENDEDSEL; HMENU hMenu = GetMenu(hwnd); RECT rc;
+void LayoutListItems(HWND hList, ListItemData FAR* FAR* arr, int count, int viewMode) {
+    int i;
+    SendMessage(hList, WM_SETREDRAW, FALSE, 0);
+    SendMessage(hList, LB_RESETCONTENT, 0, 0);
+    if (viewMode == 0) {
+        RECT rcList; GetClientRect(hList, &rcList); int listW = rcList.right - rcList.left; int colW = CELL_W; int cols, r;
+        if (listW < colW) listW = colW; cols = listW / colW; if (cols > 16) cols = 16; if (cols < 1) cols = 1;
+        for (r = 0; r < count; r += cols) {
+            RowItemData FAR* row = (RowItemData FAR*)malloc(sizeof(RowItemData));
+            if (row) { 
+                int c, pos; row->type = 2; row->count = 0; 
+                for (c = 0; c < cols && r + c < count; c++) { row->items[c] = arr[r + c]; row->items[c]->type = 1; row->count++; } 
+                pos = SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)row); 
+                if (pos < 0) { for (c = 0; c < row->count; c++) free(row->items[c]); free(row); } 
+            } else { int c; for (c = 0; c < cols && r + c < count; c++) free(arr[r + c]); }
+        }
+    } else {
+        for (i = 0; i < count; i++) { arr[i]->type = 1; int pos = SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)arr[i]); if (pos < 0) { free(arr[i]); } }
+    }
+    SendMessage(hList, WM_SETREDRAW, TRUE, 0); InvalidateRect(hList, NULL, TRUE);
+}
+
+void ChangeViewMode(HWND hwnd, int mode, WindowState FAR* state) {
+    HWND hOldList = GetDlgItem(hwnd, ID_LIST); char cls[64]; GetClassName(hwnd, cls, 64);
+    DWORD style = WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | LBS_OWNERDRAWFIXED | LBS_NOTIFY | LBS_EXTENDEDSEL; 
+    if (lstrcmpi(cls, "Win95DesktopClass") != 0) style |= WS_BORDER;
+    
+    HMENU hMenu = GetMenu(hwnd); RECT rc;
     if (mode == 1 || mode == 2) style |= LBS_MULTICOLUMN | WS_HSCROLL; else style |= WS_VSCROLL;
-    g_ViewMode = mode; SaveConfig();
+    if (state) state->viewMode = mode; 
+    if (lstrcmpi(cls, "Win95FolderClass") == 0) { g_GlobalViewMode = mode; SaveConfig(); }
     if (hMenu) { CheckMenuItem(hMenu, 4022, MF_BYCOMMAND | (mode == 0 ? MF_CHECKED : MF_UNCHECKED)); CheckMenuItem(hMenu, 4023, MF_BYCOMMAND | (mode == 1 ? MF_CHECKED : MF_UNCHECKED)); CheckMenuItem(hMenu, 4024, MF_BYCOMMAND | (mode == 2 ? MF_CHECKED : MF_UNCHECKED)); CheckMenuItem(hMenu, 4025, MF_BYCOMMAND | (mode == 3 ? MF_CHECKED : MF_UNCHECKED)); }
     if (hOldList) DestroyWindow(hOldList);
+    
     {
         HWND hNewList = CreateWindowEx(0, "LISTBOX", "", style, 0, 0, 0, 0, hwnd, (HMENU)ID_LIST, g_hInst, NULL);
         SendMessage(hNewList, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), FALSE);
         if (mode == 1 || mode == 2) SendMessage(hNewList, LB_SETCOLUMNWIDTH, 150, 0);
         g_lpfnOldListProc = (FARPROC)SetWindowLong(hNewList, GWL_WNDPROC, (LONG)g_lpfnListProcInst);
     }
-    RebuildList(hwnd); GetClientRect(hwnd, &rc); SendMessage(hwnd, WM_SIZE, 0, MAKELONG(rc.right, rc.bottom));
+    
+    GetClientRect(hwnd, &rc); SendMessage(hwnd, WM_SIZE, 0, MAKELONG(rc.right, rc.bottom));
+    if (state) {
+        if (lstrcmpi(cls, "Win95SearchClass") != 0) {
+            RebuildList(hwnd, state);
+        }
+    }
 }
 
-static void RebuildList(HWND hwnd) {
+static void RebuildList(HWND hwnd, WindowState FAR* state) {
     HWND hList = GetDlgItem(hwnd, ID_LIST); int i, count = 0; unsigned long totalBytes = 0; char statBuf[128]; char sizeStr[64];
-    ListItemData FAR* FAR* arr = (ListItemData FAR* FAR*)malloc(MAX_LIST_ITEMS * sizeof(ListItemData FAR*)); if (!arr) return;
-    SendMessage(hList, WM_SETREDRAW, FALSE, 0); SendMessage(hList, LB_RESETCONTENT, 0, 0); g_SelectedListItemPath[0] = '\0'; g_SelectedListItemName[0] = '\0';
+    
+    ListItemData FAR* FAR* arr = (ListItemData FAR* FAR*)malloc(MAX_LIST_ITEMS * sizeof(ListItemData FAR*)); 
+    if (!arr) return;
+    
+    g_SelectedListItemPath[0] = '\0'; g_SelectedListItemName[0] = '\0';
 
-    if (g_CurrentIsVirtual) {
+    if (state->isVirtual) {
         for (i = 0; i < g_IniShortcutCount && count < MAX_LIST_ITEMS; i++) {
-            if (lstrcmp(g_IniShortcuts[i]->parentId, g_CurrentPathOrId) == 0 && lstrcmp(g_IniShortcuts[i]->name, "-") != 0) {
+            if (lstrcmp(g_IniShortcuts[i]->parentId, state->pathOrId) == 0 && lstrcmp(g_IniShortcuts[i]->name, "-") != 0) {
                 arr[count] = (ListItemData FAR*)malloc(sizeof(ListItemData));
-                if (arr[count]) { 
+                if (arr[count]) {
                     lstrcpyn(arr[count]->name, g_IniShortcuts[i]->name, 63); 
-                    if (g_IniShortcuts[i]->isFolder && g_IniShortcuts[i]->exe[0] != '\0') {
-                        lstrcpy(arr[count]->path, g_IniShortcuts[i]->exe); arr[count]->isVirtual = FALSE;
-                    } else {
-                        lstrcpy(arr[count]->path, g_IniShortcuts[i]->id); arr[count]->isVirtual = TRUE;
-                    }
-                    arr[count]->isDir = g_IniShortcuts[i]->isFolder; GetExtension(arr[count]->name, arr[count]->ext); 
-                    if (arr[count]->isDir) lstrcpy(arr[count]->ext, ""); 
+                    if (g_IniShortcuts[i]->isFolder && g_IniShortcuts[i]->exe[0] != '\0') { lstrcpy(arr[count]->path, g_IniShortcuts[i]->exe); arr[count]->isVirtual = FALSE; } else { lstrcpy(arr[count]->path, g_IniShortcuts[i]->id); arr[count]->isVirtual = TRUE; }
+                    arr[count]->isDir = g_IniShortcuts[i]->isFolder; GetExtension(arr[count]->name, arr[count]->ext); if (arr[count]->isDir) lstrcpy(arr[count]->ext, ""); 
                     arr[count]->size = 0; arr[count]->date = 0; arr[count]->time = 0; count++; 
                 }
             }
         }
     } else {
-        struct find_t file; char searchPath[MAX_PATH]; lstrcpy(searchPath, g_CurrentPathOrId);
-        
+        struct find_t file; char searchPath[MAX_PATH + 16]; lstrcpy(searchPath, state->pathOrId);
         for (i = 0; i < g_IniShortcutCount && count < MAX_LIST_ITEMS; i++) {
-            if (lstrcmp(g_IniShortcuts[i]->parentId, g_CurrentPathOrId) == 0 && lstrcmp(g_IniShortcuts[i]->name, "-") != 0) {
+            if (lstrcmp(g_IniShortcuts[i]->parentId, state->pathOrId) == 0 && lstrcmp(g_IniShortcuts[i]->name, "-") != 0) {
                 arr[count] = (ListItemData FAR*)malloc(sizeof(ListItemData));
-                if (arr[count]) { 
+                if (arr[count]) {
                     lstrcpyn(arr[count]->name, g_IniShortcuts[i]->name, 63); 
-                    if (g_IniShortcuts[i]->isFolder && g_IniShortcuts[i]->exe[0] != '\0') {
-                        lstrcpy(arr[count]->path, g_IniShortcuts[i]->exe); arr[count]->isVirtual = FALSE;
-                    } else {
-                        lstrcpy(arr[count]->path, g_IniShortcuts[i]->id); arr[count]->isVirtual = TRUE;
-                    }
-                    arr[count]->isDir = g_IniShortcuts[i]->isFolder; GetExtension(arr[count]->name, arr[count]->ext); 
-                    if (arr[count]->isDir) lstrcpy(arr[count]->ext, ""); 
+                    if (g_IniShortcuts[i]->isFolder && g_IniShortcuts[i]->exe[0] != '\0') { lstrcpy(arr[count]->path, g_IniShortcuts[i]->exe); arr[count]->isVirtual = FALSE; } else { lstrcpy(arr[count]->path, g_IniShortcuts[i]->id); arr[count]->isVirtual = TRUE; }
+                    arr[count]->isDir = g_IniShortcuts[i]->isFolder; GetExtension(arr[count]->name, arr[count]->ext); if (arr[count]->isDir) lstrcpy(arr[count]->ext, ""); 
                     arr[count]->size = 0; arr[count]->date = 0; arr[count]->time = 0; count++; 
                 }
             }
         }
         if (searchPath[0] != '\0' && searchPath[lstrlen(searchPath)-1] != '\\') lstrcat(searchPath, "\\"); lstrcat(searchPath, "*.*");
-        
         if (_dos_findfirst(searchPath, _A_NORMAL | _A_SUBDIR | _A_RDONLY | _A_ARCH, &file) == 0) {
             do {
                 if (lstrcmp(file.name, ".") != 0 && lstrcmp(file.name, "..") != 0 && count < MAX_LIST_ITEMS) {
                     arr[count] = (ListItemData FAR*)malloc(sizeof(ListItemData));
-                    if (arr[count]) { lstrcpy(arr[count]->name, file.name); lstrcpy(arr[count]->path, g_CurrentPathOrId); if (arr[count]->path[0] != '\0' && arr[count]->path[lstrlen(arr[count]->path)-1] != '\\') lstrcat(arr[count]->path, "\\"); lstrcat(arr[count]->path, file.name); arr[count]->isDir = (file.attrib & _A_SUBDIR) ? TRUE : FALSE; arr[count]->isVirtual = FALSE; arr[count]->size = file.size; arr[count]->date = file.wr_date; arr[count]->time = file.wr_time; GetExtension(file.name, arr[count]->ext); if (arr[count]->isDir) { lstrcpy(arr[count]->ext, ""); } else { totalBytes += file.size; } count++; }
+                    if (arr[count]) {
+                        lstrcpy(arr[count]->name, file.name); lstrcpy(arr[count]->path, state->pathOrId); if (arr[count]->path[0] != '\0' && arr[count]->path[lstrlen(arr[count]->path)-1] != '\\') lstrcat(arr[count]->path, "\\"); lstrcat(arr[count]->path, file.name); arr[count]->isDir = (file.attrib & _A_SUBDIR) ? TRUE : FALSE; arr[count]->isVirtual = FALSE; arr[count]->size = file.size; arr[count]->date = file.wr_date; arr[count]->time = file.wr_time; GetExtension(file.name, arr[count]->ext); if (arr[count]->isDir) { lstrcpy(arr[count]->ext, ""); } else { totalBytes += file.size; } count++; 
+                    }
                 }
             } while (_dos_findnext(&file) == 0);
         }
     }
     SortListItems(arr, count);
-
-    if (g_ViewMode == 0 || g_ViewMode == 1) {
-        RECT rcList; GetClientRect(hList, &rcList); int listW = rcList.right - rcList.left; int colW = (g_ViewMode == 0) ? CELL_W : 150; int cols, r;
-        if (listW < colW) listW = colW; cols = listW / colW; if (cols > 16) cols = 16; if (cols < 1) cols = 1;
-        for (r = 0; r < count; r += cols) {
-            RowItemData FAR* row = (RowItemData FAR*)malloc(sizeof(RowItemData));
-            if (row) { 
-                int c, pos; row->type = 2; row->count = 0; 
-                for (c = 0; c < cols && r + c < count; c++) { 
-                    row->items[c] = arr[r + c]; row->items[c]->type = 1; row->count++; 
-                } 
-                pos = SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)row); 
-                if (pos < 0) {
-                    for (c = 0; c < row->count; c++) free(row->items[c]);
-                    free(row);
-                }
-            } else {
-                int c;
-                for (c = 0; c < cols && r + c < count; c++) free(arr[r + c]);
-            }
-        }
-    } else {
-        for (i = 0; i < count; i++) { 
-            int pos; arr[i]->type = 1; pos = SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)arr[i]); 
-            if (pos < 0) {
-                free(arr[i]);
-            }
-        }
-    }
+    LayoutListItems(hList, arr, count, state->viewMode);
     
-    free(arr); SendMessage(hList, WM_SETREDRAW, TRUE, 0); InvalidateRect(hList, NULL, TRUE);
-    if (g_bShowStatusBar) { FormatSizeStr(totalBytes, sizeStr); sprintf(statBuf, " %d object(s)     %s", count, sizeStr); SetWindowText(GetDlgItem(hwnd, 300), statBuf); }
+    free(arr);
+    
+    if (g_bShowStatusBar) { 
+        FormatSizeStr(totalBytes, sizeStr); sprintf(statBuf, " %d object(s)     %s", count, sizeStr); 
+        HWND hStat = GetDlgItem(hwnd, 300); if (hStat) SetWindowText(hStat, statBuf); 
+    }
 }
-
-/* --- GDI Drawing Utilities --- */
 
 static void Draw3DButton(HDC hdc, int left, int top, int right, int bottom, BOOL bPushed) {
     HPEN hHi = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_BTNHIGHLIGHT)); HPEN hSh = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_BTNSHADOW)); HPEN hOld = SelectObject(hdc, bPushed ? hSh : hHi);
@@ -773,13 +619,9 @@ static void Draw3DButton(HDC hdc, int left, int top, int right, int bottom, BOOL
 
 static void DrawGDIFolder(HDC hdc, int x, int y, BOOL bOpen, BOOL bSelected, BOOL bLarge) {
     HBRUSH hBr = CreateSolidBrush(bSelected ? GetSysColor(COLOR_HIGHLIGHT) : RGB(255, 255, 128)); HBRUSH hOld = SelectObject(hdc, hBr); HPEN hPen = GetStockObject(BLACK_PEN); HPEN hOldP = SelectObject(hdc, hPen);
-    if (bLarge) {
-        if (bOpen) { Rectangle(hdc, x+2, y+4, x+14, y+12); Rectangle(hdc, x, y+10, x+30, y+28); MoveTo(hdc, x, y+28); LineTo(hdc, x+8, y+16); LineTo(hdc, x+36, y+16); LineTo(hdc, x+30, y+28); } 
-        else { Rectangle(hdc, x+2, y+4, x+14, y+12); Rectangle(hdc, x, y+10, x+32, y+28); }
-    } else {
-        if (bOpen) { Rectangle(hdc, x+1, y+2, x+7, y+6); Rectangle(hdc, x, y+5, x+15, y+14); MoveTo(hdc, x, y+14); LineTo(hdc, x+4, y+8); LineTo(hdc, x+18, y+8); LineTo(hdc, x+15, y+14); } 
-        else { Rectangle(hdc, x+1, y+2, x+7, y+6); Rectangle(hdc, x, y+5, x+16, y+14); }
-    } SelectObject(hdc, hOldP); SelectObject(hdc, hOld); DeleteObject(hBr);
+    if (bLarge) { if (bOpen) { Rectangle(hdc, x+2, y+4, x+14, y+12); Rectangle(hdc, x, y+10, x+30, y+28); MoveTo(hdc, x, y+28); LineTo(hdc, x+8, y+16); LineTo(hdc, x+36, y+16); LineTo(hdc, x+30, y+28); } else { Rectangle(hdc, x+2, y+4, x+14, y+12); Rectangle(hdc, x, y+10, x+32, y+28); } } 
+    else { if (bOpen) { Rectangle(hdc, x+1, y+2, x+7, y+6); Rectangle(hdc, x, y+5, x+15, y+14); MoveTo(hdc, x, y+14); LineTo(hdc, x+4, y+8); LineTo(hdc, x+18, y+8); LineTo(hdc, x+15, y+14); } else { Rectangle(hdc, x+1, y+2, x+7, y+6); Rectangle(hdc, x, y+5, x+16, y+14); } } 
+    SelectObject(hdc, hOldP); SelectObject(hdc, hOld); DeleteObject(hBr);
 }
 
 static void DrawGDIFile(HDC hdc, int x, int y, BOOL bSelected, BOOL bLarge) {
@@ -795,20 +637,51 @@ static void DrawPlusMinus(HDC hdc, int x, int y, BOOL bExpanded) {
     SelectObject(hdc, hOld); SelectObject(hdc, hOldP);
 }
 
-/* --- Context Menus --- */
-static void ShowContextMenu(HWND hwnd, int x, int y, BOOL isDir, BOOL isBackground) {
+static void ShowContextMenu(HWND hwnd, int x, int y, BOOL isDir, BOOL isBackground, int currentViewMode) {
     HMENU hCtx = CreatePopupMenu();
     if (isBackground) {
-        AppendMenu(hCtx, MF_STRING | (g_ViewMode == 0 ? MF_CHECKED : 0), 4022, "Lar&ge Icons"); AppendMenu(hCtx, MF_STRING | (g_ViewMode == 1 ? MF_CHECKED : 0), 4023, "S&mall Icons"); AppendMenu(hCtx, MF_STRING | (g_ViewMode == 2 ? MF_CHECKED : 0), 4024, "&List"); AppendMenu(hCtx, MF_STRING | (g_ViewMode == 3 ? MF_CHECKED : 0), 4025, "&Details"); AppendMenu(hCtx, MF_SEPARATOR, 0, NULL); 
+        AppendMenu(hCtx, MF_STRING | (currentViewMode == 0 ? MF_CHECKED : 0), 4022, "Lar&ge Icons"); AppendMenu(hCtx, MF_STRING | (currentViewMode == 1 ? MF_CHECKED : 0), 4023, "S&mall Icons"); AppendMenu(hCtx, MF_STRING | (currentViewMode == 2 ? MF_CHECKED : 0), 4024, "&List"); AppendMenu(hCtx, MF_STRING | (currentViewMode == 3 ? MF_CHECKED : 0), 4025, "&Details"); AppendMenu(hCtx, MF_SEPARATOR, 0, NULL); 
         AppendMenu(hCtx, MF_STRING | (g_ClipOp == 0 ? MF_GRAYED : 0), 4013, "&Paste"); AppendMenu(hCtx, MF_STRING | (g_ClipOp == 0 ? MF_GRAYED : 0), 4014, "Paste &Shortcut"); AppendMenu(hCtx, MF_SEPARATOR, 0, NULL); AppendMenu(hCtx, MF_STRING, 4001, "New &Folder"); AppendMenu(hCtx, MF_STRING, 4002, "New &Shortcut"); AppendMenu(hCtx, MF_SEPARATOR, 0, NULL); AppendMenu(hCtx, MF_STRING, 4005, "P&roperties");
     } else {
         if (isDir) { AppendMenu(hCtx, MF_STRING, 5001, "&Explore"); AppendMenu(hCtx, MF_STRING, 5002, "&Open"); AppendMenu(hCtx, MF_STRING, 5003, "&Find..."); AppendMenu(hCtx, MF_SEPARATOR, 0, NULL); } else { AppendMenu(hCtx, MF_STRING, 5002, "&Open"); AppendMenu(hCtx, MF_SEPARATOR, 0, NULL); }
         AppendMenu(hCtx, MF_STRING, 4011, "Cu&t"); AppendMenu(hCtx, MF_STRING, 4012, "&Copy"); AppendMenu(hCtx, MF_SEPARATOR, 0, NULL); AppendMenu(hCtx, MF_STRING, 4002, "Create &Shortcut"); AppendMenu(hCtx, MF_STRING, 4003, "&Delete"); AppendMenu(hCtx, MF_STRING, 4004, "Re&name"); AppendMenu(hCtx, MF_SEPARATOR, 0, NULL); AppendMenu(hCtx, MF_STRING, 4005, "P&roperties");
-    }
-    TrackPopupMenu(hCtx, TPM_LEFTALIGN | TPM_RIGHTBUTTON, x, y, 0, hwnd, NULL); DestroyMenu(hCtx);
+    } TrackPopupMenu(hCtx, TPM_LEFTALIGN | TPM_RIGHTBUTTON, x, y, 0, hwnd, NULL); DestroyMenu(hCtx);
 }
 
-/* --- Inline Rename Support --- */
+LRESULT CALLBACK FilePropDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch(msg) {
+        case WM_CREATE: {
+            struct find_t f; char buf[256];
+            if (_dos_findfirst(g_ContextId, _A_NORMAL|_A_SUBDIR|_A_HIDDEN|_A_SYSTEM|_A_RDONLY|_A_ARCH, &f) == 0) {
+                CreateWindow("STATIC", "Name:", WS_CHILD|WS_VISIBLE, 10, 10, 80, 20, hwnd, NULL, g_hInst, NULL);
+                CreateWindow("STATIC", f.name, WS_CHILD|WS_VISIBLE, 100, 10, 200, 20, hwnd, NULL, g_hInst, NULL);
+                CreateWindow("STATIC", "Type:", WS_CHILD|WS_VISIBLE, 10, 35, 80, 20, hwnd, NULL, g_hInst, NULL);
+                CreateWindow("STATIC", (f.attrib & _A_SUBDIR) ? "File Folder" : "File", WS_CHILD|WS_VISIBLE, 100, 35, 200, 20, hwnd, NULL, g_hInst, NULL);
+                CreateWindow("STATIC", "Location:", WS_CHILD|WS_VISIBLE, 10, 60, 80, 20, hwnd, NULL, g_hInst, NULL);
+                CreateWindow("STATIC", g_ContextId, WS_CHILD|WS_VISIBLE|SS_NOPREFIX|SS_LEFTNOWORDWRAP, 100, 60, 240, 20, hwnd, NULL, g_hInst, NULL);
+                CreateWindow("STATIC", "Size:", WS_CHILD|WS_VISIBLE, 10, 85, 80, 20, hwnd, NULL, g_hInst, NULL);
+                FormatSizeStr(f.size, buf); CreateWindow("STATIC", buf, WS_CHILD|WS_VISIBLE, 100, 85, 200, 20, hwnd, NULL, g_hInst, NULL);
+                CreateWindow("STATIC", "MS-DOS name:", WS_CHILD|WS_VISIBLE, 10, 110, 80, 20, hwnd, NULL, g_hInst, NULL);
+                CreateWindow("STATIC", f.name, WS_CHILD|WS_VISIBLE, 100, 110, 200, 20, hwnd, NULL, g_hInst, NULL);
+                CreateWindow("STATIC", "Modified:", WS_CHILD|WS_VISIBLE, 10, 135, 80, 20, hwnd, NULL, g_hInst, NULL);
+                FormatDateStr(f.wr_date, f.wr_time, buf); CreateWindow("STATIC", buf, WS_CHILD|WS_VISIBLE, 100, 135, 200, 20, hwnd, NULL, g_hInst, NULL);
+                CreateWindow("BUTTON", "Read-only", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_DISABLED, 100, 160, 80, 20, hwnd, (HMENU)101, g_hInst, NULL);
+                CreateWindow("BUTTON", "Hidden", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_DISABLED, 190, 160, 80, 20, hwnd, (HMENU)102, g_hInst, NULL);
+                CreateWindow("BUTTON", "Archive", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_DISABLED, 100, 185, 80, 20, hwnd, (HMENU)103, g_hInst, NULL);
+                CreateWindow("BUTTON", "System", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_DISABLED, 190, 185, 80, 20, hwnd, (HMENU)104, g_hInst, NULL);
+                if (f.attrib & _A_RDONLY) SendMessage(GetDlgItem(hwnd, 101), BM_SETCHECK, 1, 0);
+                if (f.attrib & _A_HIDDEN) SendMessage(GetDlgItem(hwnd, 102), BM_SETCHECK, 1, 0);
+                if (f.attrib & _A_ARCH) SendMessage(GetDlgItem(hwnd, 103), BM_SETCHECK, 1, 0);
+                if (f.attrib & _A_SYSTEM) SendMessage(GetDlgItem(hwnd, 104), BM_SETCHECK, 1, 0);
+            }
+            CreateWindow("BUTTON", "OK", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON, 130, 230, 80, 24, hwnd, (HMENU)IDOK, g_hInst, NULL); return 0;
+        }
+        case WM_PAINT: {
+            PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps); HPEN hSh = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_BTNSHADOW)); HPEN hHi = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_BTNHIGHLIGHT)); HPEN hOld = SelectObject(hdc, hSh); MoveTo(hdc, 10, 155); LineTo(hdc, 340, 155); SelectObject(hdc, hHi); MoveTo(hdc, 10, 156); LineTo(hdc, 340, 156); SelectObject(hdc, hOld); DeleteObject(hSh); DeleteObject(hHi); EndPaint(hwnd, &ps); return 0;
+        }
+        case WM_COMMAND: if (wp == IDOK || wp == IDCANCEL) DestroyWindow(hwnd); return 0;
+    } return DefWindowProc(hwnd, msg, wp, lp);
+}
 
 LRESULT CALLBACK InlineEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_KEYDOWN) {
@@ -816,87 +689,35 @@ LRESULT CALLBACK InlineEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             char newName[MAX_PATH]; GetWindowText(hwnd, newName, MAX_PATH);
             if (newName[0] != '\0') {
                 if (g_InlineRenameIsVirtual) {
-                    int i; for (i=0; i<g_IniShortcutCount; i++) { 
-                        if (lstrcmp(g_IniShortcuts[i]->id, g_InlineRenameId) == 0) { 
-                            if (lstrcmpi(g_IniShortcuts[i]->name, newName) == 0 || !NameExists(g_IniShortcuts[i]->parentId, newName, TRUE)) { 
-                                lstrcpy(g_IniShortcuts[i]->name, newName); SaveIniEntry(g_IniShortcuts[i]); 
-                            } else MessageBox(hwnd, "Name exists.", "Error", MB_OK|MB_ICONHAND); 
-                            break; 
-                        } 
-                    }
+                    int i; for (i=0; i<g_IniShortcutCount; i++) { if (lstrcmp(g_IniShortcuts[i]->id, g_InlineRenameId) == 0) { if (lstrcmpi(g_IniShortcuts[i]->name, newName) == 0 || !NameExists(g_IniShortcuts[i]->parentId, newName, TRUE)) { lstrcpy(g_IniShortcuts[i]->name, newName); SaveIniEntry(g_IniShortcuts[i]); } else MessageBox(hwnd, "Name exists.", "Error", MB_OK|MB_ICONHAND); break; } }
                 } else {
-                    char newPath[MAX_PATH]; char *p = strrchr(g_InlineRenameOldPath, '\\');
-                    if (p) { 
-                        int len = p - g_InlineRenameOldPath + 1; lstrcpyn(newPath, g_InlineRenameOldPath, len + 1); lstrcat(newPath, newName); 
-                        if (lstrcmpi(g_InlineRenameOldPath, newPath) == 0 || !NameExists(g_CurrentPathOrId, newName, FALSE)) {
-                            rename(g_InlineRenameOldPath, newPath); 
-                        } else MessageBox(hwnd, "Name exists.", "Error", MB_OK|MB_ICONHAND); 
-                    }
+                    char newPath[MAX_PATH + 16]; char *p = strrchr(g_InlineRenameOldPath, '\\');
+                    if (p) { int len = p - g_InlineRenameOldPath + 1; lstrcpyn(newPath, g_InlineRenameOldPath, len + 1); lstrcat(newPath, newName); WindowState FAR* state = (WindowState FAR*)GetWindowLong(GetParent(GetParent(hwnd)), 0); if (lstrcmpi(g_InlineRenameOldPath, newPath) == 0 || !NameExists(state?state->pathOrId:"0", newName, FALSE)) { rename(g_InlineRenameOldPath, newPath); } else MessageBox(hwnd, "Name exists.", "Error", MB_OK|MB_ICONHAND); }
                 }
             } 
-            {
-                HWND hParent = GetParent(hwnd);
-                char cls[64]; GetClassName(hParent, cls, 64);
-                if (lstrcmpi(cls, "Win95DesktopClass") == 0) {
-                    DestroyWindow(hwnd); PostMessage(hParent, WM_COMMAND, 4028, 0);
-                } else {
-                    HWND hFolder = GetParent(hParent);
-                    DestroyWindow(hwnd); PostMessage(hFolder, WM_COMMAND, 4028, 0);
-                }
-            }
-            return 0;
+            { HWND hParent = GetParent(hwnd); char cls[64]; GetClassName(hParent, cls, 64); if (lstrcmpi(cls, "Win95DesktopClass") == 0) { DestroyWindow(hwnd); PostMessage(hParent, WM_COMMAND, 4028, 0); } else { HWND hFolder = GetParent(hParent); DestroyWindow(hwnd); PostMessage(hFolder, WM_COMMAND, 4028, 0); } } return 0;
         } else if (wp == VK_ESCAPE) { DestroyWindow(hwnd); return 0; }
     } else if (msg == WM_KILLFOCUS) { DestroyWindow(hwnd); return 0; }
     return CallWindowProc(g_lpfnOldInlineEditProc, hwnd, msg, wp, lp);
 }
 
-/* --- Dialog Procs --- */
-
 LRESULT CALLBACK ReplaceDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_CREATE) {
-        CreateWindow("STATIC", "File already exists:", WS_CHILD|WS_VISIBLE, 10, 10, 300, 20, hwnd, NULL, g_hInst, NULL);
-        CreateWindow("STATIC", g_ReplaceTarget, WS_CHILD|WS_VISIBLE|SS_NOPREFIX, 10, 30, 300, 40, hwnd, NULL, g_hInst, NULL);
-        CreateWindow("BUTTON", "Overwrite", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 10, 80, 70, 24, hwnd, (HMENU)101, g_hInst, NULL);
-        CreateWindow("BUTTON", "All", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 85, 80, 50, 24, hwnd, (HMENU)102, g_hInst, NULL);
-        CreateWindow("BUTTON", "Skip", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 140, 80, 50, 24, hwnd, (HMENU)103, g_hInst, NULL);
-        CreateWindow("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 195, 80, 60, 24, hwnd, (HMENU)104, g_hInst, NULL);
-        return 0;
-    }
-    if (msg == WM_COMMAND) { g_ReplaceResult = wp - 100; return 0; }
-    return DefWindowProc(hwnd, msg, wp, lp);
+    if (msg == WM_CREATE) { CreateWindow("STATIC", "File already exists:", WS_CHILD|WS_VISIBLE, 10, 10, 300, 20, hwnd, NULL, g_hInst, NULL); CreateWindow("STATIC", g_ReplaceTarget, WS_CHILD|WS_VISIBLE|SS_NOPREFIX, 10, 30, 300, 40, hwnd, NULL, g_hInst, NULL); CreateWindow("BUTTON", "Overwrite", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 10, 80, 70, 24, hwnd, (HMENU)101, g_hInst, NULL); CreateWindow("BUTTON", "All", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 85, 80, 50, 24, hwnd, (HMENU)102, g_hInst, NULL); CreateWindow("BUTTON", "Skip", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 140, 80, 50, 24, hwnd, (HMENU)103, g_hInst, NULL); CreateWindow("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 195, 80, 60, 24, hwnd, (HMENU)104, g_hInst, NULL); return 0; }
+    if (msg == WM_COMMAND) { g_ReplaceResult = wp - 100; return 0; } return DefWindowProc(hwnd, msg, wp, lp);
 }
 
 LRESULT CALLBACK CopyProgressDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch(msg) {
-        case WM_CREATE:
-            g_bCancelDel = FALSE;
-            CreateWindow("STATIC", g_CurrentJob.isMove ? "Moving..." : "Copying...", WS_CHILD|WS_VISIBLE|SS_CENTER, 10, 10, 260, 20, hwnd, NULL, g_hInst, NULL);
-            CreateWindow("STATIC", g_CurrentJob.src, WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX, 10, 40, 260, 20, hwnd, (HMENU)101, g_hInst, NULL);
-            CreateWindow("STATIC", "", WS_CHILD|WS_VISIBLE|WS_BORDER, 10, 70, 260, 20, hwnd, (HMENU)102, g_hInst, NULL);
-            CreateWindow("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 100, 100, 80, 24, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
-            SetTimer(hwnd, 1, 100, NULL); return 0;
-        case WM_TIMER:
-            KillTimer(hwnd, 1);
-            if (g_CurrentJob.isMove) { if (rename(g_CurrentJob.src, g_CurrentJob.dst) != 0) { if (g_CurrentJob.isDir) DoCopyFolder(hwnd, g_CurrentJob.src, g_CurrentJob.dst); else DoCopyFile(hwnd, g_CurrentJob.src, g_CurrentJob.dst); if (g_ReplaceMode != 3 && !g_bCancelDel) { if (g_CurrentJob.isDir) { DoDeleteFolder(g_CurrentJob.src); rmdir(g_CurrentJob.src); } else remove(g_CurrentJob.src); } } } 
-            else { if (g_CurrentJob.isDir) DoCopyFolder(hwnd, g_CurrentJob.src, g_CurrentJob.dst); else DoCopyFile(hwnd, g_CurrentJob.src, g_CurrentJob.dst); }
-            { HWND hParent = GetParent(hwnd); EnableWindow(hParent, TRUE); DestroyWindow(hwnd); PostMessage(hParent, WM_COMMAND, 4028, 0); } return 0;
+        case WM_CREATE: g_bCancelDel = FALSE; CreateWindow("STATIC", g_CurrentJob.isMove ? "Moving..." : "Copying...", WS_CHILD|WS_VISIBLE|SS_CENTER, 10, 10, 260, 20, hwnd, NULL, g_hInst, NULL); CreateWindow("STATIC", g_CurrentJob.src, WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX, 10, 40, 260, 20, hwnd, (HMENU)101, g_hInst, NULL); CreateWindow("STATIC", "", WS_CHILD|WS_VISIBLE|WS_BORDER, 10, 70, 260, 20, hwnd, (HMENU)102, g_hInst, NULL); CreateWindow("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 100, 100, 80, 24, hwnd, (HMENU)IDCANCEL, g_hInst, NULL); SetTimer(hwnd, 1, 100, NULL); return 0;
+        case WM_TIMER: KillTimer(hwnd, 1); if (g_CurrentJob.isMove) { if (rename(g_CurrentJob.src, g_CurrentJob.dst) != 0) { if (g_CurrentJob.isDir) DoCopyFolder(hwnd, g_CurrentJob.src, g_CurrentJob.dst); else DoCopyFile(hwnd, g_CurrentJob.src, g_CurrentJob.dst); if (g_ReplaceMode != 3 && !g_bCancelDel) { if (g_CurrentJob.isDir) { DoDeleteFolder(g_CurrentJob.src); rmdir(g_CurrentJob.src); } else remove(g_CurrentJob.src); } } } else { if (g_CurrentJob.isDir) DoCopyFolder(hwnd, g_CurrentJob.src, g_CurrentJob.dst); else DoCopyFile(hwnd, g_CurrentJob.src, g_CurrentJob.dst); } { HWND hParent = GetParent(hwnd); EnableWindow(hParent, TRUE); DestroyWindow(hwnd); PostMessage(hParent, WM_COMMAND, 4028, 0); } return 0;
         case WM_COMMAND: if (wp == IDCANCEL) g_bCancelDel = TRUE; return 0;
     } return DefWindowProc(hwnd, msg, wp, lp);
 }
 
 LRESULT CALLBACK DeleteProgressDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch(msg) {
-        case WM_CREATE:
-            g_bCancelDel = FALSE;
-            g_hDelDlg = hwnd; CreateWindow("STATIC", "Deleting...", WS_CHILD|WS_VISIBLE|SS_CENTER, 10, 10, 260, 20, hwnd, NULL, g_hInst, NULL);
-            CreateWindow("STATIC", g_DelPath, WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX, 10, 40, 260, 20, hwnd, (HMENU)101, g_hInst, NULL);
-            CreateWindow("STATIC", "", WS_CHILD|WS_VISIBLE|WS_BORDER, 10, 70, 260, 20, hwnd, (HMENU)102, g_hInst, NULL);
-            CreateWindow("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 100, 100, 80, 24, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
-            SetTimer(hwnd, 1, 50, NULL); return 0;
-        case WM_TIMER:
-            KillTimer(hwnd, 1);
-            if (g_DelIsDir) { DoDeleteFolder(g_DelPath); if (!g_bCancelDel) rmdir(g_DelPath); } else remove(g_DelPath);
-            { HWND hParent = GetParent(hwnd); EnableWindow(hParent, TRUE); DestroyWindow(hwnd); PostMessage(hParent, WM_COMMAND, 4028, 0); } return 0;
+        case WM_CREATE: g_bCancelDel = FALSE; g_hDelDlg = hwnd; CreateWindow("STATIC", "Deleting...", WS_CHILD|WS_VISIBLE|SS_CENTER, 10, 10, 260, 20, hwnd, NULL, g_hInst, NULL); CreateWindow("STATIC", g_DelPath, WS_CHILD|WS_VISIBLE|SS_LEFT|SS_NOPREFIX, 10, 40, 260, 20, hwnd, (HMENU)101, g_hInst, NULL); CreateWindow("STATIC", "", WS_CHILD|WS_VISIBLE|WS_BORDER, 10, 70, 260, 20, hwnd, (HMENU)102, g_hInst, NULL); CreateWindow("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 100, 100, 80, 24, hwnd, (HMENU)IDCANCEL, g_hInst, NULL); SetTimer(hwnd, 1, 50, NULL); return 0;
+        case WM_TIMER: KillTimer(hwnd, 1); if (g_DelIsDir) { DoDeleteFolder(g_DelPath); if (!g_bCancelDel) rmdir(g_DelPath); } else remove(g_DelPath); { HWND hParent = GetParent(hwnd); EnableWindow(hParent, TRUE); DestroyWindow(hwnd); PostMessage(hParent, WM_COMMAND, 4028, 0); } return 0;
         case WM_COMMAND: if (wp == IDCANCEL) g_bCancelDel = TRUE; return 0;
         case WM_DESTROY: g_hDelDlg = NULL; return 0;
     } return DefWindowProc(hwnd, msg, wp, lp);
@@ -905,27 +726,10 @@ LRESULT CALLBACK DeleteProgressDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
 LRESULT CALLBACK PromptDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     static HWND hEdit, hParentFolder; static char parentId[MAX_PATH]; static char parentSel[128]; static IniShortcut sh;
     switch(msg) {
-        case WM_CREATE: {
-            CreateWindow("STATIC", g_PromptLabel, WS_CHILD|WS_VISIBLE, 10, 10, 260, 20, hwnd, NULL, g_hInst, NULL);
-            hEdit = CreateWindowEx(0, "EDIT", g_PromptValue, WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL|WS_BORDER, 10, 35, 260, 22, hwnd, NULL, g_hInst, NULL);
-            if (g_PromptMode == PROMPT_NEWFOLDER) {
-                int i; CreateWindow("STATIC", "Parent Folder:", WS_CHILD|WS_VISIBLE, 10, 65, 100, 20, hwnd, NULL, g_hInst, NULL); hParentFolder = CreateWindowEx(0, "COMBOBOX", "", WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP, 110, 65, 160, 150, hwnd, NULL, g_hInst, NULL);
-                SendMessage(hParentFolder, CB_ADDSTRING, 0, (LPARAM)(LPSTR)"0 (Root)"); for (i = 0; i < g_IniShortcutCount; i++) { if (g_IniShortcuts[i]->isFolder) { char buf[128]; sprintf(buf, "%s (%s)", g_IniShortcuts[i]->id, g_IniShortcuts[i]->name); SendMessage(hParentFolder, CB_ADDSTRING, 0, (LPARAM)(LPSTR)buf); } }
-                lstrcpy(parentId, g_ContextId[0] ? g_ContextId : "0"); for (i = 0; i < SendMessage(hParentFolder, CB_GETCOUNT, 0, 0); i++) { char buf[128]; buf[0] = '\0'; SendMessage(hParentFolder, CB_GETLBTEXT, i, (LPARAM)(LPSTR)buf); int pLen = lstrlen(parentId); if (pLen < lstrlen(buf)) { BOOL match = TRUE; int j; for (j=0; j<pLen; j++) { if (buf[j] != parentId[j]) { match = FALSE; break; } } if (match && buf[pLen] == ' ') { SendMessage(hParentFolder, CB_SETCURSEL, i, 0); break; } } }
-                if (SendMessage(hParentFolder, CB_GETCURSEL, 0, 0) == CB_ERR) SendMessage(hParentFolder, CB_SETCURSEL, 0, 0);
-                CreateWindow("BUTTON", "OK", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_DEFPUSHBUTTON, 50, 100, 80, 24, hwnd, (HMENU)IDOK, g_hInst, NULL); CreateWindow("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE|WS_TABSTOP, 150, 100, 80, 24, hwnd, (HMENU)IDCANCEL, g_hInst, NULL);
-            } SetFocus(hEdit); return 0;
+        case WM_CREATE: { CreateWindow("STATIC", g_PromptLabel, WS_CHILD|WS_VISIBLE, 10, 10, 260, 20, hwnd, NULL, g_hInst, NULL); hEdit = CreateWindowEx(0, "EDIT", g_PromptValue, WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL|WS_BORDER, 10, 35, 260, 22, hwnd, NULL, g_hInst, NULL);
+            if (g_PromptMode == PROMPT_NEWFOLDER) { int i; CreateWindow("STATIC", "Parent Folder:", WS_CHILD|WS_VISIBLE, 10, 65, 100, 20, hwnd, NULL, g_hInst, NULL); hParentFolder = CreateWindowEx(0, "COMBOBOX", "", WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP, 110, 65, 160, 150, hwnd, NULL, g_hInst, NULL); SendMessage(hParentFolder, CB_ADDSTRING, 0, (LPARAM)(LPSTR)"0 (Root)"); for (i = 0; i < g_IniShortcutCount; i++) { if (g_IniShortcuts[i]->isFolder) { char buf[128]; sprintf(buf, "%s (%s)", g_IniShortcuts[i]->id, g_IniShortcuts[i]->name); SendMessage(hParentFolder, CB_ADDSTRING, 0, (LPARAM)(LPSTR)buf); } } lstrcpy(parentId, g_ContextId[0] ? g_ContextId : "0"); for (i = 0; i < SendMessage(hParentFolder, CB_GETCOUNT, 0, 0); i++) { char buf[128]; buf[0] = '\0'; SendMessage(hParentFolder, CB_GETLBTEXT, i, (LPARAM)(LPSTR)buf); int pLen = lstrlen(parentId); if (pLen < lstrlen(buf)) { BOOL match = TRUE; int j; for (j=0; j<pLen; j++) { if (buf[j] != parentId[j]) { match = FALSE; break; } } if (match && buf[pLen] == ' ') { SendMessage(hParentFolder, CB_SETCURSEL, i, 0); break; } } } if (SendMessage(hParentFolder, CB_GETCURSEL, 0, 0) == CB_ERR) SendMessage(hParentFolder, CB_SETCURSEL, 0, 0); CreateWindow("BUTTON", "OK", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_DEFPUSHBUTTON, 50, 100, 80, 24, hwnd, (HMENU)IDOK, g_hInst, NULL); CreateWindow("BUTTON", "Cancel", WS_CHILD|WS_VISIBLE|WS_TABSTOP, 150, 100, 80, 24, hwnd, (HMENU)IDCANCEL, g_hInst, NULL); } SetFocus(hEdit); return 0;
         }
-        case WM_COMMAND:
-            if (wp == IDOK) {
-                GetWindowText(hEdit, g_PromptValue, MAX_PATH);
-                if (g_PromptValue[0] != '\0' && g_PromptMode == PROMPT_NEWFOLDER) {
-                    char newId[16]; char* space; GetNewIniId(newId); lstrcpy(sh.id, newId); lstrcpy(sh.name, g_PromptValue); sh.exe[0] = '\0'; sh.params[0] = '\0'; sh.icon[0] = '\0'; sh.minimized = 0; sh.hotkey[0] = '\0';
-                    if (hParentFolder) { GetWindowText(hParentFolder, parentSel, sizeof(parentSel)); space = strchr(parentSel, ' '); if (space) *space = '\0'; lstrcpy(sh.parentId, parentSel[0] ? parentSel : "0"); } else lstrcpy(sh.parentId, g_ContextId[0] ? g_ContextId : "0");
-                    if (NameExists(sh.parentId, g_PromptValue, TRUE)) { MessageBox(hwnd, "Name already exists.", "Error", MB_OK|MB_ICONHAND); return 0; }
-                    sh.isFolder = TRUE; SaveIniEntry(&sh);
-                } HWND hParent = GetParent(hwnd); EnableWindow(hParent, TRUE); DestroyWindow(hwnd); PostMessage(hParent, WM_COMMAND, 4028, 0); 
-            } else if (wp == IDCANCEL) { g_PromptValue[0] = '\0'; HWND hParent = GetParent(hwnd); EnableWindow(hParent, TRUE); DestroyWindow(hwnd); } return 0;
+        case WM_COMMAND: if (wp == IDOK) { GetWindowText(hEdit, g_PromptValue, MAX_PATH); if (g_PromptValue[0] != '\0' && g_PromptMode == PROMPT_NEWFOLDER) { char newId[16]; char* space; GetNewIniId(newId); lstrcpy(sh.id, newId); lstrcpy(sh.name, g_PromptValue); sh.exe[0] = '\0'; sh.params[0] = '\0'; sh.icon[0] = '\0'; sh.minimized = 0; sh.hotkey[0] = '\0'; if (hParentFolder) { GetWindowText(hParentFolder, parentSel, sizeof(parentSel)); space = strchr(parentSel, ' '); if (space) *space = '\0'; lstrcpy(sh.parentId, parentSel[0] ? parentSel : "0"); } else lstrcpy(sh.parentId, g_ContextId[0] ? g_ContextId : "0"); if (NameExists(sh.parentId, g_PromptValue, TRUE)) { MessageBox(hwnd, "Name already exists.", "Error", MB_OK|MB_ICONHAND); return 0; } sh.isFolder = TRUE; SaveIniEntry(&sh); } HWND hParent = GetParent(hwnd); EnableWindow(hParent, TRUE); DestroyWindow(hwnd); PostMessage(hParent, WM_COMMAND, 4028, 0); } else if (wp == IDCANCEL) { g_PromptValue[0] = '\0'; HWND hParent = GetParent(hwnd); EnableWindow(hParent, TRUE); DestroyWindow(hwnd); } return 0;
         case WM_CLOSE: { HWND hParent = GetParent(hwnd); EnableWindow(hParent, TRUE); DestroyWindow(hwnd); } return 0;
     } return DefWindowProc(hwnd, msg, wp, lp);
 }
@@ -945,216 +749,139 @@ LRESULT CALLBACK ShortcutDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetFocus(hName); return 0;
         }
         case WM_COMMAND:
-            if (wp == 101) { 
-                char path[MAX_PATH]; 
-                if (SendMessage(hMapDirCheck, BM_GETCHECK, 0, 0)) { MessageBox(hwnd, "Select any file inside the mapped directory.", "Select", MB_OK); if (BrowseFile(hwnd, path, "All Files (*.*)\0*.*\0")) { char* pDir = strrchr(path, '\\'); if (pDir) { if (pDir == path || *(pDir - 1) == ':') *(pDir + 1) = '\0'; else *pDir = '\0'; } SetWindowText(hTarget, path); } } 
-                else { if (BrowseFile(hwnd, path, "Programs (*.exe;*.com;*.bat)\0*.exe;*.com;*.bat\0All Files (*.*)\0*.*\0")) { SetWindowText(hTarget, path); if (GetWindowTextLength(hIcon) == 0) SetWindowText(hIcon, path); if (GetWindowTextLength(hName) == 0) { char base[MAX_PATH], *p, *dot; lstrcpy(base, path); p = strrchr(base, '\\'); if (p) lstrcpy(base, p + 1); dot = strrchr(base, '.'); if (dot) *dot = '\0'; if (base[0]) { AnsiLower((LPSTR)base); if (base[0] >= 'a' && base[0] <= 'z') base[0] -= 32; } SetWindowText(hName, base); } } }
-            } else if (wp == 102) { char path[MAX_PATH]; if (BrowseFile(hwnd, path, "Icons (*.exe;*.ico)\0*.exe;*.ico\0All Files (*.*)\0*.*\0")) SetWindowText(hIcon, path); } else if (wp == 103) { if (SendMessage(hFolderCheck, BM_GETCHECK, 0, 0)) { EnableWindow(hParams, FALSE); SetWindowText(hParams, ""); EnableWindow(hMinCheck, FALSE); EnableWindow(hMapDirCheck, TRUE); if (SendMessage(hMapDirCheck, BM_GETCHECK, 0, 0)) { SetWindowText(hTargetLbl, "Dir Path:"); EnableWindow(hTarget, TRUE); EnableWindow(GetDlgItem(hwnd, 101), TRUE); } else { SetWindowText(hTargetLbl, "Target:"); EnableWindow(hTarget, FALSE); EnableWindow(GetDlgItem(hwnd, 101), FALSE); } } else { EnableWindow(hMapDirCheck, FALSE); SendMessage(hMapDirCheck, BM_SETCHECK, 0, 0); SetWindowText(hTargetLbl, "Target (File):"); EnableWindow(hTarget, TRUE); EnableWindow(GetDlgItem(hwnd, 101), TRUE); EnableWindow(hParams, TRUE); EnableWindow(hMinCheck, TRUE); } } else if (wp == 104) { if (SendMessage(hMapDirCheck, BM_GETCHECK, 0, 0)) { SetWindowText(hTargetLbl, "Dir Path:"); EnableWindow(hTarget, TRUE); EnableWindow(GetDlgItem(hwnd, 101), TRUE); } else { SetWindowText(hTargetLbl, "Target:"); SetWindowText(hTarget, ""); EnableWindow(hTarget, FALSE); EnableWindow(GetDlgItem(hwnd, 101), FALSE); } } else if (wp == IDOK) {
-                char *space; GetWindowText(hName, name, MAX_PATH); GetWindowText(hTarget, target, MAX_PATH); GetWindowText(hParams, params, MAX_PATH); GetWindowText(hIcon, iconF, MAX_PATH); GetWindowText(hParentFolder, parentSel, sizeof(parentSel)); space = strchr(parentSel, ' '); if (space) *space = '\0';
-                if (name[0] && (target[0] || SendMessage(hFolderCheck, BM_GETCHECK, 0, 0))) {
-                    memset(&sh, 0, sizeof(sh)); if (g_EditShortcutId[0] != '\0') { int i; for (i = 0; i < g_IniShortcutCount; i++) { if (lstrcmp(g_IniShortcuts[i]->id, g_EditShortcutId) == 0) { sh = *(g_IniShortcuts[i]); break; } } } else { char newId[16]; GetNewIniId(newId); lstrcpy(sh.id, newId); }
-                    lstrcpy(sh.parentId, parentSel[0] ? parentSel : "0"); lstrcpy(sh.name, name); lstrcpy(sh.exe, target); lstrcpy(sh.params, params); lstrcpy(sh.icon, iconF); sh.hotkey[0] = '\0'; sh.minimized = SendMessage(hMinCheck, BM_GETCHECK, 0, 0) ? 1 : 0; sh.isFolder = SendMessage(hFolderCheck, BM_GETCHECK, 0, 0) ? 1 : 0; if (sh.isFolder) { sh.params[0] = '\0'; if (!SendMessage(hMapDirCheck, BM_GETCHECK, 0, 0)) sh.exe[0] = '\0'; }
-                    if (g_EditShortcutId[0] == '\0' || lstrcmpi(sh.name, name) != 0) { if (NameExists(sh.parentId, name, TRUE)) { MessageBox(hwnd, "Name exists.", "Error", MB_OK|MB_ICONHAND); return 0; } } SaveIniEntry(&sh);
-                } HWND hParent = GetParent(hwnd); EnableWindow(hParent, TRUE); DestroyWindow(hwnd); PostMessage(hParent, WM_COMMAND, 4028, 0); 
-            } else if (wp == IDCANCEL) { HWND hParent = GetParent(hwnd); EnableWindow(hParent, TRUE); DestroyWindow(hwnd); } return 0;
+            if (wp == 101) { char path[MAX_PATH]; if (SendMessage(hMapDirCheck, BM_GETCHECK, 0, 0)) { MessageBox(hwnd, "Select any file inside the mapped directory.", "Select", MB_OK); if (BrowseFile(hwnd, path, "All Files (*.*)\0*.*\0")) { char* pDir = strrchr(path, '\\'); if (pDir) { if (pDir == path || *(pDir - 1) == ':') *(pDir + 1) = '\0'; else *pDir = '\0'; } SetWindowText(hTarget, path); } } else { if (BrowseFile(hwnd, path, "Programs (*.exe;*.com;*.bat)\0*.exe;*.com;*.bat\0All Files (*.*)\0*.*\0")) { SetWindowText(hTarget, path); if (GetWindowTextLength(hIcon) == 0) SetWindowText(hIcon, path); if (GetWindowTextLength(hName) == 0) { char base[MAX_PATH], *p, *dot; lstrcpy(base, path); p = strrchr(base, '\\'); if (p) lstrcpy(base, p + 1); dot = strrchr(base, '.'); if (dot) *dot = '\0'; if (base[0]) { AnsiLower((LPSTR)base); if (base[0] >= 'a' && base[0] <= 'z') base[0] -= 32; } SetWindowText(hName, base); } } } } else if (wp == 102) { char path[MAX_PATH]; if (BrowseFile(hwnd, path, "Icons (*.exe;*.ico)\0*.exe;*.ico\0All Files (*.*)\0*.*\0")) SetWindowText(hIcon, path); } else if (wp == 103) { if (SendMessage(hFolderCheck, BM_GETCHECK, 0, 0)) { EnableWindow(hParams, FALSE); SetWindowText(hParams, ""); EnableWindow(hMinCheck, FALSE); EnableWindow(hMapDirCheck, TRUE); if (SendMessage(hMapDirCheck, BM_GETCHECK, 0, 0)) { SetWindowText(hTargetLbl, "Dir Path:"); EnableWindow(hTarget, TRUE); EnableWindow(GetDlgItem(hwnd, 101), TRUE); } else { SetWindowText(hTargetLbl, "Target:"); EnableWindow(hTarget, FALSE); EnableWindow(GetDlgItem(hwnd, 101), FALSE); } } else { EnableWindow(hMapDirCheck, FALSE); SendMessage(hMapDirCheck, BM_SETCHECK, 0, 0); SetWindowText(hTargetLbl, "Target (File):"); EnableWindow(hTarget, TRUE); EnableWindow(GetDlgItem(hwnd, 101), TRUE); EnableWindow(hParams, TRUE); EnableWindow(hMinCheck, TRUE); } } else if (wp == 104) { if (SendMessage(hMapDirCheck, BM_GETCHECK, 0, 0)) { SetWindowText(hTargetLbl, "Dir Path:"); EnableWindow(hTarget, TRUE); EnableWindow(GetDlgItem(hwnd, 101), TRUE); } else { SetWindowText(hTargetLbl, "Target:"); SetWindowText(hTarget, ""); EnableWindow(hTarget, FALSE); EnableWindow(GetDlgItem(hwnd, 101), FALSE); } } else if (wp == IDOK) { char *space; GetWindowText(hName, name, MAX_PATH); GetWindowText(hTarget, target, MAX_PATH); GetWindowText(hParams, params, MAX_PATH); GetWindowText(hIcon, iconF, MAX_PATH); GetWindowText(hParentFolder, parentSel, sizeof(parentSel)); space = strchr(parentSel, ' '); if (space) *space = '\0'; if (name[0] && (target[0] || SendMessage(hFolderCheck, BM_GETCHECK, 0, 0))) { memset(&sh, 0, sizeof(sh)); if (g_EditShortcutId[0] != '\0') { int i; for (i = 0; i < g_IniShortcutCount; i++) { if (lstrcmp(g_IniShortcuts[i]->id, g_EditShortcutId) == 0) { sh = *(g_IniShortcuts[i]); break; } } } else { char newId[16]; GetNewIniId(newId); lstrcpy(sh.id, newId); } lstrcpy(sh.parentId, parentSel[0] ? parentSel : "0"); lstrcpy(sh.name, name); lstrcpy(sh.exe, target); lstrcpy(sh.params, params); lstrcpy(sh.icon, iconF); sh.hotkey[0] = '\0'; sh.minimized = SendMessage(hMinCheck, BM_GETCHECK, 0, 0) ? 1 : 0; sh.isFolder = SendMessage(hFolderCheck, BM_GETCHECK, 0, 0) ? 1 : 0; if (sh.isFolder) { sh.params[0] = '\0'; if (!SendMessage(hMapDirCheck, BM_GETCHECK, 0, 0)) sh.exe[0] = '\0'; } if (g_EditShortcutId[0] == '\0' || lstrcmpi(sh.name, name) != 0) { if (NameExists(sh.parentId, name, TRUE)) { MessageBox(hwnd, "Name exists.", "Error", MB_OK|MB_ICONHAND); return 0; } } SaveIniEntry(&sh); } HWND hParent = GetParent(hwnd); EnableWindow(hParent, TRUE); DestroyWindow(hwnd); PostMessage(hParent, WM_COMMAND, 4028, 0); } else if (wp == IDCANCEL) { HWND hParent = GetParent(hwnd); EnableWindow(hParent, TRUE); DestroyWindow(hwnd); } return 0;
         case WM_CLOSE: { HWND hParent = GetParent(hwnd); EnableWindow(hParent, TRUE); DestroyWindow(hwnd); } return 0;
     } return DefWindowProc(hwnd, msg, wp, lp);
 }
 
-/* --- Subclass Procedures --- */
-
 LRESULT CALLBACK ToolbarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_PAINT) {
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps); RECT rc; GetClientRect(hwnd, &rc); FillRect(hdc, &rc, (HBRUSH)(COLOR_BTNFACE + 1));
-        Draw3DButton(hdc, 2, 2, 26, 26, FALSE); DrawGDIFolder(hdc, 5, 8, TRUE, FALSE, FALSE); MoveTo(hdc, 14, 15); LineTo(hdc, 14, 8); MoveTo(hdc, 11, 11); LineTo(hdc, 14, 8); MoveTo(hdc, 17, 11); LineTo(hdc, 14, 8);
-        Draw3DButton(hdc, 30, 2, 54, 26, FALSE); Ellipse(hdc, 34, 14, 40, 20); Ellipse(hdc, 44, 14, 50, 20); MoveTo(hdc, 38, 15); LineTo(hdc, 48, 6); MoveTo(hdc, 46, 15); LineTo(hdc, 36, 6);
-        Draw3DButton(hdc, 58, 2, 82, 26, FALSE); Rectangle(hdc, 65, 9, 75, 21); Rectangle(hdc, 61, 5, 71, 17);
-        Draw3DButton(hdc, 86, 2, 110, 26, FALSE); Rectangle(hdc, 90, 6, 102, 22); Rectangle(hdc, 93, 10, 105, 20); Rectangle(hdc, 94, 4, 98, 7);
-        Draw3DButton(hdc, 114, 2, 138, 26, FALSE); MoveTo(hdc, 120, 8); LineTo(hdc, 132, 20); MoveTo(hdc, 120, 20); LineTo(hdc, 132, 8);
-        Draw3DButton(hdc, 142, 2, 166, 26, FALSE); Rectangle(hdc, 148, 6, 160, 22); MoveTo(hdc, 150, 10); LineTo(hdc, 158, 10); MoveTo(hdc, 150, 14); LineTo(hdc, 158, 14);
+        
+        /* Up Dir (Folder w/ Arrow) */
+        Draw3DButton(hdc, 2, 2, 26, 26, FALSE); 
+        { HBRUSH hYel = CreateSolidBrush(RGB(255, 255, 128)); HBRUSH hOldB = SelectObject(hdc, hYel); DrawGDIFolder(hdc, 5, 8, TRUE, FALSE, FALSE); SelectObject(hdc, hOldB); DeleteObject(hYel); }
+        { HPEN hGrn = CreatePen(PS_SOLID, 2, RGB(0, 128, 0)); HPEN hOldP = SelectObject(hdc, hGrn); MoveTo(hdc, 14, 15); LineTo(hdc, 14, 8); MoveTo(hdc, 11, 11); LineTo(hdc, 14, 8); MoveTo(hdc, 17, 11); LineTo(hdc, 14, 8); SelectObject(hdc, hOldP); DeleteObject(hGrn); }
+        
+        /* Cut (Scissors) */
+        Draw3DButton(hdc, 30, 2, 54, 26, FALSE); 
+        { HPEN hRed = CreatePen(PS_SOLID, 1, RGB(255, 0, 0)); HPEN hOldP = SelectObject(hdc, hRed); Ellipse(hdc, 34, 14, 40, 20); Ellipse(hdc, 44, 14, 50, 20); SelectObject(hdc, hOldP); DeleteObject(hRed); }
+        { HPEN hBlu = CreatePen(PS_SOLID, 1, RGB(0, 0, 255)); HPEN hOldP = SelectObject(hdc, hBlu); MoveTo(hdc, 38, 15); LineTo(hdc, 48, 6); MoveTo(hdc, 46, 15); LineTo(hdc, 36, 6); SelectObject(hdc, hOldP); DeleteObject(hBlu); }
+        
+        /* Copy (2 Pages) */
+        Draw3DButton(hdc, 58, 2, 82, 26, FALSE); 
+        { HBRUSH hWht = GetStockObject(WHITE_BRUSH); HBRUSH hOldB = SelectObject(hdc, hWht); HPEN hCyn = CreatePen(PS_SOLID, 1, RGB(0, 128, 128)); HPEN hOldP = SelectObject(hdc, hCyn); Rectangle(hdc, 65, 9, 75, 21); Rectangle(hdc, 61, 5, 71, 17); SelectObject(hdc, hOldP); DeleteObject(hCyn); SelectObject(hdc, hOldB); }
+        
+        /* Paste (Clipboard) */
+        Draw3DButton(hdc, 86, 2, 110, 26, FALSE); 
+        { HBRUSH hBrn = CreateSolidBrush(RGB(128, 64, 0)); HBRUSH hOldB = SelectObject(hdc, hBrn); Rectangle(hdc, 90, 6, 102, 22); SelectObject(hdc, GetStockObject(WHITE_BRUSH)); Rectangle(hdc, 93, 10, 105, 20); SelectObject(hdc, GetStockObject(LTGRAY_BRUSH)); Rectangle(hdc, 94, 4, 98, 7); SelectObject(hdc, hOldB); DeleteObject(hBrn); }
+        
+        /* Delete (Red X) */
+        Draw3DButton(hdc, 114, 2, 138, 26, FALSE); 
+        { HPEN hRed2 = CreatePen(PS_SOLID, 2, RGB(255, 0, 0)); HPEN hOldP = SelectObject(hdc, hRed2); MoveTo(hdc, 120, 8); LineTo(hdc, 132, 20); MoveTo(hdc, 120, 20); LineTo(hdc, 132, 8); SelectObject(hdc, hOldP); DeleteObject(hRed2); }
+        
+        /* Properties (Hand/Gear) */
+        Draw3DButton(hdc, 142, 2, 166, 26, FALSE); 
+        Rectangle(hdc, 148, 6, 160, 22); 
+        { HPEN hBlu2 = CreatePen(PS_SOLID, 1, RGB(0, 0, 255)); HPEN hOldP = SelectObject(hdc, hBlu2); MoveTo(hdc, 150, 10); LineTo(hdc, 158, 10); MoveTo(hdc, 150, 14); LineTo(hdc, 158, 14); SelectObject(hdc, hOldP); DeleteObject(hBlu2); }
+        
         EndPaint(hwnd, &ps); return 0;
     }
-    if (msg == WM_LBUTTONDOWN) {
-        int x = LOWORD(lp);
-        if (x >= 2 && x <= 26) PostMessage(GetParent(hwnd), WM_COMMAND, 4050, 0); 
-        else if (x >= 30 && x <= 54) PostMessage(GetParent(hwnd), WM_COMMAND, 4011, 0); 
-        else if (x >= 58 && x <= 82) PostMessage(GetParent(hwnd), WM_COMMAND, 4012, 0); 
-        else if (x >= 86 && x <= 110) PostMessage(GetParent(hwnd), WM_COMMAND, 4013, 0); 
-        else if (x >= 114 && x <= 138) PostMessage(GetParent(hwnd), WM_COMMAND, 4003, 0); 
-        else if (x >= 142 && x <= 166) PostMessage(GetParent(hwnd), WM_COMMAND, 4005, 0); 
-        return 0;
-    }
+    if (msg == WM_LBUTTONDOWN) { int x = LOWORD(lp); if (x >= 2 && x <= 26) PostMessage(GetParent(hwnd), WM_COMMAND, 4050, 0); else if (x >= 30 && x <= 54) PostMessage(GetParent(hwnd), WM_COMMAND, 4011, 0); else if (x >= 58 && x <= 82) PostMessage(GetParent(hwnd), WM_COMMAND, 4012, 0); else if (x >= 86 && x <= 110) PostMessage(GetParent(hwnd), WM_COMMAND, 4013, 0); else if (x >= 114 && x <= 138) PostMessage(GetParent(hwnd), WM_COMMAND, 4003, 0); else if (x >= 142 && x <= 166) PostMessage(GetParent(hwnd), WM_COMMAND, 4005, 0); return 0; }
     return CallWindowProc(g_lpfnOldToolbarProc, hwnd, msg, wp, lp); 
 }
 
 LRESULT CALLBACK TreeProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_KEYDOWN) {
-        if (wp == VK_F5) { PostMessage(GetParent(hwnd), WM_COMMAND, 4028, 0); return 0; }
-        if (wp == VK_F2) { PostMessage(GetParent(hwnd), WM_COMMAND, 4004, 0); return 0; }
-        if (wp == VK_DELETE) { PostMessage(GetParent(hwnd), WM_COMMAND, 4003, 0); return 0; }
-        if (GetKeyState(VK_CONTROL) & 0x8000) {
-            if (wp == 'X') { PostMessage(GetParent(hwnd), WM_COMMAND, 4011, 0); return 0; }
-            if (wp == 'C') { PostMessage(GetParent(hwnd), WM_COMMAND, 4012, 0); return 0; }
-            if (wp == 'V') { PostMessage(GetParent(hwnd), WM_COMMAND, 4013, 0); return 0; }
-            if (wp == 'N') { PostMessage(GetParent(hwnd), WM_COMMAND, 4001, 0); return 0; }
-        }
-        if (wp == VK_TAB) { SetFocus(GetDlgItem(GetParent(hwnd), ID_LIST)); return 0; }
-    }
+    if (msg == WM_KEYDOWN) { if (wp == VK_F5) { PostMessage(GetParent(hwnd), WM_COMMAND, 4028, 0); return 0; } if (wp == VK_F2) { PostMessage(GetParent(hwnd), WM_COMMAND, 4004, 0); return 0; } if (wp == VK_DELETE) { PostMessage(GetParent(hwnd), WM_COMMAND, 4003, 0); return 0; } if (GetKeyState(VK_CONTROL) & 0x8000) { if (wp == 'X') { PostMessage(GetParent(hwnd), WM_COMMAND, 4011, 0); return 0; } if (wp == 'C') { PostMessage(GetParent(hwnd), WM_COMMAND, 4012, 0); return 0; } if (wp == 'V') { PostMessage(GetParent(hwnd), WM_COMMAND, 4013, 0); return 0; } if (wp == 'N') { PostMessage(GetParent(hwnd), WM_COMMAND, 4001, 0); return 0; } } if (wp == VK_TAB) { SetFocus(GetDlgItem(GetParent(hwnd), ID_LIST)); return 0; } }
     if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONUP) {
         int x = LOWORD(lp); int y = HIWORD(lp); int count = SendMessage(hwnd, LB_GETCOUNT, 0, 0); int topIdx = SendMessage(hwnd, LB_GETTOPINDEX, 0, 0); int hitIdx = -1; int i;
-        for (i = topIdx; i < count; i++) { RECT rc; if (SendMessage(hwnd, LB_GETITEMRECT, i, (LPARAM)(LPRECT)&rc) != LB_ERR) { if (y >= rc.top && y <= rc.bottom) { hitIdx = i; break; } } }
+        for (i = topIdx; i < count; i++) { RECT rc; if (SendMessage(hwnd, LB_GETITEMRECT, i, (LPARAM)(LPRECT)&rc) != LB_ERR) { if (y >= rc.top && y <= rc.bottom) { hitIdx = i; break; } } else break; }
         if (hitIdx >= 0) {
-            if (msg == WM_LBUTTONDOWN) {
-                TreeItemData FAR* item = (TreeItemData FAR*)SendMessage(hwnd, LB_GETITEMDATA, hitIdx, 0);
-                if (item && item->hasChildren) {
-                    int pmX = item->level * 16 + 2;
-                    if (x >= pmX && x <= pmX + 12) { ToggleExpand(item->pathOrId); RebuildTree(hwnd); return 0; }
-                }
-            } else if (msg == WM_RBUTTONUP) {
-                TreeItemData FAR* item; POINT pt; pt.x = x; pt.y = y; SendMessage(hwnd, LB_SETCURSEL, hitIdx, 0); item = (TreeItemData FAR*)SendMessage(hwnd, LB_GETITEMDATA, hitIdx, 0);
-                if (item) { g_ContextIsVirtual = item->isVirtual; lstrcpy(g_ContextId, item->pathOrId); g_ContextIsFolder = TRUE; ClientToScreen(hwnd, &pt); ShowContextMenu(GetParent(hwnd), pt.x, pt.y, TRUE, FALSE); } return 0;
-            }
+            if (msg == WM_LBUTTONDOWN) { TreeItemData FAR* item = (TreeItemData FAR*)SendMessage(hwnd, LB_GETITEMDATA, hitIdx, 0); if (item && item->hasChildren) { int pmX = item->level * 16 + 2; if (x >= pmX && x <= pmX + 12) { WindowState FAR* state = (WindowState FAR*)GetWindowLong(GetParent(hwnd), 0); ToggleExpand(item->pathOrId); RebuildTree(hwnd, state); return 0; } } } 
+            else if (msg == WM_RBUTTONUP) { TreeItemData FAR* item; POINT pt; pt.x = x; pt.y = y; SendMessage(hwnd, LB_SETCURSEL, hitIdx, 0); item = (TreeItemData FAR*)SendMessage(hwnd, LB_GETITEMDATA, hitIdx, 0); if (item) { WindowState FAR* state = (WindowState FAR*)GetWindowLong(GetParent(hwnd), 0); g_ContextIsVirtual = item->isVirtual; lstrcpy(g_ContextId, item->pathOrId); g_ContextIsFolder = TRUE; ClientToScreen(hwnd, &pt); ShowContextMenu(GetParent(hwnd), pt.x, pt.y, TRUE, FALSE, state->viewMode); } return 0; }
         }
-    }
-    return CallWindowProc(g_lpfnOldTreeProc, hwnd, msg, wp, lp);
+    } return CallWindowProc(g_lpfnOldTreeProc, hwnd, msg, wp, lp);
 }
 
 LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_KEYDOWN) {
-        if (wp == VK_F5) { PostMessage(GetParent(hwnd), WM_COMMAND, 4028, 0); return 0; }
-        if (wp == VK_F2) { PostMessage(GetParent(hwnd), WM_COMMAND, 4004, 0); return 0; }
-        if (wp == VK_DELETE) { PostMessage(GetParent(hwnd), WM_COMMAND, 4003, 0); return 0; }
-        if (GetKeyState(VK_CONTROL) & 0x8000) {
-            if (wp == 'A') { PostMessage(GetParent(hwnd), WM_COMMAND, 4015, 0); return 0; }
-            if (wp == 'X') { PostMessage(GetParent(hwnd), WM_COMMAND, 4011, 0); return 0; }
-            if (wp == 'C') { PostMessage(GetParent(hwnd), WM_COMMAND, 4012, 0); return 0; }
-            if (wp == 'V') { PostMessage(GetParent(hwnd), WM_COMMAND, 4013, 0); return 0; }
-            if (wp == 'N') { PostMessage(GetParent(hwnd), WM_COMMAND, 4001, 0); return 0; }
-        }
-        if (wp == VK_TAB) { HWND hTree = GetDlgItem(GetParent(hwnd), ID_TREE); if (hwnd == hTree) SetFocus(GetDlgItem(GetParent(hwnd), ID_LIST)); else SetFocus(hTree); return 0; }
+        if (wp == VK_F5) { PostMessage(GetParent(hwnd), WM_COMMAND, 4028, 0); return 0; } if (wp == VK_F2) { PostMessage(GetParent(hwnd), WM_COMMAND, 4004, 0); return 0; } if (wp == VK_DELETE) { PostMessage(GetParent(hwnd), WM_COMMAND, 4003, 0); return 0; }
+        if (GetKeyState(VK_CONTROL) & 0x8000) { if (wp == 'A') { PostMessage(GetParent(hwnd), WM_COMMAND, 4015, 0); return 0; } if (wp == 'X') { PostMessage(GetParent(hwnd), WM_COMMAND, 4011, 0); return 0; } if (wp == 'C') { PostMessage(GetParent(hwnd), WM_COMMAND, 4012, 0); return 0; } if (wp == 'V') { PostMessage(GetParent(hwnd), WM_COMMAND, 4013, 0); return 0; } if (wp == 'N') { PostMessage(GetParent(hwnd), WM_COMMAND, 4001, 0); return 0; } }
+        if (wp == VK_TAB) { HWND hTree = GetDlgItem(GetParent(hwnd), ID_TREE); if (hTree) SetFocus(hTree); return 0; }
 
-        if (g_ViewMode == 0 || g_ViewMode == 1) { 
+        WindowState FAR* state = (WindowState FAR*)GetWindowLong(GetParent(hwnd), 0);
+        if (state && state->viewMode == 0) { 
             if (wp == VK_LEFT || wp == VK_RIGHT || wp == VK_UP || wp == VK_DOWN) {
                 int selIdx = SendMessage(hwnd, LB_GETCURSEL, 0, 0);
                 if (selIdx != LB_ERR) {
                     int FAR* pType = (int FAR*)SendMessage(hwnd, LB_GETITEMDATA, selIdx, 0);
                     if (pType && *pType == 2) {
-                        RowItemData FAR* row = (RowItemData FAR*)pType;
-                        int c, col = -1;
-                        for (c = 0; c < row->count; c++) {
-                            if (lstrcmp(row->items[c]->path, g_SelectedListItemPath) == 0 && lstrcmp(row->items[c]->name, g_SelectedListItemName) == 0) { col = c; break; }
-                        }
+                        RowItemData FAR* row = (RowItemData FAR*)pType; int c, col = -1;
+                        for (c = 0; c < row->count; c++) { if (lstrcmp(row->items[c]->path, g_SelectedListItemPath) == 0 && lstrcmp(row->items[c]->name, g_SelectedListItemName) == 0) { col = c; break; } }
                         if (col == -1) col = 0;
-                        if (wp == VK_LEFT) {
-                            if (col > 0) col--;
-                            else if (selIdx > 0) {
-                                selIdx--; row = (RowItemData FAR*)SendMessage(hwnd, LB_GETITEMDATA, selIdx, 0);
-                                if (row) col = row->count - 1;
-                                SendMessage(hwnd, LB_SETCURSEL, selIdx, 0);
-                            }
-                        } else if (wp == VK_RIGHT) {
-                            if (col < row->count - 1) col++;
-                            else if (selIdx < SendMessage(hwnd, LB_GETCOUNT, 0, 0) - 1) {
-                                selIdx++; col = 0; SendMessage(hwnd, LB_SETCURSEL, selIdx, 0);
-                            }
-                        } else if (wp == VK_UP) {
-                            if (selIdx > 0) {
-                                selIdx--; row = (RowItemData FAR*)SendMessage(hwnd, LB_GETITEMDATA, selIdx, 0);
-                                if (row && col >= row->count) col = row->count - 1;
-                                SendMessage(hwnd, LB_SETCURSEL, selIdx, 0);
-                            }
-                        } else if (wp == VK_DOWN) {
-                            if (selIdx < SendMessage(hwnd, LB_GETCOUNT, 0, 0) - 1) {
-                                selIdx++; row = (RowItemData FAR*)SendMessage(hwnd, LB_GETITEMDATA, selIdx, 0);
-                                if (row && col >= row->count) col = row->count - 1;
-                                SendMessage(hwnd, LB_SETCURSEL, selIdx, 0);
-                            }
-                        }
+                        if (wp == VK_LEFT) { if (col > 0) col--; else if (selIdx > 0) { selIdx--; row = (RowItemData FAR*)SendMessage(hwnd, LB_GETITEMDATA, selIdx, 0); if (row) col = row->count - 1; SendMessage(hwnd, LB_SETCURSEL, selIdx, 0); } } 
+                        else if (wp == VK_RIGHT) { if (col < row->count - 1) col++; else if (selIdx < SendMessage(hwnd, LB_GETCOUNT, 0, 0) - 1) { selIdx++; col = 0; SendMessage(hwnd, LB_SETCURSEL, selIdx, 0); } } 
+                        else if (wp == VK_UP) { if (selIdx > 0) { selIdx--; row = (RowItemData FAR*)SendMessage(hwnd, LB_GETITEMDATA, selIdx, 0); if (row && col >= row->count) col = row->count - 1; SendMessage(hwnd, LB_SETCURSEL, selIdx, 0); } } 
+                        else if (wp == VK_DOWN) { if (selIdx < SendMessage(hwnd, LB_GETCOUNT, 0, 0) - 1) { selIdx++; row = (RowItemData FAR*)SendMessage(hwnd, LB_GETITEMDATA, selIdx, 0); if (row && col >= row->count) col = row->count - 1; SendMessage(hwnd, LB_SETCURSEL, selIdx, 0); } }
                         row = (RowItemData FAR*)SendMessage(hwnd, LB_GETITEMDATA, selIdx, 0);
-                        if (row && col >= 0 && col < row->count) {
-                            lstrcpy(g_SelectedListItemPath, row->items[col]->path);
-                            lstrcpy(g_SelectedListItemName, row->items[col]->name);
-                            g_SelectedListItemIsVirtual = row->items[col]->isVirtual;
-                            g_SelectedListItemIsDir = row->items[col]->isDir;
-                            InvalidateRect(hwnd, NULL, TRUE);
-                        }
+                        if (row && col >= 0 && col < row->count) { lstrcpy(g_SelectedListItemPath, row->items[col]->path); lstrcpy(g_SelectedListItemName, row->items[col]->name); g_SelectedListItemIsVirtual = row->items[col]->isVirtual; g_SelectedListItemIsDir = row->items[col]->isDir; InvalidateRect(hwnd, NULL, TRUE); }
                     }
-                }
-                return 0; 
+                } return 0; 
             } else { g_SelectedListItemPath[0] = '\0'; InvalidateRect(hwnd, NULL, TRUE); }
+        } else {
+            if (wp == VK_LEFT || wp == VK_RIGHT || wp == VK_UP || wp == VK_DOWN) {
+                LRESULT res = CallWindowProc(g_lpfnOldListProc, hwnd, msg, wp, lp);
+                int selIdx = SendMessage(hwnd, LB_GETCURSEL, 0, 0);
+                if (selIdx != LB_ERR) { int FAR* pType = (int FAR*)SendMessage(hwnd, LB_GETITEMDATA, selIdx, 0); if (pType && *pType == 1) { ListItemData FAR* item = (ListItemData FAR*)pType; lstrcpy(g_SelectedListItemPath, item->path); lstrcpy(g_SelectedListItemName, item->name); g_SelectedListItemIsVirtual = item->isVirtual; g_SelectedListItemIsDir = item->isDir; } }
+                return res;
+            }
         }
+    }
+    if (msg == WM_ERASEBKGND) {
+        char pCls[64]; GetClassName(GetParent(hwnd), pCls, 64);
+        if (lstrcmpi(pCls, "Win95DesktopClass") == 0) { RECT rc; GetClientRect(hwnd, &rc); FillRect((HDC)wp, &rc, g_hbrDesktop); return 1; }
     }
     if (msg == WM_LBUTTONDOWN) { g_bListDragging = TRUE; SetCapture(hwnd); }
     if (msg == WM_MOUSEMOVE && g_bListDragging && (wp & MK_LBUTTON)) { SetCursor(LoadCursor(NULL, IDC_CROSS)); return 0; }
     if (msg == WM_LBUTTONUP) {
         if (g_bListDragging) {
-            g_bListDragging = FALSE; ReleaseCapture(); POINT pt; pt.x = LOWORD(lp); pt.y = HIWORD(lp); ClientToScreen(hwnd, &pt); HWND hTarget = WindowFromPoint(pt);
-            if (hTarget) { 
-                char cls[64]; GetClassName(hTarget, cls, 64); 
-                if (lstrcmpi(cls, "Win95DesktopClass") == 0) {
-                    PostMessage(GetParent(hwnd), WM_COMMAND, 9999, 0); 
-                } else if (!g_SelectedListItemIsVirtual && g_SelectedListItemPath[0] != '\0') {
-                    char targetFolder[MAX_PATH] = "";
-                    BOOL validTarget = FALSE;
-                    
-                    if (hTarget == hwnd) {
-                        POINT clPt = pt; ScreenToClient(hwnd, &clPt);
-                        int hitIdx = -1; int topIdx = SendMessage(hwnd, LB_GETTOPINDEX, 0, 0); int count = SendMessage(hwnd, LB_GETCOUNT, 0, 0);
-                        for (int i = topIdx; i < count; i++) {
-                            RECT rc; if (SendMessage(hwnd, LB_GETITEMRECT, i, (LPARAM)(LPRECT)&rc) != LB_ERR) {
-                                if (clPt.y >= rc.top && clPt.y <= rc.bottom) { hitIdx = i; break; }
-                            }
-                        }
-                        if (hitIdx >= 0) {
-                            int FAR* pType = (int FAR*)SendMessage(hwnd, LB_GETITEMDATA, hitIdx, 0);
-                            if (pType && *pType == 2 && (g_ViewMode == 0 || g_ViewMode == 1)) {
-                                RowItemData FAR* row = (RowItemData FAR*)pType; int colW = (g_ViewMode == 0) ? CELL_W : 150; int col = clPt.x / colW;
-                                if (col >= 0 && col < row->count && row->items[col]->isDir && !row->items[col]->isVirtual) {
-                                    lstrcpy(targetFolder, row->items[col]->path); validTarget = TRUE;
-                                }
-                            } else if (pType && *pType == 1) {
-                                ListItemData FAR* item = (ListItemData FAR*)pType;
-                                if (item->isDir && !item->isVirtual) { lstrcpy(targetFolder, item->path); validTarget = TRUE; }
-                            }
-                        }
-                    } else if (hTarget == GetDlgItem(GetParent(hwnd), ID_TREE)) {
+            g_bListDragging = FALSE; ReleaseCapture(); POINT pt; pt.x = LOWORD(lp); pt.y = HIWORD(lp); ClientToScreen(hwnd, &pt); HWND hTarget = WindowFromPoint(pt); 
+            if (hTarget) {
+                HWND hTgtParent = hTarget; char targetCls[64]; GetClassName(hTgtParent, targetCls, 64);
+                if (lstrcmpi(targetCls, "LISTBOX") == 0) { hTgtParent = GetParent(hTarget); GetClassName(hTgtParent, targetCls, 64); }
+                if (lstrcmpi(targetCls, "Win95FolderClass") == 0 || lstrcmpi(targetCls, "Win95DesktopClass") == 0 || lstrcmpi(targetCls, "Win95SearchClass") == 0) {
+                    WindowState FAR* tgtState = (WindowState FAR*)GetWindowLong(hTgtParent, 0);
+                    BOOL validTarget = FALSE; char targetFolder[MAX_PATH] = ""; BOOL tgtVirtual = FALSE;
+
+                    if (GetWindowLong(hTarget, GWL_ID) == ID_LIST && tgtState) {
                         POINT clPt = pt; ScreenToClient(hTarget, &clPt);
                         int hitIdx = -1; int topIdx = SendMessage(hTarget, LB_GETTOPINDEX, 0, 0); int count = SendMessage(hTarget, LB_GETCOUNT, 0, 0);
-                        for (int i = topIdx; i < count; i++) {
-                            RECT rc; if (SendMessage(hTarget, LB_GETITEMRECT, i, (LPARAM)(LPRECT)&rc) != LB_ERR) {
-                                if (clPt.y >= rc.top && clPt.y <= rc.bottom) { hitIdx = i; break; }
-                            }
-                        }
+                        for (int i = topIdx; i < count; i++) { RECT rc; if (SendMessage(hTarget, LB_GETITEMRECT, i, (LPARAM)(LPRECT)&rc) != LB_ERR) { if (clPt.y >= rc.top && clPt.y <= rc.bottom && clPt.x >= rc.left && clPt.x <= rc.right) { hitIdx = i; break; } } else break; }
                         if (hitIdx >= 0) {
-                            TreeItemData FAR* item = (TreeItemData FAR*)SendMessage(hTarget, LB_GETITEMDATA, hitIdx, 0);
-                            if (item && !item->isVirtual) { lstrcpy(targetFolder, item->pathOrId); validTarget = TRUE; }
+                            int FAR* pType = (int FAR*)SendMessage(hTarget, LB_GETITEMDATA, hitIdx, 0);
+                            if (pType && *pType == 2 && tgtState->viewMode == 0) { RowItemData FAR* row = (RowItemData FAR*)pType; int col = clPt.x / CELL_W; if (col >= 0 && col < row->count && row->items[col]->isDir) { lstrcpy(targetFolder, row->items[col]->path); tgtVirtual = row->items[col]->isVirtual; validTarget = TRUE; } } 
+                            else if (pType && *pType == 1) { ListItemData FAR* item = (ListItemData FAR*)pType; if (item->isDir) { lstrcpy(targetFolder, item->path); tgtVirtual = item->isVirtual; validTarget = TRUE; } }
                         }
+                    } else if (GetWindowLong(hTarget, GWL_ID) == ID_TREE) {
+                        POINT clPt = pt; ScreenToClient(hTarget, &clPt); int hitIdx = -1; int topIdx = SendMessage(hTarget, LB_GETTOPINDEX, 0, 0); int count = SendMessage(hTarget, LB_GETCOUNT, 0, 0);
+                        for (int i = topIdx; i < count; i++) { RECT rc; if (SendMessage(hTarget, LB_GETITEMRECT, i, (LPARAM)(LPRECT)&rc) != LB_ERR) { if (clPt.y >= rc.top && clPt.y <= rc.bottom) { hitIdx = i; break; } } else break; }
+                        if (hitIdx >= 0) { TreeItemData FAR* item = (TreeItemData FAR*)SendMessage(hTarget, LB_GETITEMDATA, hitIdx, 0); if (item) { lstrcpy(targetFolder, item->pathOrId); tgtVirtual = item->isVirtual; validTarget = TRUE; } }
                     }
+
+                    if (!validTarget && tgtState && lstrcmpi(targetCls, "Win95SearchClass") != 0) { lstrcpy(targetFolder, tgtState->pathOrId); tgtVirtual = tgtState->isVirtual; validTarget = TRUE; }
                     
-                    if (validTarget && lstrcmpi(targetFolder, g_SelectedListItemPath) != 0) {
-                        int op = (GetKeyState(VK_SHIFT) & 0x8000) ? 2 : 1; 
-                        if (GetKeyState(VK_CONTROL) & 0x8000) op = 1;
-                        
-                        lstrcpy(g_CurrentJob.src, g_SelectedListItemPath);
-                        lstrcpy(g_CurrentJob.dst, targetFolder);
-                        if (g_CurrentJob.dst[0] != '\0' && g_CurrentJob.dst[lstrlen(g_CurrentJob.dst)-1] != '\\') lstrcat(g_CurrentJob.dst, "\\");
-                        lstrcat(g_CurrentJob.dst, g_SelectedListItemName);
-                        
-                        if (op == 2 && strstr(g_CurrentJob.dst, g_CurrentJob.src) == g_CurrentJob.dst) {
-                            MessageBox(GetParent(hwnd), "Cannot move a folder into itself.", "Error", MB_OK|MB_ICONHAND);
+                    if (validTarget && lstrcmpi(targetFolder, g_SelectedListItemPath) != 0 && g_SelectedListItemPath[0]) {
+                        int op = 1; if (GetKeyState(VK_SHIFT) & 0x8000) op = 2; if (GetKeyState(VK_CONTROL) & 0x8000) { if (GetKeyState(VK_SHIFT) & 0x8000) op = 3; else op = 1; }
+                        char srcParent[MAX_PATH]; lstrcpy(srcParent, g_SelectedListItemPath); char* pSlash = strrchr(srcParent, '\\'); if (pSlash) *pSlash = '\0';
+                        if (lstrcmpi(srcParent, targetFolder) == 0 && op == 2) op = 1;
+
+                        if (op == 3 || tgtVirtual || g_SelectedListItemIsVirtual) {
+                            char newId[16]; GetNewIniId(newId); IniShortcut FAR* sh = (IniShortcut FAR*)malloc(sizeof(IniShortcut)); 
+                            if (sh) { memset(sh, 0, sizeof(IniShortcut)); lstrcpy(sh->id, newId); lstrcpy(sh->parentId, targetFolder); sprintf(sh->name, "%s%s", (op==3||!tgtVirtual)?"Shortcut to ":"", g_SelectedListItemName); sh->isFolder = g_SelectedListItemIsDir; if (g_SelectedListItemIsVirtual) { int i; for (i = 0; i < g_IniShortcutCount; i++) { if (lstrcmp(g_IniShortcuts[i]->id, g_SelectedListItemPath) == 0) { lstrcpy(sh->exe, g_IniShortcuts[i]->exe); break; } } } else { lstrcpy(sh->exe, g_SelectedListItemPath); } if (NameExists(targetFolder, sh->name, TRUE)) { char temp[MAX_PATH]; sprintf(temp, "Copy of %s", sh->name); lstrcpy(sh->name, temp); } if (!NameExists(targetFolder, sh->name, TRUE)) { SaveIniEntry(sh); LoadIniShortcuts(); InvalidateRect(hTgtParent, NULL, TRUE); PostMessage(hTgtParent, WM_COMMAND, 4028, 0); } free(sh); }
                         } else {
-                            if (op == 1 && lstrcmpi(g_CurrentJob.src, g_CurrentJob.dst) == 0) {
-                                char tempDst[MAX_PATH];
-                                lstrcpy(tempDst, targetFolder);
-                                if (tempDst[0] != '\0' && tempDst[lstrlen(tempDst)-1] != '\\') lstrcat(tempDst, "\\");
-                                lstrcat(tempDst, "Copy of ");
-                                lstrcat(tempDst, g_SelectedListItemName);
-                                lstrcpy(g_CurrentJob.dst, tempDst);
-                            }
-                            g_CurrentJob.isMove = (op == 2);
-                            g_CurrentJob.isDir = g_SelectedListItemIsDir;
-                            g_ReplaceMode = 0;
-                            CreateCenteredDialog(g_hInst, GetParent(hwnd), "CopyProgressDlgClass", g_CurrentJob.isMove ? "Moving" : "Copying", 280, 140);
+                            lstrcpy(g_CurrentJob.src, g_SelectedListItemPath); lstrcpy(g_CurrentJob.dst, targetFolder); if (g_CurrentJob.dst[0] != '\0' && g_CurrentJob.dst[lstrlen(g_CurrentJob.dst)-1] != '\\') lstrcat(g_CurrentJob.dst, "\\"); lstrcat(g_CurrentJob.dst, g_SelectedListItemName);
+                            if (op == 2 && strstr(g_CurrentJob.dst, g_CurrentJob.src) == g_CurrentJob.dst) { MessageBox(GetParent(hwnd), "Cannot move a folder into itself.", "Error", MB_OK|MB_ICONHAND); } 
+                            else { if (op == 1 && lstrcmpi(g_CurrentJob.src, g_CurrentJob.dst) == 0) { char tempDst[MAX_PATH]; lstrcpy(tempDst, targetFolder); if (tempDst[0] != '\0' && tempDst[lstrlen(tempDst)-1] != '\\') lstrcat(tempDst, "\\"); lstrcat(tempDst, "Copy of "); lstrcat(tempDst, g_SelectedListItemName); lstrcpy(g_CurrentJob.dst, tempDst); } g_CurrentJob.isMove = (op == 2); g_CurrentJob.isDir = g_SelectedListItemIsDir; g_ReplaceMode = 0; CreateCenteredDialog(g_hInst, GetParent(hwnd), "CopyProgressDlgClass", g_CurrentJob.isMove ? "Moving" : "Copying", 280, 140); }
                         }
                     }
                 }
@@ -1164,510 +891,519 @@ LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONUP) {
         int x = LOWORD(lp); int y = HIWORD(lp); int count = SendMessage(hwnd, LB_GETCOUNT, 0, 0); int topIdx = SendMessage(hwnd, LB_GETTOPINDEX, 0, 0); int hitIdx = -1; int i;
-        for (i = topIdx; i < count; i++) { RECT rc; if (SendMessage(hwnd, LB_GETITEMRECT, i, (LPARAM)(LPRECT)&rc) != LB_ERR) { if (y >= rc.top && y <= rc.bottom) { hitIdx = i; break; } } }
+        WindowState FAR* state = (WindowState FAR*)GetWindowLong(GetParent(hwnd), 0);
+        for (i = topIdx; i < count; i++) { RECT rc; if (SendMessage(hwnd, LB_GETITEMRECT, i, (LPARAM)(LPRECT)&rc) != LB_ERR) { if (y >= rc.top && y <= rc.bottom && x >= rc.left && x <= rc.right) { hitIdx = i; break; } } else break; }
         if (hitIdx >= 0) {
             int FAR* pType = (int FAR*)SendMessage(hwnd, LB_GETITEMDATA, hitIdx, 0);
-            if (pType && *pType == 2 && (g_ViewMode == 0 || g_ViewMode == 1)) {
-                RowItemData FAR* row = (RowItemData FAR*)pType; int colW = (g_ViewMode == 0) ? CELL_W : 150; int col = x / colW;
+            if (pType && *pType == 2 && state && state->viewMode == 0) {
+                RowItemData FAR* row = (RowItemData FAR*)pType; int col = x / CELL_W;
                 if (col >= 0 && col < row->count) {
                     ListItemData FAR* item = row->items[col]; lstrcpy(g_SelectedListItemPath, item->path); lstrcpy(g_SelectedListItemName, item->name); g_SelectedListItemIsVirtual = item->isVirtual; g_SelectedListItemIsDir = item->isDir; InvalidateRect(hwnd, NULL, TRUE);
                     if (msg == WM_LBUTTONDBLCLK) {
-                        if (item->isDir) { lstrcpy(g_CurrentPathOrId, item->path); g_CurrentIsVirtual = item->isVirtual; SetWindowText(GetParent(hwnd), item->name); if (g_CurrentIsVirtual) ExpandAllParentsVirtual(g_CurrentPathOrId); else ExpandAllParentsFS(g_CurrentPathOrId); if (!IsExpanded(item->path)) ToggleExpand(item->path); RebuildTree(GetDlgItem(GetParent(hwnd), ID_TREE)); RebuildList(GetParent(hwnd)); } else { if (item->isVirtual) { int k; for (k = 0; k < g_IniShortcutCount; k++) { if (lstrcmpi(g_IniShortcuts[k]->id, item->path) == 0) { if (g_IniShortcuts[k]->exe[0]) ShellExecute(hwnd, "open", g_IniShortcuts[k]->exe, g_IniShortcuts[k]->params, NULL, SW_SHOWNORMAL); break; } } } else ShellExecute(hwnd, "open", item->path, NULL, NULL, SW_SHOWNORMAL); }
-                    } else if (msg == WM_RBUTTONUP) { g_ContextIsVirtual = item->isVirtual; lstrcpy(g_ContextId, item->path); g_ContextIsFolder = item->isDir; POINT pt; pt.x = x; pt.y = y; ClientToScreen(hwnd, &pt); ShowContextMenu(GetParent(hwnd), pt.x, pt.y, item->isDir, FALSE); }
-                } else if (msg == WM_LBUTTONDOWN) { g_SelectedListItemPath[0] = '\0'; InvalidateRect(hwnd, NULL, TRUE); } 
-                else if (msg == WM_RBUTTONUP) { POINT pt; pt.x = x; pt.y = y; g_ContextIsVirtual = g_CurrentIsVirtual; lstrcpy(g_ContextId, g_CurrentPathOrId); g_ContextIsFolder = TRUE; ClientToScreen(hwnd, &pt); ShowContextMenu(GetParent(hwnd), pt.x, pt.y, TRUE, TRUE); return 0; }
-            } else if (msg == WM_RBUTTONUP && pType && *pType == 1) {
+                        if (item->isDir) { char pcls[64]; GetClassName(GetParent(hwnd), pcls, 64); if (lstrcmpi(pcls, "Win95DesktopClass") == 0 || lstrcmpi(pcls, "Win95SearchClass") == 0) { char pathTarget[MAX_PATH]; lstrcpy(pathTarget, item->path); CreateWindowEx(0, "Win95FolderClass", item->name, (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME) | WS_VISIBLE | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, NULL, NULL, g_hInst, (LPVOID)pathTarget); } else { lstrcpy(state->pathOrId, item->path); state->isVirtual = item->isVirtual; SetWindowText(GetParent(hwnd), item->name); if (state->isVirtual) ExpandAllParentsVirtual(state->pathOrId); else ExpandAllParentsFS(state->pathOrId); if (!IsExpanded(item->path)) ToggleExpand(item->path); RebuildTree(GetDlgItem(GetParent(hwnd), ID_TREE), state); RebuildList(GetParent(hwnd), state); } } 
+                        else { if (item->isVirtual) { int k; for (k = 0; k < g_IniShortcutCount; k++) { if (lstrcmpi(g_IniShortcuts[k]->id, item->path) == 0) { if (g_IniShortcuts[k]->exe[0]) ShellExecute(hwnd, "open", g_IniShortcuts[k]->exe, g_IniShortcuts[k]->params, NULL, SW_SHOWNORMAL); break; } } } else ShellExecute(hwnd, "open", item->path, NULL, NULL, SW_SHOWNORMAL); }
+                        return 0; /* Prevents trailing procedure from executing on freed memory */
+                    } else if (msg == WM_RBUTTONUP) { g_ContextIsVirtual = item->isVirtual; lstrcpy(g_ContextId, item->path); g_ContextIsFolder = item->isDir; POINT pt; pt.x = x; pt.y = y; ClientToScreen(hwnd, &pt); ShowContextMenu(GetParent(hwnd), pt.x, pt.y, item->isDir, FALSE, state->viewMode); }
+                } else if (msg == WM_LBUTTONDOWN) { g_SelectedListItemPath[0] = '\0'; InvalidateRect(hwnd, NULL, TRUE); } else if (msg == WM_RBUTTONUP) { POINT pt; pt.x = x; pt.y = y; g_ContextIsVirtual = state->isVirtual; lstrcpy(g_ContextId, state->pathOrId); g_ContextIsFolder = TRUE; ClientToScreen(hwnd, &pt); ShowContextMenu(GetParent(hwnd), pt.x, pt.y, TRUE, TRUE, state->viewMode); return 0; }
+            } else if (pType && *pType == 1) {
                 ListItemData FAR* item; POINT pt; pt.x = x; pt.y = y; SendMessage(hwnd, LB_SETSEL, FALSE, -1); SendMessage(hwnd, LB_SETSEL, TRUE, hitIdx); SendMessage(hwnd, LB_SETCARETINDEX, hitIdx, 0); item = (ListItemData FAR*)pType;
-                g_ContextIsVirtual = item->isVirtual; lstrcpy(g_ContextId, item->path); g_ContextIsFolder = item->isDir; ClientToScreen(hwnd, &pt); ShowContextMenu(GetParent(hwnd), pt.x, pt.y, item->isDir, FALSE); return 0;
+                if (msg == WM_LBUTTONDBLCLK) {
+                    if (item->isDir) { char pcls[64]; GetClassName(GetParent(hwnd), pcls, 64); if (lstrcmpi(pcls, "Win95DesktopClass") == 0 || lstrcmpi(pcls, "Win95SearchClass") == 0) { char pathTarget[MAX_PATH]; lstrcpy(pathTarget, item->path); CreateWindowEx(0, "Win95FolderClass", item->name, (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME) | WS_VISIBLE | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, NULL, NULL, g_hInst, (LPVOID)pathTarget); } else { lstrcpy(state->pathOrId, item->path); state->isVirtual = item->isVirtual; SetWindowText(GetParent(hwnd), item->name); if (state->isVirtual) ExpandAllParentsVirtual(state->pathOrId); else ExpandAllParentsFS(state->pathOrId); if (!IsExpanded(item->path)) ToggleExpand(item->path); RebuildTree(GetDlgItem(GetParent(hwnd), ID_TREE), state); RebuildList(GetParent(hwnd), state); } }
+                    else { if (item->isVirtual) { int k; for (k = 0; k < g_IniShortcutCount; k++) { if (lstrcmpi(g_IniShortcuts[k]->id, item->path) == 0) { if (g_IniShortcuts[k]->exe[0]) ShellExecute(hwnd, "open", g_IniShortcuts[k]->exe, g_IniShortcuts[k]->params, NULL, SW_SHOWNORMAL); break; } } } else ShellExecute(hwnd, "open", item->path, NULL, NULL, SW_SHOWNORMAL); }
+                    return 0; /* Prevents trailing procedure from executing on freed memory */
+                } else if (msg == WM_RBUTTONUP) { g_ContextIsVirtual = item->isVirtual; lstrcpy(g_ContextId, item->path); g_ContextIsFolder = item->isDir; ClientToScreen(hwnd, &pt); ShowContextMenu(GetParent(hwnd), pt.x, pt.y, item->isDir, FALSE, state?state->viewMode:3); return 0; }
+                else if (msg == WM_LBUTTONDOWN) { lstrcpy(g_SelectedListItemPath, item->path); lstrcpy(g_SelectedListItemName, item->name); g_SelectedListItemIsVirtual = item->isVirtual; g_SelectedListItemIsDir = item->isDir; }
             }
-        } else if (msg == WM_RBUTTONUP) { POINT pt; pt.x = x; pt.y = y; g_ContextIsVirtual = g_CurrentIsVirtual; lstrcpy(g_ContextId, g_CurrentPathOrId); g_ContextIsFolder = TRUE; ClientToScreen(hwnd, &pt); ShowContextMenu(GetParent(hwnd), pt.x, pt.y, TRUE, TRUE); return 0; }
+        } else if (msg == WM_RBUTTONUP) { POINT pt; pt.x = x; pt.y = y; g_ContextIsVirtual = state ? state->isVirtual : TRUE; lstrcpy(g_ContextId, state ? state->pathOrId : "0"); g_ContextIsFolder = TRUE; ClientToScreen(hwnd, &pt); ShowContextMenu(GetParent(hwnd), pt.x, pt.y, TRUE, TRUE, state ? state->viewMode : 3); return 0; }
     }
     return CallWindowProc(g_lpfnOldListProc, hwnd, msg, wp, lp);
 }
 
-/* --- Window Procedures --- */
+void HandleDrawItem(HWND hwnd, WPARAM wp, LPARAM lp) {
+    LPDRAWITEMSTRUCT lpdis = (LPDRAWITEMSTRUCT)lp; HDC hdc = lpdis->hDC; RECT rc = lpdis->rcItem; BOOL bSel = (lpdis->itemState & ODS_SELECTED); HBRUSH hWinBg;
+    char cls[64]; GetClassName(hwnd, cls, 64); WindowState FAR* state = (WindowState FAR*)GetWindowLong(hwnd, 0); int drawMode = state ? state->viewMode : g_GlobalViewMode;
+    if (lstrcmpi(cls, "Win95DesktopClass") == 0) hWinBg = g_hbrDesktop; else hWinBg = g_hbrWindow;
+    
+    if (lpdis->itemID == (UINT)-1) return;
+    if (lpdis->CtlID == ID_TREE) {
+        TreeItemData FAR* item = (TreeItemData FAR*)lpdis->itemData; int startX = item->level * 16 + 5; int lyHalf = rc.top + (rc.bottom - rc.top) / 2; int l; HPEN hDot = CreatePen(PS_DOT, 1, RGB(128, 128, 128)); HPEN hOldP = SelectObject(hdc, hDot); FillRect(hdc, &rc, hWinBg);
+        for (l = 1; l < item->level; l++) { if (!item->isLastChild[l]) { int lx = l * 16 - 3; MoveTo(hdc, lx, rc.top); LineTo(hdc, lx, rc.bottom); } }
+        if (item->level > 0) { int lx = item->level * 16 - 3; MoveTo(hdc, lx, rc.top); if (item->isLastChild[item->level]) LineTo(hdc, lx, lyHalf); else LineTo(hdc, lx, rc.bottom); MoveTo(hdc, lx, lyHalf); LineTo(hdc, lx + 8, lyHalf); }
+        SelectObject(hdc, hOldP); DeleteObject(hDot); if (item->hasChildren) DrawPlusMinus(hdc, startX - 12, rc.top + 4, item->expanded); DrawGDIFolder(hdc, startX, rc.top + 2, item->expanded, FALSE, FALSE); rc.left = startX + 20; 
+        SetBkMode(hdc, OPAQUE); SetBkColor(hdc, bSel ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_WINDOW)); SetTextColor(hdc, bSel ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_WINDOWTEXT)); ExtTextOut(hdc, rc.left + 2, rc.top + 2, ETO_CLIPPED | ETO_OPAQUE, &rc, item->displayName, lstrlen(item->displayName), NULL);
+    } else if (lpdis->CtlID == ID_LIST) {
+        int FAR* pType = (int FAR*)lpdis->itemData;
+        if (pType && *pType == 2) {
+            RowItemData FAR* row = (RowItemData FAR*)lpdis->itemData; int c; FillRect(hdc, &rc, hWinBg); int colW = CELL_W;
+            for (c = 0; c < row->count; c++) {
+                ListItemData FAR* item = row->items[c]; int itemX = rc.left + c * colW; BOOL bItemSel = (lstrcmp(item->path, g_SelectedListItemPath) == 0 && lstrcmp(item->name, g_SelectedListItemName) == 0);
+                int centerX = itemX + (CELL_W - 32) / 2; if (item->isDir) DrawGDIFolder(hdc, centerX, rc.top + 5, FALSE, bItemSel, TRUE); else DrawGDIFile(hdc, centerX, rc.top + 5, bItemSel, TRUE);
+                RECT tRc; tRc.left = itemX + 2; tRc.right = itemX + CELL_W - 2; tRc.top = rc.top + 42; tRc.bottom = rc.bottom; SetBkMode(hdc, OPAQUE); SetBkColor(hdc, bItemSel ? GetSysColor(COLOR_HIGHLIGHT) : (lstrcmpi(cls, "Win95DesktopClass") == 0 ? (g_bIsWindowed ? RGB(0, 128, 128) : GetSysColor(COLOR_BACKGROUND)) : GetSysColor(COLOR_WINDOW))); SetTextColor(hdc, bItemSel ? GetSysColor(COLOR_HIGHLIGHTTEXT) : (lstrcmpi(cls, "Win95DesktopClass") == 0 ? RGB(255,255,255) : GetSysColor(COLOR_WINDOWTEXT))); ExtTextOut(hdc, 0, 0, ETO_OPAQUE, &tRc, "", 0, NULL); DrawText(hdc, item->name, -1, &tRc, DT_CENTER | DT_WORDBREAK);
+            }
+        } else if (pType && *pType == 1) {
+            ListItemData FAR* item = (ListItemData FAR*)lpdis->itemData; char buf[MAX_PATH]; FillRect(hdc, &rc, bSel ? g_hbrHighlight : hWinBg); 
+            RECT rName = rc, rSize = rc, rType = rc, rDate = rc; rName.left += 22;
+            if (drawMode == 3) { rName.right = rc.left + 150 - 4; rSize.left = rc.left + 150 + 4; rSize.right = rc.left + 220 - 4; rType.left = rc.left + 220 + 4; rType.right = rc.left + 280 - 4; rDate.left = rc.left + 280 + 4; }
+            if (item->isDir) DrawGDIFolder(hdc, rc.left + 2, rc.top + 2, FALSE, FALSE, FALSE); else DrawGDIFile(hdc, rc.left + 2, rc.top + 2, FALSE, FALSE);
+            SetBkMode(hdc, OPAQUE); SetBkColor(hdc, bSel ? GetSysColor(COLOR_HIGHLIGHT) : (lstrcmpi(cls, "Win95DesktopClass") == 0 ? (g_bIsWindowed ? RGB(0, 128, 128) : GetSysColor(COLOR_BACKGROUND)) : GetSysColor(COLOR_WINDOW))); SetTextColor(hdc, bSel ? GetSysColor(COLOR_HIGHLIGHTTEXT) : (lstrcmpi(cls, "Win95DesktopClass") == 0 ? RGB(255,255,255) : GetSysColor(COLOR_WINDOWTEXT)));
+            if (drawMode == 3) {
+                ExtTextOut(hdc, rName.left, rc.top + 2, ETO_CLIPPED | ETO_OPAQUE, &rName, item->name, lstrlen(item->name), NULL);
+                if (lstrcmpi(cls, "Win95SearchClass") == 0) {
+                    ExtTextOut(hdc, rSize.left, rc.top + 2, ETO_CLIPPED | ETO_OPAQUE, &rSize, item->path, lstrlen(item->path), NULL);
+                    if (!item->isDir && !item->isVirtual) { FormatSizeStr(item->size, buf); ExtTextOut(hdc, rType.left, rc.top + 2, ETO_CLIPPED | ETO_OPAQUE, &rType, buf, lstrlen(buf), NULL); } else ExtTextOut(hdc, rType.left, rc.top + 2, ETO_OPAQUE, &rType, "", 0, NULL);
+                    if (!item->isVirtual && item->date > 0) { FormatDateStr(item->date, item->time, buf); ExtTextOut(hdc, rDate.left, rc.top + 2, ETO_CLIPPED | ETO_OPAQUE, &rDate, buf, lstrlen(buf), NULL); } else ExtTextOut(hdc, rDate.left, rc.top + 2, ETO_OPAQUE, &rDate, "", 0, NULL);
+                } else {
+                    if (!item->isDir && !item->isVirtual) { FormatSizeStr(item->size, buf); ExtTextOut(hdc, rSize.left, rc.top + 2, ETO_CLIPPED | ETO_OPAQUE, &rSize, buf, lstrlen(buf), NULL); } else ExtTextOut(hdc, rSize.left, rc.top + 2, ETO_OPAQUE, &rSize, "", 0, NULL);
+                    if (item->isDir) lstrcpy(buf, "File Folder"); else if (item->ext[0]) sprintf(buf, "%s File", item->ext); else lstrcpy(buf, "File"); ExtTextOut(hdc, rType.left, rc.top + 2, ETO_CLIPPED | ETO_OPAQUE, &rType, buf, lstrlen(buf), NULL);
+                    if (!item->isVirtual && item->date > 0) { FormatDateStr(item->date, item->time, buf); ExtTextOut(hdc, rDate.left, rc.top + 2, ETO_CLIPPED | ETO_OPAQUE, &rDate, buf, lstrlen(buf), NULL); } else ExtTextOut(hdc, rDate.left, rc.top + 2, ETO_OPAQUE, &rDate, "", 0, NULL);
+                }
+            } else { ExtTextOut(hdc, rName.left, rc.top + 2, ETO_CLIPPED | ETO_OPAQUE, &rName, item->name, lstrlen(item->name), NULL); }
+        }
+    }
+}
 
-LRESULT CALLBACK DesktopProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-        case WM_CREATE: LoadConfig(); return 0;
-        case WM_KEYDOWN: {
-            if (wp == VK_F5) { SendMessage(hwnd, WM_COMMAND, 4028, 0); return 0; }
-            if (wp == VK_F2) { SendMessage(hwnd, WM_COMMAND, 4004, 0); return 0; }
-            if (wp == VK_DELETE) { SendMessage(hwnd, WM_COMMAND, 4003, 0); return 0; }
-            if (GetKeyState(VK_CONTROL) & 0x8000) {
-                if (wp == 'A') { SendMessage(hwnd, WM_COMMAND, 4015, 0); return 0; }
-                if (wp == 'X') { SendMessage(hwnd, WM_COMMAND, 4011, 0); return 0; }
-                if (wp == 'C') { SendMessage(hwnd, WM_COMMAND, 4012, 0); return 0; }
-                if (wp == 'V') { SendMessage(hwnd, WM_COMMAND, 4013, 0); return 0; }
-                if (wp == 'N') { SendMessage(hwnd, WM_COMMAND, 4001, 0); return 0; }
-            } break;
+void HandleListCommand(HWND hwnd, WPARAM wp, LPARAM lp, WindowState FAR* state) {
+    int id = wp; HWND hList = GetDlgItem(hwnd, ID_LIST); HWND hTree = GetDlgItem(hwnd, ID_TREE); HWND hFocus = GetFocus();
+    if (id == 4041) MessageBox(hwnd, "Explorer for Win16\nWindows 95 Shell Clone", "About Calmira", MB_OK | MB_ICONINFORMATION);
+    else if (id == 4006) DestroyWindow(hwnd);
+    else if (id == 4022) ChangeViewMode(hwnd, 0, state); else if (id == 4023) ChangeViewMode(hwnd, 1, state); else if (id == 4024) ChangeViewMode(hwnd, 2, state); else if (id == 4025) ChangeViewMode(hwnd, 3, state);
+    else if (id == 4020) { g_bShowToolbar = !g_bShowToolbar; ShowWindow(GetDlgItem(hwnd, ID_TOOLBAR), g_bShowToolbar ? SW_SHOW : SW_HIDE); CheckMenuItem(GetMenu(hwnd), 4020, MF_BYCOMMAND | (g_bShowToolbar ? MF_CHECKED : MF_UNCHECKED)); SendMessage(hwnd, WM_SIZE, 0, MAKELONG(GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))); }
+    else if (id == 4021) { g_bShowStatusBar = !g_bShowStatusBar; ShowWindow(GetDlgItem(hwnd, 300), g_bShowStatusBar ? SW_SHOW : SW_HIDE); CheckMenuItem(GetMenu(hwnd), 4021, MF_BYCOMMAND | (g_bShowStatusBar ? MF_CHECKED : MF_UNCHECKED)); SendMessage(hwnd, WM_SIZE, 0, MAKELONG(GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))); }
+    else if (id == 4028) { LoadIniShortcuts(); if(hTree) RebuildTree(hTree, state); RebuildList(hwnd, state); }
+    else if (id == 4030 || id == 5003) { const char* target = (id == 5003 && g_ContextIsFolder && g_ContextId[0]) ? g_ContextId : state->pathOrId; CreateWindowEx(0, "Win95SearchClass", "Find: All Files", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 480, 420, NULL, NULL, g_hInst, (LPVOID)target); }
+    else if (id == 4050) { 
+        if (state->isVirtual) { 
+            if (lstrcmp(state->pathOrId, "0") != 0) { 
+                int i; for(i=0; i<g_IniShortcutCount; i++) { 
+                    if(lstrcmp(g_IniShortcuts[i]->id, state->pathOrId)==0) { 
+                        lstrcpy(state->pathOrId, g_IniShortcuts[i]->parentId); break; 
+                    } 
+                } 
+            } 
+        } else { 
+            char temp[MAX_PATH]; lstrcpy(temp, state->pathOrId); 
+            char* p = strrchr(temp, '\\'); 
+            if (p) { 
+                if (p == temp) *(p+1) = '\0'; 
+                else if (p > temp && *(p-1) == ':') {
+                    if (*(p+1) == '\0') { lstrcpy(temp, "0"); state->isVirtual = TRUE; }
+                    else *(p+1) = '\0';
+                } else *p = '\0'; 
+                lstrcpy(state->pathOrId, temp); 
+            } else { 
+                lstrcpy(state->pathOrId, "0"); state->isVirtual = TRUE; 
+            } 
         }
-        case WM_PAINT: {
-            PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps); RECT rcClient; int rows, idx = 0, i; HFONT hFont = GetStockObject(DEFAULT_GUI_FONT); HFONT hOldFont = SelectObject(hdc, hFont); GetClientRect(hwnd, &rcClient); rows = rcClient.bottom / CELL_H; if (rows < 1) rows = 1; SetBkMode(hdc, TRANSPARENT); SetTextColor(hdc, RGB(255, 255, 255));
-            for (i = 0; i < g_IniShortcutCount; i++) {
-                if (lstrcmp(g_IniShortcuts[i]->parentId, "0") == 0 && lstrcmp(g_IniShortcuts[i]->name, "-") != 0) {
-                    int r = idx % rows; int c = idx / rows; int x = c * CELL_W; int y = r * CELL_H; RECT textRect; BOOL bSel = (i == g_DesktopSelectedIndex);
-                    if (g_IniShortcuts[i]->isFolder) DrawGDIFolder(hdc, x + (CELL_W - 32)/2, y + 5, FALSE, bSel, TRUE); else DrawGDIFile(hdc, x + (CELL_W - 32)/2, y + 5, bSel, TRUE);
-                    textRect.left = x + 2; textRect.right = x + CELL_W - 2; textRect.top = y + 42; textRect.bottom = y + CELL_H;
-                    if (bSel) { HBRUSH hSelBr = CreateSolidBrush(GetSysColor(COLOR_HIGHLIGHT)); FillRect(hdc, &textRect, hSelBr); DeleteObject(hSelBr); SetTextColor(hdc, GetSysColor(COLOR_HIGHLIGHTTEXT)); } 
-                    else { SetTextColor(hdc, RGB(255, 255, 255)); }
-                    DrawText(hdc, g_IniShortcuts[i]->name, -1, &textRect, DT_CENTER | DT_WORDBREAK); idx++;
-                }
-            } SelectObject(hdc, hOldFont); EndPaint(hwnd, &ps); return 0;
+        if (state->isVirtual) ExpandAllParentsVirtual(state->pathOrId); else ExpandAllParentsFS(state->pathOrId); 
+        if (!IsExpanded(state->pathOrId)) ToggleExpand(state->pathOrId); 
+        if(hTree) RebuildTree(hTree, state); RebuildList(hwnd, state);
+    }
+    else if (id == 9999) { 
+         HWND hDesktop = FindWindow("Win95DesktopClass", "Desktop");
+         if (hDesktop) {
+             char clipP[MAX_PATH], clipN[64]; BOOL isV = FALSE, isD = FALSE;
+             if (state->viewMode == 0) { lstrcpy(clipP, g_SelectedListItemPath); lstrcpy(clipN, g_SelectedListItemName); isV = g_SelectedListItemIsVirtual; isD = g_SelectedListItemIsDir; } else { int sel = SendMessage(hList, LB_GETCARETINDEX, 0, 0); if (sel != LB_ERR && SendMessage(hList, LB_GETSEL, sel, 0) > 0) { int FAR* pType = (int FAR*)SendMessage(hList, LB_GETITEMDATA, sel, 0); if (pType && *pType == 1) { ListItemData FAR* item = (ListItemData FAR*)pType; lstrcpy(clipP, item->path); lstrcpy(clipN, item->name); isV = item->isVirtual; isD = item->isDir; } } }
+             if (clipN[0] != '\0') {
+                 char newId[16]; GetNewIniId(newId); IniShortcut FAR* sh = (IniShortcut FAR*)malloc(sizeof(IniShortcut)); 
+                 if (sh) { memset(sh, 0, sizeof(IniShortcut)); lstrcpy(sh->id, newId); lstrcpy(sh->parentId, "0"); sprintf(sh->name, "Shortcut to %s", clipN); sh->isFolder = isD; if (isV) { int i; for (i = 0; i < g_IniShortcutCount; i++) { if (lstrcmp(g_IniShortcuts[i]->id, clipP) == 0) { lstrcpy(sh->exe, g_IniShortcuts[i]->exe); break; } } } else { lstrcpy(sh->exe, clipP); } if (NameExists("0", sh->name, TRUE)) { char temp[MAX_PATH]; sprintf(temp, "Copy of %s", sh->name); lstrcpy(sh->name, temp); } if (!NameExists("0", sh->name, TRUE)) { SaveIniEntry(sh); LoadIniShortcuts(); InvalidateRect(hDesktop, NULL, TRUE); } free(sh); }
+             }
+         }
+    }
+    else if (id == ID_TREE && (HIWORD(lp) == LBN_SELCHANGE || HIWORD(lp) == LBN_DBLCLK)) { int sel = SendMessage(hTree, LB_GETCURSEL, 0, 0); if (sel != LB_ERR) { TreeItemData FAR* item = (TreeItemData FAR*)SendMessage(hTree, LB_GETITEMDATA, sel, 0); if (item) { lstrcpy(state->pathOrId, item->pathOrId); state->isVirtual = item->isVirtual; SetWindowText(hwnd, item->displayName); RebuildList(hwnd, state); } } }
+    else if (id >= 4001 && id <= 4016) {
+        if (id == 4001 || id == 4002) { lstrcpy(g_ContextId, state->pathOrId); g_ContextIsVirtual = state->isVirtual; } 
+        else if (id <= 4005 || id == 4011 || id == 4012) {
+            if (hFocus == hTree) { lstrcpy(g_ContextId, state->pathOrId); g_ContextIsVirtual = state->isVirtual; g_ContextIsFolder = TRUE; } else { if (state->viewMode == 0) { if (g_SelectedListItemPath[0] != '\0') { lstrcpy(g_ContextId, g_SelectedListItemPath); g_ContextIsVirtual = g_SelectedListItemIsVirtual; g_ContextIsFolder = g_SelectedListItemIsDir; } else { HWND hStat = GetDlgItem(hwnd, 300); if (hStat) SetWindowText(hStat, " Please select an item first."); return; } } else { int sel = SendMessage(hList, LB_GETCARETINDEX, 0, 0); if (sel != LB_ERR && SendMessage(hList, LB_GETSEL, sel, 0) > 0) { int FAR* pType = (int FAR*)SendMessage(hList, LB_GETITEMDATA, sel, 0); if (pType && *pType == 1) { ListItemData FAR* item = (ListItemData FAR*)pType; lstrcpy(g_ContextId, item->path); g_ContextIsVirtual = item->isVirtual; g_ContextIsFolder = item->isDir; } } else { HWND hStat = GetDlgItem(hwnd, 300); if (hStat) SetWindowText(hStat, " Please select an item first."); return; } } }
         }
-        case WM_LBUTTONDOWN: {
-            RECT rc; int rows, c, r, idx = 0, hitIndex = -1, i; int x = LOWORD(lp); int y = HIWORD(lp); GetClientRect(hwnd, &rc); rows = rc.bottom / CELL_H; if (rows < 1) rows = 1; c = x / CELL_W; r = y / CELL_H; idx = c * rows + r;
-            for (i = 0; i < g_IniShortcutCount; i++) { if (lstrcmp(g_IniShortcuts[i]->parentId, "0") == 0 && lstrcmp(g_IniShortcuts[i]->name, "-") != 0) { if (idx == 0) { hitIndex = i; break; } idx--; } }
-            if (hitIndex != g_DesktopSelectedIndex) { g_DesktopSelectedIndex = hitIndex; InvalidateRect(hwnd, NULL, TRUE); } return 0;
+        if (!g_ContextIsVirtual && (id == 4002)) { HWND hStat = GetDlgItem(hwnd, 300); if (hStat) SetWindowText(hStat, " Only virtual shortcuts can be edited."); return; }
+        if (id == 4001) { 
+            if (!state->isVirtual) {
+                char newPath[MAX_PATH]; char baseName[64]; int idx = 0;
+                do { if (idx == 0) lstrcpy(baseName, "New Folder"); else sprintf(baseName, "New Folder (%d)", idx); lstrcpy(newPath, state->pathOrId); if (newPath[0] && newPath[lstrlen(newPath)-1] != '\\') lstrcat(newPath, "\\"); lstrcat(newPath, baseName); idx++; } while (access(newPath, 0) == 0);
+                if (mkdir(newPath) == 0) {
+                    int i, count; RebuildList(hwnd, state); SetFocus(hList); count = SendMessage(hList, LB_GETCOUNT, 0, 0);
+                    for (i = 0; i < count; i++) { int FAR* pType = (int FAR*)SendMessage(hList, LB_GETITEMDATA, i, 0); if (pType && *pType == 1) { ListItemData FAR* item = (ListItemData FAR*)pType; if (lstrcmp(item->name, baseName) == 0) { SendMessage(hList, LB_SETCURSEL, i, 0); lstrcpy(g_SelectedListItemPath, item->path); lstrcpy(g_SelectedListItemName, item->name); g_SelectedListItemIsVirtual = FALSE; g_SelectedListItemIsDir = TRUE; break; } } else if (pType && *pType == 2) { RowItemData FAR* row = (RowItemData FAR*)pType; int c; for (c = 0; c < row->count; c++) { if (lstrcmp(row->items[c]->name, baseName) == 0) { SendMessage(hList, LB_SETCURSEL, i, 0); lstrcpy(g_SelectedListItemPath, row->items[c]->path); lstrcpy(g_SelectedListItemName, row->items[c]->name); g_SelectedListItemIsVirtual = FALSE; g_SelectedListItemIsDir = TRUE; break; } } } }
+                    InvalidateRect(hList, NULL, TRUE); UpdateWindow(hList); PostMessage(hwnd, WM_COMMAND, 4004, 0);
+                } else { MessageBox(hwnd, "Failed to create folder.", "Error", MB_OK|MB_ICONHAND); }
+            } else { lstrcpy(g_PromptLabel, "New Folder Name:"); g_PromptValue[0] = '\0'; g_PromptMode = PROMPT_NEWFOLDER; CreateCenteredDialog(g_hInst, hwnd, "PromptDlgClass", "New Folder", 290, 170); }
         }
-        case WM_LBUTTONDBLCLK: {
-            if (g_DesktopSelectedIndex >= 0) {
-                IniShortcut FAR* sh = g_IniShortcuts[g_DesktopSelectedIndex];
-                if (sh->isFolder) { char path[MAX_PATH]; if (sh->exe[0]) lstrcpy(path, sh->exe); else lstrcpy(path, sh->id); CreateWindowEx(0, "Win95FolderClass", sh->name, WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, NULL, NULL, g_hInst, (LPVOID)path); } 
-                else if (sh->exe[0]) ShellExecute(hwnd, "open", sh->exe, sh->params[0] ? sh->params : NULL, NULL, SW_SHOWNORMAL);
-            } return 0;
+        else if (id == 4002) { g_EditShortcutId[0] = '\0'; CreateCenteredDialog(g_hInst, hwnd, "ShortcutDlgClass", "Create Shortcut", 360, 300); }
+        else if (id == 4003 && g_ContextId[0] != '\0') {
+            char msgBuf[256]; sprintf(msgBuf, "Are you sure you want to delete '%s'?", g_ContextId);
+            if (MessageBox(hwnd, msgBuf, "Confirm Delete", MB_YESNO | MB_ICONQUESTION) == IDYES) { if (g_ContextIsVirtual) { WritePrivateProfileString("Shortcut", g_ContextId, NULL, g_szExplorerIni); LoadIniShortcuts(); if(hTree) RebuildTree(hTree, state); RebuildList(hwnd, state); } else { lstrcpy(g_DelPath, g_ContextId); g_DelIsDir = g_ContextIsFolder; g_bCancelDel = FALSE; CreateCenteredDialog(g_hInst, hwnd, "DeleteProgressDlgClass", "Deleting", 280, 130); } }
         }
-        case WM_RBUTTONUP: {
-            POINT pt; pt.x = LOWORD(lp); pt.y = HIWORD(lp); ClientToScreen(hwnd, &pt);
-            if (g_DesktopSelectedIndex >= 0) { g_ContextIsVirtual = TRUE; lstrcpy(g_ContextId, g_IniShortcuts[g_DesktopSelectedIndex]->id); ShowContextMenu(hwnd, pt.x, pt.y, g_IniShortcuts[g_DesktopSelectedIndex]->isFolder, FALSE); } 
-            else { g_ContextIsVirtual = TRUE; lstrcpy(g_ContextId, "0"); ShowContextMenu(hwnd, pt.x, pt.y, TRUE, TRUE); } return 0;
-        }
-        case WM_COMMAND: {
-            int id = wp;
-            if (id == 4028) { LoadIniShortcuts(); InvalidateRect(hwnd, NULL, TRUE); return 0; }
-            if (id >= 4011 && id <= 4015) {
-                if (id == 4011 || id == 4012) {
-                    if (g_DesktopSelectedIndex >= 0) {
-                        lstrcpy(g_ClipPath, g_IniShortcuts[g_DesktopSelectedIndex]->id); lstrcpy(g_ClipName, g_IniShortcuts[g_DesktopSelectedIndex]->name);
-                        g_ClipIsVirtual = TRUE; g_ClipIsDir = g_IniShortcuts[g_DesktopSelectedIndex]->isFolder;
-                        g_ClipOp = (id == 4011) ? 2 : 1; lstrcpy(g_ClipId, g_IniShortcuts[g_DesktopSelectedIndex]->id);
-                    }
-                }
-                else if (id == 4013) {
-                    if (g_ClipOp == 0) return 0; char newId[16]; IniShortcut sh; memset(&sh, 0, sizeof(sh)); GetNewIniId(newId); lstrcpy(sh.id, newId);
-                    lstrcpy(sh.name, g_ClipName); lstrcpy(sh.parentId, "0"); sh.isFolder = g_ClipIsDir;
-                    if (g_ClipIsVirtual) { int i; for(i=0; i<g_IniShortcutCount; i++) if (lstrcmp(g_IniShortcuts[i]->id, g_ClipId) == 0) { lstrcpy(sh.exe, g_IniShortcuts[i]->exe); lstrcpy(sh.params, g_IniShortcuts[i]->params); lstrcpy(sh.icon, g_IniShortcuts[i]->icon); sh.minimized = g_IniShortcuts[i]->minimized; break; }
-                        if (g_ClipOp == 2) { WritePrivateProfileString("Shortcut", g_ClipId, NULL, g_szExplorerIni); g_ClipOp = 0; }
-                    } else lstrcpy(sh.exe, g_ClipPath);
-                    if (g_ClipOp == 1 && lstrcmpi(g_ClipPath, "0") == 0) { char temp[MAX_PATH]; sprintf(temp, "Copy of %s", sh.name); lstrcpy(sh.name, temp); }
-                    if (NameExists("0", sh.name, TRUE)) { char temp[MAX_PATH]; sprintf(temp, "Copy of %s", sh.name); lstrcpy(sh.name, temp); }
-                    if (!NameExists("0", sh.name, TRUE)) { SaveIniEntry(&sh); LoadIniShortcuts(); InvalidateRect(hwnd, NULL, TRUE); }
-                }
-                else if (id == 4014) {
-                    if (g_ClipOp == 0) return 0; char newId[16]; IniShortcut sh; memset(&sh, 0, sizeof(sh)); GetNewIniId(newId); lstrcpy(sh.id, newId);
-                    sprintf(sh.name, "Shortcut to %s", g_ClipName); lstrcpy(sh.parentId, "0"); sh.isFolder = FALSE;
-                    if (g_ClipIsVirtual) { int i; for(i=0; i<g_IniShortcutCount; i++) if (lstrcmp(g_IniShortcuts[i]->id, g_ClipId) == 0) { lstrcpy(sh.exe, g_IniShortcuts[i]->exe); lstrcpy(sh.params, g_IniShortcuts[i]->params); lstrcpy(sh.icon, g_IniShortcuts[i]->icon); sh.minimized = g_IniShortcuts[i]->minimized; break; } } 
-                    else lstrcpy(sh.exe, g_ClipPath); 
-                    if (NameExists("0", sh.name, TRUE)) { char temp[MAX_PATH]; sprintf(temp, "Copy of %s", sh.name); lstrcpy(sh.name, temp); }
-                    if (!NameExists("0", sh.name, TRUE)) { SaveIniEntry(&sh); LoadIniShortcuts(); InvalidateRect(hwnd, NULL, TRUE); }
+        else if (id == 4004) {
+            if (hFocus == hTree) { HWND hStat = GetDlgItem(hwnd, 300); if (hStat) SetWindowText(hStat, " Rename unsupported in tree view directly."); }
+            else {
+                int sel = SendMessage(hList, LB_GETCURSEL, 0, 0);
+                if (state->viewMode == 0) {
+                    if (g_SelectedListItemPath[0] != '\0') { g_InlineRenameIsVirtual = g_SelectedListItemIsVirtual; if (g_SelectedListItemIsVirtual) lstrcpy(g_InlineRenameId, g_SelectedListItemPath); else lstrcpy(g_InlineRenameOldPath, g_SelectedListItemPath); if (sel != LB_ERR) { int FAR* pType = (int FAR*)SendMessage(hList, LB_GETITEMDATA, sel, 0); if (pType && *pType == 2) { RowItemData FAR* row = (RowItemData FAR*)pType; int c; for (c=0; c<row->count; c++) { if (lstrcmp(row->items[c]->path, g_SelectedListItemPath) == 0 && lstrcmp(row->items[c]->name, g_SelectedListItemName) == 0) { RECT rc; SendMessage(hList, LB_GETITEMRECT, sel, (LPARAM)(LPRECT)&rc); int itemX = rc.left + c * CELL_W; RECT eRc; eRc.left = itemX + 2; eRc.right = itemX + CELL_W - 2; eRc.top = rc.top + 42; eRc.bottom = rc.bottom; HWND hEdit = CreateWindowEx(0, "EDIT", row->items[c]->name, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_CENTER, eRc.left, eRc.top, eRc.right - eRc.left, eRc.bottom - eRc.top, hList, (HMENU)9999, g_hInst, NULL); g_lpfnOldInlineEditProc = (FARPROC)SetWindowLong(hEdit, GWL_WNDPROC, (LONG)g_lpfnInlineEditProcInst); SetFocus(hEdit); SendMessage(hEdit, EM_SETSEL, 0, MAKELONG(0, -1)); break; } } } } }
+                } else {
+                    if (sel != LB_ERR) { int FAR* pType = (int FAR*)SendMessage(hList, LB_GETITEMDATA, sel, 0); if (pType && *pType == 1) { ListItemData FAR* item = (ListItemData FAR*)pType; g_InlineRenameIsVirtual = item->isVirtual; if (item->isVirtual) lstrcpy(g_InlineRenameId, item->path); else lstrcpy(g_InlineRenameOldPath, item->path); RECT rc; SendMessage(hList, LB_GETITEMRECT, sel, (LPARAM)(LPRECT)&rc); rc.left += 22; if (state->viewMode == 3) rc.right = rc.left + 150 - 4; HWND hEdit = CreateWindowEx(0, "EDIT", item->name, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, hList, (HMENU)9999, g_hInst, NULL); g_lpfnOldInlineEditProc = (FARPROC)SetWindowLong(hEdit, GWL_WNDPROC, (LONG)g_lpfnInlineEditProcInst); SetFocus(hEdit); SendMessage(hEdit, EM_SETSEL, 0, MAKELONG(0, -1)); } }
                 }
             }
-            if (id >= 4001 && id <= 4005) {
-                if (id == 4001 || id == 4002) { lstrcpy(g_ContextId, "0"); g_ContextIsVirtual = TRUE; } 
-                else if (g_DesktopSelectedIndex >= 0) lstrcpy(g_ContextId, g_IniShortcuts[g_DesktopSelectedIndex]->id);
-                else return 0;
-                
-                if (id == 4001) { lstrcpy(g_PromptLabel, "New Folder Name:"); g_PromptValue[0] = '\0'; g_PromptMode = PROMPT_NEWFOLDER; CreateCenteredDialog(g_hInst, hwnd, "PromptDlgClass", "New Folder", 290, 170); }
-                else if (id == 4002) { g_EditShortcutId[0] = '\0'; CreateCenteredDialog(g_hInst, hwnd, "ShortcutDlgClass", "Create Shortcut", 360, 300); }
-                else if (id == 4003 && g_ContextId[0] != '\0') {
-                    char msgBuf[256]; sprintf(msgBuf, "Are you sure you want to delete '%s'?", g_ContextId);
-                    if (MessageBox(hwnd, msgBuf, "Confirm Delete", MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                        WritePrivateProfileString("Shortcut", g_ContextId, NULL, g_szExplorerIni); LoadIniShortcuts(); InvalidateRect(hwnd, NULL, TRUE); 
-                    }
-                }
-                else if (id == 4004 && g_DesktopSelectedIndex >= 0) {
-                    RECT rcClient; GetClientRect(hwnd, &rcClient); int rows = rcClient.bottom / CELL_H; if (rows < 1) rows = 1; int idx = 0, i;
-                    for (i = 0; i < g_IniShortcutCount; i++) {
-                        if (lstrcmp(g_IniShortcuts[i]->parentId, "0") == 0 && lstrcmp(g_IniShortcuts[i]->name, "-") != 0) {
-                            if (i == g_DesktopSelectedIndex) {
-                                int r = idx % rows; int c = idx / rows; int x = c * CELL_W; int y = r * CELL_H; RECT eRc; eRc.left = x + 2; eRc.right = x + CELL_W - 2; eRc.top = y + 42; eRc.bottom = y + CELL_H; g_InlineRenameIsVirtual = TRUE; lstrcpy(g_InlineRenameId, g_IniShortcuts[i]->id); HWND hEdit = CreateWindowEx(0, "EDIT", g_IniShortcuts[i]->name, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_CENTER, eRc.left, eRc.top, eRc.right - eRc.left, eRc.bottom - eRc.top, hwnd, (HMENU)9999, g_hInst, NULL); g_lpfnOldInlineEditProc = (FARPROC)SetWindowLong(hEdit, GWL_WNDPROC, (LONG)g_lpfnInlineEditProcInst); SetFocus(hEdit); SendMessage(hEdit, EM_SETSEL, 0, MAKELONG(0, -1)); break;
-                            } idx++;
-                        }
-                    }
-                }
-                else if (id == 4005) { lstrcpy(g_EditShortcutId, g_ContextId); CreateCenteredDialog(g_hInst, hwnd, "ShortcutDlgClass", "Properties", 360, 300); }
-            } return 0;
         }
-        case WM_SIZE: InvalidateRect(hwnd, NULL, TRUE); return 0;
-        case WM_DESTROY: PostQuitMessage(0); return 0;
+        else if (id == 4005 && g_ContextId[0] != '\0') {
+            if (!g_ContextIsVirtual) { CreateCenteredDialog(g_hInst, hwnd, "FilePropDlgClass", "Properties", 360, 300); }
+            else { lstrcpy(g_EditShortcutId, g_ContextId); CreateCenteredDialog(g_hInst, hwnd, "ShortcutDlgClass", "Properties", 360, 300); }
+        }
+        else if (id == 4011 || id == 4012) {
+            if (hFocus == hTree) { lstrcpy(g_ClipPath, g_ContextId); lstrcpy(g_ClipName, ""); g_ClipIsVirtual = g_ContextIsVirtual; g_ClipIsDir = g_ContextIsFolder; } 
+            else { if (state->viewMode == 0) { lstrcpy(g_ClipPath, g_SelectedListItemPath); lstrcpy(g_ClipName, g_SelectedListItemName); g_ClipIsVirtual = g_SelectedListItemIsVirtual; g_ClipIsDir = g_SelectedListItemIsDir; } else { int sel = SendMessage(hList, LB_GETCARETINDEX, 0, 0); if (sel != LB_ERR && SendMessage(hList, LB_GETSEL, sel, 0) > 0) { int FAR* pType = (int FAR*)SendMessage(hList, LB_GETITEMDATA, sel, 0); if (pType && *pType == 1) { ListItemData FAR* item = (ListItemData FAR*)pType; lstrcpy(g_ClipPath, item->path); lstrcpy(g_ClipName, item->name); g_ClipIsVirtual = item->isVirtual; g_ClipIsDir = item->isDir; } } } }
+            if (g_ClipName[0] == '\0') { if (!g_ClipIsVirtual) { char tempP[MAX_PATH]; lstrcpy(tempP, g_ClipPath); if (tempP[0] && tempP[lstrlen(tempP)-1] == '\\') tempP[lstrlen(tempP)-1] = '\0'; char* p = strrchr(tempP, '\\'); if (p) lstrcpy(g_ClipName, p + 1); else lstrcpy(g_ClipName, tempP); } else { int k; for(k=0; k<g_IniShortcutCount; k++) if(lstrcmp(g_IniShortcuts[k]->id, g_ClipPath) == 0) { lstrcpy(g_ClipName, g_IniShortcuts[k]->name); break; } } }
+            g_ClipOp = (id == 4011) ? 2 : 1; if (g_ClipIsVirtual) lstrcpy(g_ClipId, g_ClipPath);
+        }
+        else if (id == 4013) {
+            if (g_ClipOp == 0) return;
+            if (g_ClipIsVirtual || state->isVirtual) {
+                char newId[16]; IniShortcut FAR* sh = (IniShortcut FAR*)malloc(sizeof(IniShortcut));
+                if (sh) { memset(sh, 0, sizeof(IniShortcut)); GetNewIniId(newId); lstrcpy(sh->id, newId); lstrcpy(sh->name, g_ClipName); lstrcpy(sh->parentId, state->pathOrId); sh->isFolder = g_ClipIsDir; if (g_ClipIsVirtual) { int i; for(i=0; i<g_IniShortcutCount; i++) if (lstrcmp(g_IniShortcuts[i]->id, g_ClipId) == 0) { lstrcpy(sh->exe, g_IniShortcuts[i]->exe); lstrcpy(sh->params, g_IniShortcuts[i]->params); lstrcpy(sh->icon, g_IniShortcuts[i]->icon); sh->minimized = g_IniShortcuts[i]->minimized; break; } if (g_ClipOp == 2) { WritePrivateProfileString("Shortcut", g_ClipId, NULL, g_szExplorerIni); g_ClipOp = 0; } } else lstrcpy(sh->exe, g_ClipPath); if (NameExists(state->pathOrId, sh->name, TRUE)) { char temp[MAX_PATH]; sprintf(temp, "Copy of %s", sh->name); lstrcpy(sh->name, temp); } if (!NameExists(state->pathOrId, sh->name, TRUE)) { SaveIniEntry(sh); LoadIniShortcuts(); if(hTree) RebuildTree(hTree, state); RebuildList(hwnd, state); } free(sh); }
+            } else {
+                lstrcpy(g_CurrentJob.src, g_ClipPath); lstrcpy(g_CurrentJob.dst, state->pathOrId); if (g_CurrentJob.dst[0] != '\0' && g_CurrentJob.dst[lstrlen(g_CurrentJob.dst)-1] != '\\') lstrcat(g_CurrentJob.dst, "\\"); lstrcat(g_CurrentJob.dst, g_ClipName); 
+                if (g_ClipOp == 1 && lstrcmpi(g_CurrentJob.src, g_CurrentJob.dst) == 0) { char tempDst[MAX_PATH]; lstrcpy(tempDst, state->pathOrId); if (tempDst[0] != '\0' && tempDst[lstrlen(tempDst)-1] != '\\') lstrcat(tempDst, "\\"); lstrcat(tempDst, "Copy of "); lstrcat(tempDst, g_ClipName); lstrcpy(g_CurrentJob.dst, tempDst); } else if (g_ClipOp == 2 && lstrcmpi(g_CurrentJob.src, g_CurrentJob.dst) == 0) { g_ClipOp = 0; return; }
+                g_CurrentJob.isMove = (g_ClipOp == 2); g_CurrentJob.isDir = g_ClipIsDir; g_ReplaceMode = 0; if (g_ClipOp == 2) g_ClipOp = 0; CreateCenteredDialog(g_hInst, hwnd, "CopyProgressDlgClass", g_CurrentJob.isMove ? "Moving" : "Copying", 280, 140);
+            }
+        }
+        else if (id == 4014) {
+            if (g_ClipOp == 0) return; char newId[16]; IniShortcut FAR* sh = (IniShortcut FAR*)malloc(sizeof(IniShortcut));
+            if (sh) { memset(sh, 0, sizeof(IniShortcut)); GetNewIniId(newId); lstrcpy(sh->id, newId); sprintf(sh->name, "Shortcut to %s", g_ClipName); lstrcpy(sh->parentId, state->pathOrId); sh->isFolder = FALSE; if (g_ClipIsVirtual) { int i; for(i=0; i<g_IniShortcutCount; i++) if (lstrcmp(g_IniShortcuts[i]->id, g_ClipId) == 0) { lstrcpy(sh->exe, g_IniShortcuts[i]->exe); lstrcpy(sh->params, g_IniShortcuts[i]->params); lstrcpy(sh->icon, g_IniShortcuts[i]->icon); sh->minimized = g_IniShortcuts[i]->minimized; break; } } else lstrcpy(sh->exe, g_ClipPath); if (!NameExists(state->pathOrId, sh->name, TRUE)) SaveIniEntry(sh); LoadIniShortcuts(); if(hTree) RebuildTree(hTree, state); RebuildList(hwnd, state); free(sh); }
+        }
+        else if (id == 4015) { SendMessage(hList, LB_SETSEL, TRUE, -1); }
+        else if (id == 4016) { int i, count = SendMessage(hList, LB_GETCOUNT, 0, 0); for (i=0; i<count; i++) { BOOL sel = SendMessage(hList, LB_GETSEL, i, 0); SendMessage(hList, LB_SETSEL, !sel, i); } }
+    }
+}
+
+LRESULT CALLBACK DesktopProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    WindowState FAR* state = (WindowState FAR*)GetWindowLong(hwnd, 0);
+    switch (msg) {
+        case WM_CREATE: {
+            state = (WindowState FAR*)malloc(sizeof(WindowState));
+            lstrcpy(state->pathOrId, "0"); state->isVirtual = TRUE; SetWindowLong(hwnd, 0, (LONG)state); LoadConfig(); state->viewMode = 0; ChangeViewMode(hwnd, 0, state); return 0;
+        }
+        case WM_CTLCOLOR: {
+            if (HIWORD(lp) == CTLCOLOR_LISTBOX) {
+                SetBkMode((HDC)wp, TRANSPARENT);
+                return (LRESULT)g_hbrDesktop;
+            }
+            break;
+        }
+        case WM_WINDOWPOSCHANGING: { if (!g_bIsWindowed) { WINDOWPOS FAR* pos = (WINDOWPOS FAR*)lp; pos->hwndInsertAfter = HWND_BOTTOM; } break; }
+        case WM_MEASUREITEM: { LPMEASUREITEMSTRUCT lpmis = (LPMEASUREITEMSTRUCT)lp; if (lpmis->CtlID == ID_LIST) { if (state && state->viewMode == 0) lpmis->itemHeight = CELL_H; else if (state && state->viewMode == 1) lpmis->itemHeight = 20; else lpmis->itemHeight = 18; return TRUE; } break; }
+        case WM_DRAWITEM: { HandleDrawItem(hwnd, wp, lp); return TRUE; }
+        case WM_DELETEITEM: { 
+            LPDELETEITEMSTRUCT lpdis = (LPDELETEITEMSTRUCT)lp; 
+            if (lpdis->itemData && lpdis->itemData != (DWORD)LB_ERR) { 
+                if (lpdis->CtlID == ID_TREE) { 
+                    free((void FAR*)lpdis->itemData); 
+                } else if (lpdis->CtlID == ID_LIST) { 
+                    int FAR* pType = (int FAR*)lpdis->itemData; 
+                    if (*pType == 1) {
+                        free((void FAR*)lpdis->itemData);
+                    } else if (*pType == 2) { 
+                        RowItemData FAR* row = (RowItemData FAR*)lpdis->itemData; 
+                        int i; for (i = 0; i < row->count; i++) free(row->items[i]);
+                        free(row); 
+                    } 
+                } 
+            } 
+            return TRUE; 
+        }
+        case WM_COMMAND: { int id = wp; if (id >= 4001 && id <= 4050 && state) HandleListCommand(hwnd, wp, lp, state); return 0; }
+        case WM_SIZE: { HWND hList = GetDlgItem(hwnd, ID_LIST); if (hList) MoveWindow(hList, 0, 0, LOWORD(lp), HIWORD(lp), TRUE); return 0; }
+        case WM_DESTROY: { 
+            if (state) { free(state); SetWindowLong(hwnd, 0, 0); } 
+            char cls[64]; GetClassName(hwnd, cls, 64); 
+            if (lstrcmpi(cls, "Win95DesktopClass") == 0) PostQuitMessage(0); 
+            return 0; 
+        }
     } return DefWindowProc(hwnd, msg, wp, lp);
 }
 
 LRESULT CALLBACK FolderWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    WindowState FAR* state = (WindowState FAR*)GetWindowLong(hwnd, 0);
     switch(msg) {
         case WM_CREATE: {
-            CREATESTRUCT* cs = (CREATESTRUCT*)lp; char* targetPath = (char*)cs->lpCreateParams; HWND hTree, hToolbar; HMENU hMenu, hFile, hEdit, hView, hTools, hHelp; LoadConfig();
-            if (targetPath && targetPath[0] != '\0') { lstrcpy(g_CurrentPathOrId, targetPath); g_CurrentIsVirtual = FALSE; ExpandAllParentsFS(targetPath); ToggleExpand(targetPath); } 
-            else { lstrcpy(g_CurrentPathOrId, "0"); g_CurrentIsVirtual = TRUE; ToggleExpand("0"); }
+            CREATESTRUCT* cs = (CREATESTRUCT*)lp; char* targetPath = (char*)cs->lpCreateParams; HWND hTree, hToolbar; HMENU hMenu, hFile, hEdit, hView, hTools, hHelp; 
+            state = (WindowState FAR*)malloc(sizeof(WindowState)); SetWindowLong(hwnd, 0, (LONG)state); LoadConfig();
+            
+            BOOL isVirt = TRUE;
+            if (targetPath && (strchr(targetPath, '\\') || (lstrlen(targetPath)>1 && targetPath[1] == ':'))) isVirt = FALSE;
+            
+            if (targetPath && targetPath[0] != '\0') { lstrcpy(state->pathOrId, targetPath); state->isVirtual = isVirt; if(!isVirt) ExpandAllParentsFS(targetPath); ToggleExpand(targetPath); } else { lstrcpy(state->pathOrId, "0"); state->isVirtual = TRUE; ToggleExpand("0"); }
+            state->viewMode = g_GlobalViewMode;
 
             hMenu = CreateMenu(); hFile = CreatePopupMenu(); AppendMenu(hFile, MF_STRING, 4001, "&New\t"); AppendMenu(hFile, MF_SEPARATOR, 0, NULL); AppendMenu(hFile, MF_STRING, 4002, "Create &Shortcut"); AppendMenu(hFile, MF_STRING, 4003, "&Delete\tDel"); AppendMenu(hFile, MF_STRING, 4004, "Re&name\tF2"); AppendMenu(hFile, MF_STRING, 4005, "P&roperties"); AppendMenu(hFile, MF_SEPARATOR, 0, NULL); AppendMenu(hFile, MF_STRING, 4006, "&Close"); AppendMenu(hMenu, MF_POPUP, (UINT)hFile, "&File");
-            hEdit = CreatePopupMenu(); 
-            AppendMenu(hEdit, MF_STRING, 4011, "Cu&t\tCtrl+X"); AppendMenu(hEdit, MF_STRING, 4012, "&Copy\tCtrl+C"); AppendMenu(hEdit, MF_STRING, 4013, "&Paste\tCtrl+V"); AppendMenu(hEdit, MF_STRING, 4014, "Paste &Shortcut"); AppendMenu(hEdit, MF_SEPARATOR, 0, NULL); AppendMenu(hEdit, MF_STRING, 4015, "Select &All\tCtrl+A"); AppendMenu(hEdit, MF_STRING, 4016, "&Invert Selection"); AppendMenu(hMenu, MF_POPUP, (UINT)hEdit, "&Edit");
-            hView = CreatePopupMenu(); AppendMenu(hView, MF_STRING | (g_bShowToolbar ? MF_CHECKED : 0), 4020, "&Toolbar"); AppendMenu(hView, MF_STRING | (g_bShowStatusBar ? MF_CHECKED : 0), 4021, "&Status Bar"); AppendMenu(hView, MF_SEPARATOR, 0, NULL); AppendMenu(hView, MF_STRING | (g_ViewMode == 0 ? MF_CHECKED : 0), 4022, "Lar&ge Icons"); AppendMenu(hView, MF_STRING | (g_ViewMode == 1 ? MF_CHECKED : 0), 4023, "S&mall Icons"); AppendMenu(hView, MF_STRING | (g_ViewMode == 2 ? MF_CHECKED : 0), 4024, "&List"); AppendMenu(hView, MF_STRING | (g_ViewMode == 3 ? MF_CHECKED : 0), 4025, "&Details"); AppendMenu(hView, MF_SEPARATOR, 0, NULL); 
-            AppendMenu(hView, MF_STRING, 4028, "&Refresh\tF5"); AppendMenu(hView, MF_STRING, 4029, "&Options..."); AppendMenu(hMenu, MF_POPUP, (UINT)hView, "&View");
-            hTools = CreatePopupMenu(); AppendMenu(hTools, MF_STRING, 4030, "&Find"); AppendMenu(hTools, MF_SEPARATOR, 0, NULL); 
-            AppendMenu(hTools, MF_STRING, 4033, "&Go to..."); AppendMenu(hMenu, MF_POPUP, (UINT)hTools, "&Tools");
-            hHelp = CreatePopupMenu(); AppendMenu(hHelp, MF_STRING, 4040, "&Help Topics"); AppendMenu(hHelp, MF_SEPARATOR, 0, NULL); AppendMenu(hHelp, MF_STRING, 4041, "&About Calmira"); AppendMenu(hMenu, MF_POPUP, (UINT)hHelp, "&Help"); 
-            SetMenu(hwnd, hMenu); DrawMenuBar(hwnd);
-
-hToolbar = CreateWindowEx(0, "STATIC", "", WS_CHILD | (g_bShowToolbar ? WS_VISIBLE : 0) | SS_NOTIFY, 0, 0, 0, 0, hwnd, (HMENU)ID_TOOLBAR, g_hInst, NULL); g_lpfnOldToolbarProc = (FARPROC)SetWindowLong(hToolbar, GWL_WNDPROC, (LONG)g_lpfnToolbarProcInst);
-
+            hEdit = CreatePopupMenu(); AppendMenu(hEdit, MF_STRING, 4011, "Cu&t\tCtrl+X"); AppendMenu(hEdit, MF_STRING, 4012, "&Copy\tCtrl+C"); AppendMenu(hEdit, MF_STRING, 4013, "&Paste\tCtrl+V"); AppendMenu(hEdit, MF_STRING, 4014, "Paste &Shortcut"); AppendMenu(hEdit, MF_SEPARATOR, 0, NULL); AppendMenu(hEdit, MF_STRING, 4015, "Select &All\tCtrl+A"); AppendMenu(hEdit, MF_STRING, 4016, "&Invert Selection"); AppendMenu(hMenu, MF_POPUP, (UINT)hEdit, "&Edit");
+            hView = CreatePopupMenu(); AppendMenu(hView, MF_STRING | (g_bShowToolbar ? MF_CHECKED : 0), 4020, "&Toolbar"); AppendMenu(hView, MF_STRING | (g_bShowStatusBar ? MF_CHECKED : 0), 4021, "&Status Bar"); AppendMenu(hView, MF_SEPARATOR, 0, NULL); AppendMenu(hView, MF_STRING | (state->viewMode == 0 ? MF_CHECKED : 0), 4022, "Lar&ge Icons"); AppendMenu(hView, MF_STRING | (state->viewMode == 1 ? MF_CHECKED : 0), 4023, "S&mall Icons"); AppendMenu(hView, MF_STRING | (state->viewMode == 2 ? MF_CHECKED : 0), 4024, "&List"); AppendMenu(hView, MF_STRING | (state->viewMode == 3 ? MF_CHECKED : 0), 4025, "&Details"); AppendMenu(hView, MF_SEPARATOR, 0, NULL); AppendMenu(hView, MF_STRING, 4028, "&Refresh\tF5"); AppendMenu(hView, MF_STRING, 4029, "&Options..."); AppendMenu(hMenu, MF_POPUP, (UINT)hView, "&View");
+            hTools = CreatePopupMenu(); AppendMenu(hTools, MF_STRING, 4030, "&Find..."); AppendMenu(hTools, MF_SEPARATOR, 0, NULL); AppendMenu(hTools, MF_STRING, 4033, "&Go to..."); AppendMenu(hMenu, MF_POPUP, (UINT)hTools, "&Tools");
+            hHelp = CreatePopupMenu(); AppendMenu(hHelp, MF_STRING, 4040, "&Help Topics"); AppendMenu(hHelp, MF_SEPARATOR, 0, NULL); AppendMenu(hHelp, MF_STRING, 4041, "&About Calmira"); AppendMenu(hMenu, MF_POPUP, (UINT)hHelp, "&Help"); SetMenu(hwnd, hMenu); DrawMenuBar(hwnd);
+            
+            hToolbar = CreateWindowEx(0, "STATIC", "", WS_CHILD | (g_bShowToolbar ? WS_VISIBLE : 0) | SS_NOTIFY, 0, 0, 0, 0, hwnd, (HMENU)ID_TOOLBAR, g_hInst, NULL); g_lpfnOldToolbarProc = (FARPROC)SetWindowLong(hToolbar, GWL_WNDPROC, (LONG)g_lpfnToolbarProcInst);
             CreateWindow("BUTTON", "Name", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)ID_HDR_NAME, g_hInst, NULL); CreateWindow("BUTTON", "Size", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)ID_HDR_SIZE, g_hInst, NULL); CreateWindow("BUTTON", "Type", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)ID_HDR_TYPE, g_hInst, NULL); CreateWindow("BUTTON", "Modified", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)ID_HDR_DATE, g_hInst, NULL);
             hTree = CreateWindowEx(0, "LISTBOX", "", WS_CHILD | WS_VISIBLE | LBS_OWNERDRAWFIXED | LBS_NOTIFY | WS_VSCROLL | WS_HSCROLL | WS_BORDER, 0, 0, 0, 0, hwnd, (HMENU)ID_TREE, g_hInst, NULL); SendMessage(hTree, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), FALSE); g_lpfnOldTreeProc = (FARPROC)SetWindowLong(hTree, GWL_WNDPROC, (LONG)g_lpfnTreeProcInst);
-            ChangeViewMode(hwnd, g_ViewMode);
-            CreateWindowEx(0, "STATIC", " Ready", WS_CHILD | (g_bShowStatusBar ? WS_VISIBLE : 0) | WS_BORDER | SS_LEFT, 0, 0, 0, 0, hwnd, (HMENU)300, g_hInst, NULL); SendMessage(GetDlgItem(hwnd, 300), WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), FALSE); RebuildTree(hTree); return 0;
+            
+            CreateWindowEx(0, "STATIC", " Ready", WS_CHILD | (g_bShowStatusBar ? WS_VISIBLE : 0) | WS_BORDER | SS_LEFT, 0, 0, 0, 0, hwnd, (HMENU)300, g_hInst, NULL); 
+            SendMessage(GetDlgItem(hwnd, 300), WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), FALSE); 
+            
+            ChangeViewMode(hwnd, state->viewMode, state);
+            RebuildTree(hTree, state); return 0;
         }
-        case WM_INITMENUPOPUP: {
-            if (LOWORD(lp) == 1) { 
-                EnableMenuItem((HMENU)wp, 4013, MF_BYCOMMAND | (g_ClipOp == 0 ? MF_GRAYED : MF_ENABLED));
-                EnableMenuItem((HMENU)wp, 4014, MF_BYCOMMAND | (g_ClipOp == 0 ? MF_GRAYED : MF_ENABLED));
-            } return 0;
-        }
+        case WM_INITMENUPOPUP: { if (LOWORD(lp) == 1) { EnableMenuItem((HMENU)wp, 4013, MF_BYCOMMAND | (g_ClipOp == 0 ? MF_GRAYED : MF_ENABLED)); EnableMenuItem((HMENU)wp, 4014, MF_BYCOMMAND | (g_ClipOp == 0 ? MF_GRAYED : MF_ENABLED)); } return 0; }
         case WM_SIZE: {
-            int cx = LOWORD(lp); int cy = HIWORD(lp); int tbH = g_bShowToolbar ? 28 : 0; int statH = g_bShowStatusBar ? 22 : 0; int listX = g_SplitX + 4; int listW = cx - listX; int hdrH = (g_ViewMode == 3) ? 22 : 0;
+            if (!state) return DefWindowProc(hwnd, msg, wp, lp);
+            int cx = LOWORD(lp); int cy = HIWORD(lp); int tbH = g_bShowToolbar ? 28 : 0; int statH = g_bShowStatusBar ? 22 : 0; int listX = g_SplitX + 4; int listW = cx - listX; int hdrH = (state->viewMode == 3) ? 22 : 0;
             if (g_bShowToolbar) MoveWindow(GetDlgItem(hwnd, ID_TOOLBAR), 0, 0, cx, tbH, TRUE); MoveWindow(GetDlgItem(hwnd, ID_TREE), 0, tbH, g_SplitX, cy - statH - tbH, TRUE);
-            if (g_ViewMode == 3) { MoveWindow(GetDlgItem(hwnd, ID_HDR_NAME), listX, tbH, 150, hdrH, TRUE); MoveWindow(GetDlgItem(hwnd, ID_HDR_SIZE), listX + 150, tbH, 70, hdrH, TRUE); MoveWindow(GetDlgItem(hwnd, ID_HDR_TYPE), listX + 220, tbH, 60, hdrH, TRUE); MoveWindow(GetDlgItem(hwnd, ID_HDR_DATE), listX + 280, tbH, listW - 280 > 0 ? listW - 280 : 80, hdrH, TRUE); ShowWindow(GetDlgItem(hwnd, ID_HDR_NAME), SW_SHOW); ShowWindow(GetDlgItem(hwnd, ID_HDR_SIZE), SW_SHOW); ShowWindow(GetDlgItem(hwnd, ID_HDR_TYPE), SW_SHOW); ShowWindow(GetDlgItem(hwnd, ID_HDR_DATE), SW_SHOW); } else { ShowWindow(GetDlgItem(hwnd, ID_HDR_NAME), SW_HIDE); ShowWindow(GetDlgItem(hwnd, ID_HDR_SIZE), SW_HIDE); ShowWindow(GetDlgItem(hwnd, ID_HDR_TYPE), SW_HIDE); ShowWindow(GetDlgItem(hwnd, ID_HDR_DATE), SW_HIDE); }
+            if (state->viewMode == 3) { MoveWindow(GetDlgItem(hwnd, ID_HDR_NAME), listX, tbH, 150, hdrH, TRUE); MoveWindow(GetDlgItem(hwnd, ID_HDR_SIZE), listX + 150, tbH, 70, hdrH, TRUE); MoveWindow(GetDlgItem(hwnd, ID_HDR_TYPE), listX + 220, tbH, 60, hdrH, TRUE); MoveWindow(GetDlgItem(hwnd, ID_HDR_DATE), listX + 280, tbH, listW - 280 > 0 ? listW - 280 : 80, hdrH, TRUE); ShowWindow(GetDlgItem(hwnd, ID_HDR_NAME), SW_SHOW); ShowWindow(GetDlgItem(hwnd, ID_HDR_SIZE), SW_SHOW); ShowWindow(GetDlgItem(hwnd, ID_HDR_TYPE), SW_SHOW); ShowWindow(GetDlgItem(hwnd, ID_HDR_DATE), SW_SHOW); } else { ShowWindow(GetDlgItem(hwnd, ID_HDR_NAME), SW_HIDE); ShowWindow(GetDlgItem(hwnd, ID_HDR_SIZE), SW_HIDE); ShowWindow(GetDlgItem(hwnd, ID_HDR_TYPE), SW_HIDE); ShowWindow(GetDlgItem(hwnd, ID_HDR_DATE), SW_HIDE); }
             MoveWindow(GetDlgItem(hwnd, ID_LIST), listX, tbH + hdrH, listW, cy - hdrH - statH - tbH, TRUE); if (g_bShowStatusBar) MoveWindow(GetDlgItem(hwnd, 300), 0, cy - statH, cx, statH, TRUE);
-            if (g_ViewMode == 0 || g_ViewMode == 1) RebuildList(hwnd); return 0;
+            if (state->viewMode == 0 || state->viewMode == 1) RebuildList(hwnd, state); return 0;
         }
         case WM_LBUTTONDOWN: { int x = LOWORD(lp); int y = HIWORD(lp); int tbH = g_bShowToolbar ? 28 : 0; if (y > tbH && x >= g_SplitX - 4 && x <= g_SplitX + 4) { SetCapture(hwnd); g_bDraggingSplitter = TRUE; } return 0; }
         case WM_MOUSEMOVE: { int x = LOWORD(lp); int y = HIWORD(lp); int tbH = g_bShowToolbar ? 28 : 0; if (y > tbH && x >= g_SplitX - 4 && x <= g_SplitX + 4) SetCursor(LoadCursor(NULL, IDC_SIZEWE)); if (g_bDraggingSplitter) { RECT rc; GetClientRect(hwnd, &rc); if (x > 50 && x < rc.right - 100) { g_SplitX = x; SendMessage(hwnd, WM_SIZE, 0, MAKELONG(rc.right, rc.bottom)); } } return 0; }
         case WM_LBUTTONUP: if (g_bDraggingSplitter) { ReleaseCapture(); g_bDraggingSplitter = FALSE; SaveConfig(); } return 0;
-        case WM_MEASUREITEM: { 
-            LPMEASUREITEMSTRUCT lpmis = (LPMEASUREITEMSTRUCT)lp; 
-            if (lpmis->CtlType == ODT_MENU) break;
-            if (lpmis->CtlID == ID_LIST) { 
-                if (g_ViewMode == 0) lpmis->itemHeight = CELL_H; 
-                else if (g_ViewMode == 1) lpmis->itemHeight = 20; 
-                else lpmis->itemHeight = 18; 
-                return TRUE;
-            } else if (lpmis->CtlID == ID_TREE) { 
-                lpmis->itemHeight = 18; 
-                return TRUE;
-            } 
-            break; 
-        }
-        case WM_DRAWITEM: {
-            LPDRAWITEMSTRUCT lpdis = (LPDRAWITEMSTRUCT)lp; HDC hdc = lpdis->hDC; RECT rc = lpdis->rcItem; BOOL bSel = (lpdis->itemState & ODS_SELECTED); HBRUSH hBgBr = CreateSolidBrush(GetSysColor(COLOR_HIGHLIGHT)); HBRUSH hWinBg = CreateSolidBrush(GetSysColor(COLOR_WINDOW));
-            if (lpdis->itemID == (UINT)-1) { DeleteObject(hBgBr); DeleteObject(hWinBg); return TRUE; }
-            if (lpdis->CtlID == ID_TREE) {
-                TreeItemData FAR* item = (TreeItemData FAR*)lpdis->itemData; int startX = item->level * 16 + 5; int lyHalf = rc.top + (rc.bottom - rc.top) / 2; int l; HPEN hDot = CreatePen(PS_DOT, 1, RGB(128, 128, 128)); HPEN hOldP = SelectObject(hdc, hDot); FillRect(hdc, &rc, hWinBg);
-                for (l = 1; l < item->level; l++) { if (!item->isLastChild[l]) { int lx = l * 16 - 3; MoveTo(hdc, lx, rc.top); LineTo(hdc, lx, rc.bottom); } }
-                if (item->level > 0) { int lx = item->level * 16 - 3; MoveTo(hdc, lx, rc.top); if (item->isLastChild[item->level]) LineTo(hdc, lx, lyHalf); else LineTo(hdc, lx, rc.bottom); MoveTo(hdc, lx, lyHalf); LineTo(hdc, lx + 8, lyHalf); }
-                SelectObject(hdc, hOldP); DeleteObject(hDot); if (item->hasChildren) DrawPlusMinus(hdc, startX - 12, rc.top + 4, item->expanded); DrawGDIFolder(hdc, startX, rc.top + 2, item->expanded, FALSE, FALSE); rc.left = startX + 20; 
-                SetBkMode(hdc, OPAQUE); SetBkColor(hdc, bSel ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_WINDOW)); SetTextColor(hdc, bSel ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_WINDOWTEXT));
-                ExtTextOut(hdc, rc.left + 2, rc.top + 2, ETO_CLIPPED | ETO_OPAQUE, &rc, item->displayName, lstrlen(item->displayName), NULL);
-            } else if (lpdis->CtlID == ID_LIST) {
-                int FAR* pType = (int FAR*)lpdis->itemData;
-                if (pType && *pType == 2) {
-                    RowItemData FAR* row = (RowItemData FAR*)lpdis->itemData; int c; FillRect(hdc, &rc, hWinBg); int colW = (g_ViewMode == 0) ? CELL_W : 150;
-                    for (c = 0; c < row->count; c++) {
-                        ListItemData FAR* item = row->items[c]; int itemX = rc.left + c * colW; 
-                        BOOL bItemSel = (lstrcmp(item->path, g_SelectedListItemPath) == 0 && lstrcmp(item->name, g_SelectedListItemName) == 0);
-                        if (g_ViewMode == 0) {
-                            int centerX = itemX + (CELL_W - 32) / 2; if (item->isDir) DrawGDIFolder(hdc, centerX, rc.top + 5, FALSE, bItemSel, TRUE); else DrawGDIFile(hdc, centerX, rc.top + 5, bItemSel, TRUE);
-                            RECT tRc; tRc.left = itemX + 2; tRc.right = itemX + CELL_W - 2; tRc.top = rc.top + 42; tRc.bottom = rc.bottom;
-                            SetBkMode(hdc, OPAQUE); SetBkColor(hdc, bItemSel ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_WINDOW)); SetTextColor(hdc, bItemSel ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_WINDOWTEXT));
-                            ExtTextOut(hdc, 0, 0, ETO_OPAQUE, &tRc, "", 0, NULL);
-                            DrawText(hdc, item->name, -1, &tRc, DT_CENTER | DT_WORDBREAK);
-                        } else {
-                            if (bItemSel) { RECT selRc; selRc.left = itemX; selRc.right = itemX + colW; selRc.top = rc.top; selRc.bottom = rc.bottom; FillRect(hdc, &selRc, hBgBr); }
-                            if (item->isDir) DrawGDIFolder(hdc, itemX + 2, rc.top + 2, FALSE, FALSE, FALSE); else DrawGDIFile(hdc, itemX + 2, rc.top + 2, FALSE, FALSE);
-                            RECT tRc; tRc.left = itemX + 22; tRc.right = itemX + colW - 4; tRc.top = rc.top + 2; tRc.bottom = rc.bottom; 
-                            SetBkMode(hdc, OPAQUE); SetBkColor(hdc, bItemSel ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_WINDOW)); SetTextColor(hdc, bItemSel ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_WINDOWTEXT)); 
-                            ExtTextOut(hdc, tRc.left, tRc.top, ETO_CLIPPED | ETO_OPAQUE, &tRc, item->name, lstrlen(item->name), NULL);
-                        }
-                    }
-                } else if (pType && *pType == 1) {
-                    ListItemData FAR* item = (ListItemData FAR*)lpdis->itemData; char buf[64]; FillRect(hdc, &rc, bSel ? hBgBr : hWinBg); 
-                    RECT rName = rc, rSize = rc, rType = rc, rDate = rc; rName.left += 22;
-                    if (g_ViewMode == 3) { rName.right = rc.left + 150 - 4; rSize.left = rc.left + 150 + 4; rSize.right = rc.left + 220 - 4; rType.left = rc.left + 220 + 4; rType.right = rc.left + 280 - 4; rDate.left = rc.left + 280 + 4; }
-                    if (item->isDir) DrawGDIFolder(hdc, rc.left + 2, rc.top + 2, FALSE, FALSE, FALSE); else DrawGDIFile(hdc, rc.left + 2, rc.top + 2, FALSE, FALSE);
-                    SetBkMode(hdc, OPAQUE); SetBkColor(hdc, bSel ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_WINDOW)); SetTextColor(hdc, bSel ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_WINDOWTEXT));
-                    if (g_ViewMode == 3) {
-                        ExtTextOut(hdc, rName.left, rc.top + 2, ETO_CLIPPED | ETO_OPAQUE, &rName, item->name, lstrlen(item->name), NULL);
-                        if (!item->isDir && !item->isVirtual) { FormatSizeStr(item->size, buf); ExtTextOut(hdc, rSize.left, rc.top + 2, ETO_CLIPPED | ETO_OPAQUE, &rSize, buf, lstrlen(buf), NULL); } else ExtTextOut(hdc, 0, 0, ETO_OPAQUE, &rSize, "", 0, NULL);
-                        if (item->isDir) lstrcpy(buf, "File Folder"); else if (item->ext[0]) sprintf(buf, "%s File", item->ext); else lstrcpy(buf, "File"); ExtTextOut(hdc, rType.left, rc.top + 2, ETO_CLIPPED | ETO_OPAQUE, &rType, buf, lstrlen(buf), NULL);
-                        if (!item->isVirtual && item->date > 0) { FormatDateStr(item->date, item->time, buf); ExtTextOut(hdc, rDate.left, rc.top + 2, ETO_CLIPPED | ETO_OPAQUE, &rDate, buf, lstrlen(buf), NULL); } else ExtTextOut(hdc, 0, 0, ETO_OPAQUE, &rDate, "", 0, NULL);
-                    } else { ExtTextOut(hdc, rName.left, rc.top + 2, ETO_OPAQUE, &rName, item->name, lstrlen(item->name), NULL); }
-                }
-            } DeleteObject(hBgBr); DeleteObject(hWinBg); return TRUE;
-        }
-        case WM_DELETEITEM: {
-            LPDELETEITEMSTRUCT lpdis = (LPDELETEITEMSTRUCT)lp;
+        case WM_MEASUREITEM: { LPMEASUREITEMSTRUCT lpmis = (LPMEASUREITEMSTRUCT)lp; if (lpmis->CtlType == ODT_MENU) break; if (lpmis->CtlID == ID_LIST) { if (state && state->viewMode == 0) lpmis->itemHeight = CELL_H; else if (state && state->viewMode == 1) lpmis->itemHeight = 20; else lpmis->itemHeight = 18; return TRUE; } else if (lpmis->CtlID == ID_TREE) { lpmis->itemHeight = 18; return TRUE; } break; }
+        case WM_DRAWITEM: { HandleDrawItem(hwnd, wp, lp); return TRUE; }
+        case WM_DELETEITEM: { 
+            LPDELETEITEMSTRUCT lpdis = (LPDELETEITEMSTRUCT)lp; 
             if (lpdis->itemData && lpdis->itemData != (DWORD)LB_ERR) { 
-                if (lpdis->CtlID == ID_TREE) {
-                    free((void FAR*)lpdis->itemData);
-                } else if (lpdis->CtlID == ID_LIST) {
+                if (lpdis->CtlID == ID_TREE) { 
+                    free((void FAR*)lpdis->itemData); 
+                } else if (lpdis->CtlID == ID_LIST) { 
                     int FAR* pType = (int FAR*)lpdis->itemData; 
-                    if (*pType == 1) free((void FAR*)lpdis->itemData); 
-                    else if (*pType == 2) { 
+                    if (*pType == 1) {
+                        free((void FAR*)lpdis->itemData);
+                    } else if (*pType == 2) { 
                         RowItemData FAR* row = (RowItemData FAR*)lpdis->itemData; 
-                        int i; for (i = 0; i < row->count; i++) free(row->items[i]); 
+                        int i; for (i = 0; i < row->count; i++) free(row->items[i]);
                         free(row); 
                     } 
+                } 
+            } 
+            return TRUE; 
+        }
+        case WM_COMMAND: { if (state) HandleListCommand(hwnd, wp, lp, state); return 0; }
+        case WM_DESTROY: { 
+            if (state) { free(state); SetWindowLong(hwnd, 0, 0); } 
+            char cls[64]; GetClassName(hwnd, cls, 64); 
+            if (lstrcmpi(cls, "Win95FolderClass") == 0 && !FindWindow("Win95DesktopClass", "Desktop")) PostQuitMessage(0); 
+            return 0; 
+        }
+    } return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+void DoRecursiveSearch(ListItemData FAR* FAR* arr, const char* searchDir, const char* pattern, int* count, int filterType, unsigned long filterBytes, const char* containing) {
+    struct find_t file; char searchPath[MAX_PATH + 16]; char FAR* FAR* subDirs; int dirCount = 0, i;
+    if (*count >= MAX_LIST_ITEMS || g_bStopSearch) return;
+    
+    lstrcpy(searchPath, searchDir); if (searchPath[0] && searchPath[lstrlen(searchPath)-1] != '\\') lstrcat(searchPath, "\\"); lstrcat(searchPath, pattern);
+    if (_dos_findfirst(searchPath, _A_NORMAL | _A_RDONLY | _A_ARCH | _A_HIDDEN | _A_SYSTEM, &file) == 0) {
+        do { 
+            ProcessMessages(); if (g_bStopSearch) return;
+            if (lstrcmp(file.name, ".") != 0 && lstrcmp(file.name, "..") != 0 && *count < MAX_LIST_ITEMS) { 
+                BOOL match = TRUE; 
+                if (filterBytes > 0) { if (filterType == 0 && file.size < filterBytes) match = FALSE; if (filterType == 1 && file.size > filterBytes) match = FALSE; } 
+                if (match && containing && containing[0] != '\0' && !(file.attrib & _A_SUBDIR)) {
+                    char fullPath[MAX_PATH + 16]; lstrcpy(fullPath, searchDir); if (fullPath[0] && fullPath[lstrlen(fullPath)-1] != '\\') lstrcat(fullPath, "\\"); lstrcat(fullPath, file.name);
+                    FILE* f = fopen(fullPath, "rb"); if (f) { match = FALSE; char* buf = (char*)malloc(1025); if (buf) { size_t bytes; while ((bytes = fread(buf, 1, 1024, f)) > 0) { buf[bytes] = '\0'; if (strstr(buf, containing) != NULL) { match = TRUE; break; } if (g_bStopSearch) break; ProcessMessages(); } free(buf); } fclose(f); } else match = FALSE;
                 }
+                if (match) { 
+                    ListItemData FAR* item = (ListItemData FAR*)malloc(sizeof(ListItemData)); 
+                    if (item) {
+                        lstrcpy(item->name, file.name); lstrcpy(item->path, searchDir); if (item->path[0] && item->path[lstrlen(item->path)-1] != '\\') lstrcat(item->path, "\\"); lstrcat(item->path, file.name); item->isDir = FALSE; item->isVirtual = FALSE; item->size = file.size; item->date = file.wr_date; item->time = file.wr_time; GetExtension(file.name, item->ext); item->type = 1; arr[*count] = item; (*count)++; 
+                    }
+                } 
+            } 
+        } while (_dos_findnext(&file) == 0 && *count < MAX_LIST_ITEMS); 
+    }
+    
+    subDirs = (char FAR* FAR*)malloc(256 * sizeof(char FAR*));
+    if (!subDirs) return;
+    
+    lstrcpy(searchPath, searchDir); if (searchPath[0] && searchPath[lstrlen(searchPath)-1] != '\\') lstrcat(searchPath, "\\"); lstrcat(searchPath, "*.*");
+    if (_dos_findfirst(searchPath, _A_SUBDIR | _A_HIDDEN | _A_SYSTEM, &file) == 0) { 
+        do { 
+            if ((file.attrib & _A_SUBDIR) && lstrcmp(file.name, ".") != 0 && lstrcmp(file.name, "..") != 0 && dirCount < 256) { 
+                subDirs[dirCount] = (char FAR*)malloc(16); 
+                if (subDirs[dirCount]) lstrcpy(subDirs[dirCount++], file.name); 
+            } 
+        } while (_dos_findnext(&file) == 0); 
+    }
+    
+    for (i = 0; i < dirCount; i++) {
+        if (!g_bStopSearch && *count < MAX_LIST_ITEMS) {
+            char nextDir[MAX_PATH + 16];
+            lstrcpy(nextDir, searchDir); if (nextDir[0] && nextDir[lstrlen(nextDir)-1] != '\\') lstrcat(nextDir, "\\"); lstrcat(nextDir, subDirs[i]);
+            DoRecursiveSearch(arr, nextDir, pattern, count, filterType, filterBytes, containing);
+        }
+        free(subDirs[i]);
+    }
+    free(subDirs);
+}
+
+LRESULT CALLBACK SearchWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    WindowState FAR* state = (WindowState FAR*)GetWindowLong(hwnd, 0);
+    switch(msg) {
+        case WM_CREATE: {
+            CREATESTRUCT* cs = (CREATESTRUCT*)lp; char* targetPath = (char*)cs->lpCreateParams; int tX = 15, tY = 55; HWND hc1, hc2, hList;
+            state = (WindowState FAR*)malloc(sizeof(WindowState)); SetWindowLong(hwnd, 0, (LONG)state);
+            lstrcpy(state->pathOrId, (targetPath && targetPath[0]) ? targetPath : "C:\\"); state->isVirtual = FALSE; state->activeTab = 0; state->viewMode = 3;
+            
+            HMENU hMenu = CreateMenu(); HMENU hFile = CreatePopupMenu(); AppendMenu(hFile, MF_STRING, 4006, "&Close"); AppendMenu(hMenu, MF_POPUP, (UINT)hFile, "&File");
+            HMENU hEdit = CreatePopupMenu(); AppendMenu(hEdit, MF_STRING, 4015, "Select &All\tCtrl+A"); AppendMenu(hEdit, MF_STRING, 4016, "&Invert Selection"); AppendMenu(hMenu, MF_POPUP, (UINT)hEdit, "&Edit");
+            HMENU hView = CreatePopupMenu(); AppendMenu(hView, MF_STRING, 4022, "Lar&ge Icons"); AppendMenu(hView, MF_STRING, 4023, "S&mall Icons"); AppendMenu(hView, MF_STRING, 4024, "&List"); AppendMenu(hView, MF_STRING|MF_CHECKED, 4025, "&Details"); AppendMenu(hMenu, MF_POPUP, (UINT)hView, "&View"); SetMenu(hwnd, hMenu); DrawMenuBar(hwnd);
+            
+            /* Tab 0 Controls (IDs 600+) */
+            CreateWindow("STATIC", "Named:", WS_CHILD|WS_VISIBLE, tX+5, tY, 60, 20, hwnd, (HMENU)600, g_hInst, NULL); 
+            CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "*.*", WS_CHILD|WS_VISIBLE|WS_BORDER|WS_TABSTOP, tX+65, tY-2, 190, 22, hwnd, (HMENU)601, g_hInst, NULL); 
+            CreateWindow("STATIC", "Look in:", WS_CHILD|WS_VISIBLE, tX+5, tY+30, 60, 20, hwnd, (HMENU)602, g_hInst, NULL); 
+            CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", state->pathOrId, WS_CHILD|WS_VISIBLE|WS_BORDER|WS_TABSTOP, tX+65, tY+28, 190, 22, hwnd, (HMENU)603, g_hInst, NULL); 
+            CreateWindow("BUTTON", "Browse...", WS_CHILD|WS_VISIBLE|WS_TABSTOP, tX+265, tY+28, 70, 24, hwnd, (HMENU)604, g_hInst, NULL); 
+            CreateWindow("BUTTON", "Include subfolders", WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP, tX+65, tY+60, 150, 20, hwnd, (HMENU)605, g_hInst, NULL); 
+            SendMessage(GetDlgItem(hwnd, 605), BM_SETCHECK, 1, 0);
+
+            /* Tab 1 Controls (IDs 700+) */
+            CreateWindow("BUTTON", "All files", WS_CHILD|BS_AUTORADIOBUTTON, tX+5, tY, 150, 20, hwnd, (HMENU)700, g_hInst, NULL); 
+            CreateWindow("BUTTON", "Find all files created or modified:", WS_CHILD|BS_AUTORADIOBUTTON, tX+5, tY+25, 250, 20, hwnd, (HMENU)701, g_hInst, NULL); 
+            CreateWindow("BUTTON", "between", WS_CHILD|BS_AUTORADIOBUTTON, tX+25, tY+50, 80, 20, hwnd, (HMENU)702, g_hInst, NULL); 
+            CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD|WS_BORDER|WS_TABSTOP, tX+105, tY+48, 70, 22, hwnd, (HMENU)703, g_hInst, NULL); 
+            CreateWindow("STATIC", "and", WS_CHILD, tX+185, tY+50, 30, 20, hwnd, (HMENU)704, g_hInst, NULL); 
+            CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD|WS_BORDER|WS_TABSTOP, tX+215, tY+48, 70, 22, hwnd, (HMENU)705, g_hInst, NULL); 
+            SendMessage(GetDlgItem(hwnd, 700), BM_SETCHECK, 1, 0);
+
+            /* Tab 2 Controls (IDs 800+) */
+            CreateWindow("STATIC", "Of type:", WS_CHILD, tX+5, tY, 100, 20, hwnd, (HMENU)800, g_hInst, NULL); 
+            hc1 = CreateWindow("COMBOBOX", "", WS_CHILD|CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP, tX+105, tY-2, 200, 100, hwnd, (HMENU)801, g_hInst, NULL); 
+            SendMessage(hc1, CB_ADDSTRING, 0, (LPARAM)"All Files and Folders"); SendMessage(hc1, CB_SETCURSEL, 0, 0); 
+            CreateWindow("STATIC", "Containing text:", WS_CHILD, tX+5, tY+30, 100, 20, hwnd, (HMENU)802, g_hInst, NULL); 
+            CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD|WS_BORDER|WS_TABSTOP, tX+105, tY+28, 200, 22, hwnd, (HMENU)803, g_hInst, NULL); 
+            CreateWindow("STATIC", "Size is:", WS_CHILD, tX+5, tY+60, 60, 20, hwnd, (HMENU)804, g_hInst, NULL); 
+            hc2 = CreateWindow("COMBOBOX", "", WS_CHILD|CBS_DROPDOWNLIST|WS_VSCROLL|WS_TABSTOP, tX+105, tY+58, 80, 100, hwnd, (HMENU)805, g_hInst, NULL); 
+            SendMessage(hc2, CB_ADDSTRING, 0, (LPARAM)"At least"); SendMessage(hc2, CB_ADDSTRING, 0, (LPARAM)"At most"); SendMessage(hc2, CB_SETCURSEL, 0, 0); 
+            CreateWindowEx(WS_EX_CLIENTEDGE, "EDIT", "", WS_CHILD|WS_BORDER|WS_TABSTOP, tX+195, tY+58, 60, 22, hwnd, (HMENU)806, g_hInst, NULL); 
+            CreateWindow("STATIC", "KB", WS_CHILD, tX+260, tY+60, 30, 20, hwnd, (HMENU)807, g_hInst, NULL);
+
+            /* Action Buttons */
+            CreateWindow("BUTTON", "Find Now", WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_DEFPUSHBUTTON, 370, 20, 80, 24, hwnd, (HMENU)103, g_hInst, NULL); 
+            CreateWindow("BUTTON", "Stop", WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_DISABLED, 370, 50, 80, 24, hwnd, (HMENU)105, g_hInst, NULL); 
+            CreateWindow("BUTTON", "New Search", WS_CHILD|WS_VISIBLE|WS_TABSTOP, 370, 80, 80, 24, hwnd, (HMENU)104, g_hInst, NULL);
+
+            /* List Headers */
+            CreateWindow("BUTTON", "Name", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)ID_HDR_NAME, g_hInst, NULL); 
+            CreateWindow("BUTTON", "In Folder", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)ID_HDR_SIZE, g_hInst, NULL); 
+            CreateWindow("BUTTON", "Size", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)ID_HDR_TYPE, g_hInst, NULL); 
+            CreateWindow("BUTTON", "Modified", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON, 0, 0, 0, 0, hwnd, (HMENU)ID_HDR_DATE, g_hInst, NULL);
+            
+            hList = CreateWindowEx(0, "LISTBOX", "", WS_CHILD|WS_VISIBLE|LBS_OWNERDRAWFIXED|LBS_NOTIFY|WS_VSCROLL|WS_HSCROLL|WS_BORDER|LBS_EXTENDEDSEL, 10, 150, 445, 200, hwnd, (HMENU)ID_LIST, g_hInst, NULL); 
+            g_lpfnOldListProc = (FARPROC)SetWindowLong(hList, GWL_WNDPROC, (LONG)g_lpfnListProcInst);
+            
+            ShowTabControls(hwnd, 0); ChangeViewMode(hwnd, state->viewMode, state); return 0;
+        }
+        case WM_LBUTTONDOWN: { int x = LOWORD(lp); int y = HIWORD(lp); int currX = 10; int tabW[] = {120, 100, 80}; int i; for (i=0; i<3; i++) { if (x >= currX && x <= currX + tabW[i] && y >= 15 && y <= 35) { if (state->activeTab != i) { state->activeTab = i; ShowTabControls(hwnd, i); InvalidateRect(hwnd, NULL, TRUE); } break; } currX += tabW[i] + 2; } return 0; }
+        case WM_PAINT: {
+            PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps); HFONT hOldFont = SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT)); int i; char* tabs[] = {"Name && Location", "Date Modified", "Advanced"}; int tabW[] = {120, 100, 80}; int currX = 10; SetBkMode(hdc, TRANSPARENT); HPEN hHi = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_BTNHIGHLIGHT)); HPEN hSh = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_BTNSHADOW)); HPEN hOldP = SelectObject(hdc, hHi);
+            MoveTo(hdc, 10, 140); LineTo(hdc, 10, 35); LineTo(hdc, currX, 35); SelectObject(hdc, hSh); LineTo(hdc, 355, 35); LineTo(hdc, 355, 140); LineTo(hdc, 10, 140); MoveTo(hdc, 355, 35);
+            for (i=0; i<3; i++) {
+                int startX = currX; int endX = startX + tabW[i]; int topY = (state->activeTab == i) ? 15 : 18; RECT tRect; tRect.left = startX; tRect.right = endX; tRect.top = topY + 3; tRect.bottom = 35; DrawText(hdc, tabs[i], -1, &tRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE); SelectObject(hdc, hHi); MoveTo(hdc, startX, 35); LineTo(hdc, startX, topY+2); LineTo(hdc, startX+2, topY); LineTo(hdc, endX-2, topY); SelectObject(hdc, hSh); LineTo(hdc, endX, topY+2); LineTo(hdc, endX, 35);
+                if (state->activeTab != i) { SelectObject(hdc, hHi); MoveTo(hdc, startX, 35); LineTo(hdc, endX, 35); } else { SelectObject(hdc, GetStockObject(WHITE_PEN)); MoveTo(hdc, startX+1, 35); LineTo(hdc, endX, 35); } currX += tabW[i] + 2;
             }
-            return TRUE;
+            SelectObject(hdc, hHi); MoveTo(hdc, currX, 35); LineTo(hdc, 355, 35); SelectObject(hdc, hOldP); SelectObject(hdc, hOldFont); DeleteObject(hHi); DeleteObject(hSh); EndPaint(hwnd, &ps); return 0;
+        }
+        case WM_SIZE: {
+            if (!state) return DefWindowProc(hwnd, msg, wp, lp);
+            int listW = LOWORD(lp) - 20; int hdrH = (state->viewMode == 3) ? 22 : 0;
+            if (state->viewMode == 3) { MoveWindow(GetDlgItem(hwnd, ID_HDR_NAME), 10, 150, 150, hdrH, TRUE); MoveWindow(GetDlgItem(hwnd, ID_HDR_SIZE), 10 + 150, 150, 70, hdrH, TRUE); MoveWindow(GetDlgItem(hwnd, ID_HDR_TYPE), 10 + 220, 150, 60, hdrH, TRUE); MoveWindow(GetDlgItem(hwnd, ID_HDR_DATE), 10 + 280, 150, listW - 280 > 0 ? listW - 280 : 80, hdrH, TRUE); ShowWindow(GetDlgItem(hwnd, ID_HDR_NAME), SW_SHOW); ShowWindow(GetDlgItem(hwnd, ID_HDR_SIZE), SW_SHOW); ShowWindow(GetDlgItem(hwnd, ID_HDR_TYPE), SW_SHOW); ShowWindow(GetDlgItem(hwnd, ID_HDR_DATE), SW_SHOW); } else { ShowWindow(GetDlgItem(hwnd, ID_HDR_NAME), SW_HIDE); ShowWindow(GetDlgItem(hwnd, ID_HDR_SIZE), SW_HIDE); ShowWindow(GetDlgItem(hwnd, ID_HDR_TYPE), SW_HIDE); ShowWindow(GetDlgItem(hwnd, ID_HDR_DATE), SW_HIDE); }
+            MoveWindow(GetDlgItem(hwnd, ID_LIST), 10, 150 + hdrH, listW, HIWORD(lp) - 160 - hdrH, TRUE); return 0;
+        }
+        case WM_MEASUREITEM: { LPMEASUREITEMSTRUCT lpmis = (LPMEASUREITEMSTRUCT)lp; if (lpmis->CtlID == ID_LIST) { if (state && state->viewMode == 0) lpmis->itemHeight = CELL_H; else if (state && state->viewMode == 1) lpmis->itemHeight = 20; else lpmis->itemHeight = 18; return TRUE; } break; }
+        case WM_DRAWITEM: { HandleDrawItem(hwnd, wp, lp); return TRUE; }
+        case WM_DELETEITEM: { 
+            LPDELETEITEMSTRUCT lpdis = (LPDELETEITEMSTRUCT)lp; 
+            if (lpdis->itemData && lpdis->itemData != (DWORD)LB_ERR && lpdis->CtlID == ID_LIST) { 
+                int FAR* pType = (int FAR*)lpdis->itemData; 
+                if (*pType == 1) {
+                    free((void FAR*)lpdis->itemData);
+                } else if (*pType == 2) { 
+                    RowItemData FAR* row = (RowItemData FAR*)lpdis->itemData; 
+                    int i; for (i = 0; i < row->count; i++) free(row->items[i]);
+                    free(row); 
+                } 
+            } 
+            return TRUE; 
         }
         case WM_COMMAND: {
-            int id = wp; HWND hList = GetDlgItem(hwnd, ID_LIST); HWND hTree = GetDlgItem(hwnd, ID_TREE); HWND hFocus = GetFocus();
-            if (id == 4041) MessageBox(hwnd, "Explorer for Win16\nWindows 95 Shell Clone", "About Calmira", MB_OK | MB_ICONINFORMATION);
-            else if (id == 4006) DestroyWindow(hwnd);
-            else if (id == 4022) ChangeViewMode(hwnd, 0); else if (id == 4023) ChangeViewMode(hwnd, 1); else if (id == 4024) ChangeViewMode(hwnd, 2); else if (id == 4025) ChangeViewMode(hwnd, 3);
-            else if (id == 4020) { g_bShowToolbar = !g_bShowToolbar; ShowWindow(GetDlgItem(hwnd, ID_TOOLBAR), g_bShowToolbar ? SW_SHOW : SW_HIDE); CheckMenuItem(GetMenu(hwnd), 4020, MF_BYCOMMAND | (g_bShowToolbar ? MF_CHECKED : MF_UNCHECKED)); SendMessage(hwnd, WM_SIZE, 0, MAKELONG(GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))); }
-            else if (id == 4021) { g_bShowStatusBar = !g_bShowStatusBar; ShowWindow(GetDlgItem(hwnd, 300), g_bShowStatusBar ? SW_SHOW : SW_HIDE); CheckMenuItem(GetMenu(hwnd), 4021, MF_BYCOMMAND | (g_bShowStatusBar ? MF_CHECKED : MF_UNCHECKED)); SendMessage(hwnd, WM_SIZE, 0, MAKELONG(GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))); }
-            else if (id == 4028) { LoadIniShortcuts(); RebuildTree(hTree); RebuildList(hwnd); }
-            else if (id == 4050) { 
-                if (g_CurrentIsVirtual) { if (lstrcmp(g_CurrentPathOrId, "0") != 0) { int i; for(i=0; i<g_IniShortcutCount; i++) { if(lstrcmp(g_IniShortcuts[i]->id, g_CurrentPathOrId)==0) { lstrcpy(g_CurrentPathOrId, g_IniShortcuts[i]->parentId); break; } } } } else { char temp[MAX_PATH]; lstrcpy(temp, g_CurrentPathOrId); char* p = strrchr(temp, '\\'); if (p) { if (p == temp || *(p-1) == ':') *(p+1) = '\0'; else *p = '\0'; lstrcpy(g_CurrentPathOrId, temp); } else { lstrcpy(g_CurrentPathOrId, "0"); g_CurrentIsVirtual = TRUE; } }
-                if (g_CurrentIsVirtual) ExpandAllParentsVirtual(g_CurrentPathOrId); else ExpandAllParentsFS(g_CurrentPathOrId); if (!IsExpanded(g_CurrentPathOrId)) ToggleExpand(g_CurrentPathOrId); RebuildTree(hTree); RebuildList(hwnd);
-            }
-            else if (id == 9999) { 
-                 HWND hDesktop = FindWindow("Win95DesktopClass", "Desktop");
-                 if (hDesktop) {
-                     char clipP[MAX_PATH], clipN[64]; BOOL isV = FALSE, isD = FALSE;
-                     if (g_ViewMode == 0 || g_ViewMode == 1) {
-                         lstrcpy(clipP, g_SelectedListItemPath); lstrcpy(clipN, g_SelectedListItemName);
-                         isV = g_SelectedListItemIsVirtual; isD = g_SelectedListItemIsDir;
-                     } else {
-                         int sel = SendMessage(hList, LB_GETCARETINDEX, 0, 0);
-                         if (sel != LB_ERR && SendMessage(hList, LB_GETSEL, sel, 0) > 0) {
-                             int FAR* pType = (int FAR*)SendMessage(hList, LB_GETITEMDATA, sel, 0);
-                             if (pType && *pType == 1) {
-                                 ListItemData FAR* item = (ListItemData FAR*)pType;
-                                 lstrcpy(clipP, item->path); lstrcpy(clipN, item->name);
-                                 isV = item->isVirtual; isD = item->isDir;
-                             }
-                         }
-                     }
-                     if (clipN[0] != '\0') {
-                         char newId[16]; GetNewIniId(newId); IniShortcut FAR* sh = (IniShortcut FAR*)malloc(sizeof(IniShortcut)); 
-                         if (sh) {
-                             memset(sh, 0, sizeof(IniShortcut)); lstrcpy(sh->id, newId); lstrcpy(sh->parentId, "0");
-                             sprintf(sh->name, "Shortcut to %s", clipN); sh->isFolder = isD;
-                             if (isV) {
-                                 int i; for (i = 0; i < g_IniShortcutCount; i++) {
-                                     if (lstrcmp(g_IniShortcuts[i]->id, clipP) == 0) { lstrcpy(sh->exe, g_IniShortcuts[i]->exe); break; }
-                                 }
-                             } else { lstrcpy(sh->exe, clipP); }
-                             
-                             if (NameExists("0", sh->name, TRUE)) {
-                                char temp[MAX_PATH];
-                                sprintf(temp, "Copy of %s", sh->name);
-                                lstrcpy(sh->name, temp);
-                             }
-                             
-                             if (!NameExists("0", sh->name, TRUE)) { SaveIniEntry(sh); LoadIniShortcuts(); InvalidateRect(hDesktop, NULL, TRUE); }
-                             free(sh);
-                         }
-                     }
-                 }
-            }
-            else if (id == ID_TREE && (HIWORD(lp) == LBN_SELCHANGE || HIWORD(lp) == LBN_DBLCLK)) {
-                int sel = SendMessage(hTree, LB_GETCURSEL, 0, 0); if (sel != LB_ERR) { TreeItemData FAR* item = (TreeItemData FAR*)SendMessage(hTree, LB_GETITEMDATA, sel, 0); if (item) { lstrcpy(g_CurrentPathOrId, item->pathOrId); g_CurrentIsVirtual = item->isVirtual; SetWindowText(hwnd, item->displayName); RebuildList(hwnd); } }
-            }
-            else if (id >= 4001 && id <= 4016) {
-                if (id == 4001 || id == 4002) { lstrcpy(g_ContextId, g_CurrentPathOrId); g_ContextIsVirtual = g_CurrentIsVirtual; } 
-                else if (id <= 4005 || id == 4011 || id == 4012) {
-                    if (hFocus == hTree) { lstrcpy(g_ContextId, g_CurrentPathOrId); g_ContextIsVirtual = g_CurrentIsVirtual; g_ContextIsFolder = TRUE; }
-                    else {
-                        if (g_ViewMode == 0 || g_ViewMode == 1) { 
-                            if (g_SelectedListItemPath[0] != '\0') { lstrcpy(g_ContextId, g_SelectedListItemPath); g_ContextIsVirtual = g_SelectedListItemIsVirtual; g_ContextIsFolder = g_SelectedListItemIsDir; } 
-                            else { SetWindowText(GetDlgItem(hwnd, 300), " Please select an item first."); return 0; } 
-                        } 
-                        else { 
-                            int sel = SendMessage(hList, LB_GETCARETINDEX, 0, 0); 
-                            if (sel != LB_ERR && SendMessage(hList, LB_GETSEL, sel, 0) > 0) { 
-                                int FAR* pType = (int FAR*)SendMessage(hList, LB_GETITEMDATA, sel, 0); 
-                                if (pType && *pType == 1) { 
-                                    ListItemData FAR* item = (ListItemData FAR*)pType; lstrcpy(g_ContextId, item->path); g_ContextIsVirtual = item->isVirtual; g_ContextIsFolder = item->isDir; 
-                                } 
-                            } else { SetWindowText(GetDlgItem(hwnd, 300), " Please select an item first."); return 0; } 
-                        }
-                    }
-                }
+            if (wp == 103) {
+                HWND hList = GetDlgItem(hwnd, ID_LIST); char name[MAX_PATH], path[MAX_PATH], sizeStr[32], containing[MAX_PATH]; int count = 0; 
+                GetWindowText(GetDlgItem(hwnd, 601), name, MAX_PATH); GetWindowText(GetDlgItem(hwnd, 603), path, MAX_PATH); GetWindowText(GetDlgItem(hwnd, 803), containing, MAX_PATH); if (name[0] == '\0') lstrcpy(name, "*.*");
+                GetWindowText(GetDlgItem(hwnd, 806), sizeStr, 32); unsigned long filterBytes = (unsigned long)atol(sizeStr) * 1024; int filterType = sizeStr[0] != '\0' ? SendMessage(GetDlgItem(hwnd, 805), CB_GETCURSEL, 0, 0) : -1;
                 
-                if (!g_ContextIsVirtual && (id == 4002 || id == 4005)) { SetWindowText(GetDlgItem(hwnd, 300), " Only virtual shortcuts can be edited."); return 0; }
+                ListItemData FAR* FAR* arr = (ListItemData FAR* FAR*)malloc(MAX_LIST_ITEMS * sizeof(ListItemData FAR*)); 
+                if (!arr) return 0;
                 
-                if (id == 4001) { 
-                    if (!g_CurrentIsVirtual) {
-                        char newPath[MAX_PATH]; char baseName[64]; int idx = 0;
-                        do {
-                            if (idx == 0) lstrcpy(baseName, "New Folder");
-                            else sprintf(baseName, "New Folder (%d)", idx);
-                            lstrcpy(newPath, g_CurrentPathOrId);
-                            if (newPath[0] && newPath[lstrlen(newPath)-1] != '\\') lstrcat(newPath, "\\");
-                            lstrcat(newPath, baseName);
-                            idx++;
-                        } while (access(newPath, 0) == 0);
-                        if (mkdir(newPath) == 0) {
-                            int i, count; RebuildList(hwnd); SetFocus(hList);
-                            count = SendMessage(hList, LB_GETCOUNT, 0, 0);
-                            for (i = 0; i < count; i++) {
-                                int FAR* pType = (int FAR*)SendMessage(hList, LB_GETITEMDATA, i, 0);
-                                if (pType && *pType == 1) {
-                                    ListItemData FAR* item = (ListItemData FAR*)pType;
-                                    if (lstrcmp(item->name, baseName) == 0) {
-                                        SendMessage(hList, LB_SETCURSEL, i, 0);
-                                        lstrcpy(g_SelectedListItemPath, item->path); lstrcpy(g_SelectedListItemName, item->name);
-                                        g_SelectedListItemIsVirtual = FALSE; g_SelectedListItemIsDir = TRUE; break;
-                                    }
-                                } else if (pType && *pType == 2) {
-                                    RowItemData FAR* row = (RowItemData FAR*)pType; int c;
-                                    for (c = 0; c < row->count; c++) {
-                                        if (lstrcmp(row->items[c]->name, baseName) == 0) {
-                                            SendMessage(hList, LB_SETCURSEL, i, 0);
-                                            lstrcpy(g_SelectedListItemPath, row->items[c]->path); lstrcpy(g_SelectedListItemName, row->items[c]->name);
-                                            g_SelectedListItemIsVirtual = FALSE; g_SelectedListItemIsDir = TRUE; break;
-                                        }
-                                    }
-                                }
-                            }
-                            InvalidateRect(hList, NULL, TRUE); UpdateWindow(hList); PostMessage(hwnd, WM_COMMAND, 4004, 0);
-                        } else { MessageBox(hwnd, "Failed to create folder.", "Error", MB_OK|MB_ICONHAND); }
-                    } else {
-                        lstrcpy(g_PromptLabel, "New Folder Name:"); g_PromptValue[0] = '\0'; g_PromptMode = PROMPT_NEWFOLDER; CreateCenteredDialog(g_hInst, hwnd, "PromptDlgClass", "New Folder", 290, 170); 
-                    }
-                }
-                else if (id == 4002) { g_EditShortcutId[0] = '\0'; CreateCenteredDialog(g_hInst, hwnd, "ShortcutDlgClass", "Create Shortcut", 360, 300); }
-                else if (id == 4003 && g_ContextId[0] != '\0') {
-                    char msgBuf[256]; sprintf(msgBuf, "Are you sure you want to delete '%s'?", g_ContextId);
-                    if (MessageBox(hwnd, msgBuf, "Confirm Delete", MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                        if (g_ContextIsVirtual) { WritePrivateProfileString("Shortcut", g_ContextId, NULL, g_szExplorerIni); LoadIniShortcuts(); RebuildTree(hTree); RebuildList(hwnd); }
-                        else { lstrcpy(g_DelPath, g_ContextId); g_DelIsDir = g_ContextIsFolder; g_bCancelDel = FALSE; CreateCenteredDialog(g_hInst, hwnd, "DeleteProgressDlgClass", "Deleting", 280, 130); }
-                    }
-                }
-                else if (id == 4004) {
-                    if (hFocus == hTree) { SetWindowText(GetDlgItem(hwnd, 300), " Rename unsupported in tree view directly."); }
-                    else {
-                        int sel = SendMessage(hList, LB_GETCURSEL, 0, 0);
-                        if (g_ViewMode == 0 || g_ViewMode == 1) {
-                            if (g_SelectedListItemPath[0] != '\0') { g_InlineRenameIsVirtual = g_SelectedListItemIsVirtual; if (g_SelectedListItemIsVirtual) lstrcpy(g_InlineRenameId, g_SelectedListItemPath); else lstrcpy(g_InlineRenameOldPath, g_SelectedListItemPath); if (sel != LB_ERR) { int FAR* pType = (int FAR*)SendMessage(hList, LB_GETITEMDATA, sel, 0); if (pType && *pType == 2) { RowItemData FAR* row = (RowItemData FAR*)pType; int c; int colW = (g_ViewMode == 0) ? CELL_W : 150; for (c=0; c<row->count; c++) { if (lstrcmp(row->items[c]->path, g_SelectedListItemPath) == 0 && lstrcmp(row->items[c]->name, g_SelectedListItemName) == 0) { RECT rc; SendMessage(hList, LB_GETITEMRECT, sel, (LPARAM)(LPRECT)&rc); int itemX = rc.left + c * colW; RECT eRc; if (g_ViewMode == 0) { eRc.left = itemX + 2; eRc.right = itemX + CELL_W - 2; eRc.top = rc.top + 42; eRc.bottom = rc.bottom; } else { eRc.left = itemX + 22; eRc.right = itemX + 150 - 4; eRc.top = rc.top + 2; eRc.bottom = rc.bottom; } HWND hEdit = CreateWindowEx(0, "EDIT", row->items[c]->name, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | (g_ViewMode == 0 ? ES_CENTER : 0), eRc.left, eRc.top, eRc.right - eRc.left, eRc.bottom - eRc.top, hList, (HMENU)9999, g_hInst, NULL); g_lpfnOldInlineEditProc = (FARPROC)SetWindowLong(hEdit, GWL_WNDPROC, (LONG)g_lpfnInlineEditProcInst); SetFocus(hEdit); SendMessage(hEdit, EM_SETSEL, 0, MAKELONG(0, -1)); break; } } } } }
-                        } else {
-                            if (sel != LB_ERR) { int FAR* pType = (int FAR*)SendMessage(hList, LB_GETITEMDATA, sel, 0); if (pType && *pType == 1) { ListItemData FAR* item = (ListItemData FAR*)pType; g_InlineRenameIsVirtual = item->isVirtual; if (item->isVirtual) lstrcpy(g_InlineRenameId, item->path); else lstrcpy(g_InlineRenameOldPath, item->path); RECT rc; SendMessage(hList, LB_GETITEMRECT, sel, (LPARAM)(LPRECT)&rc); rc.left += 22; if (g_ViewMode == 3) rc.right = rc.left + 150 - 4; HWND hEdit = CreateWindowEx(0, "EDIT", item->name, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, hList, (HMENU)9999, g_hInst, NULL); g_lpfnOldInlineEditProc = (FARPROC)SetWindowLong(hEdit, GWL_WNDPROC, (LONG)g_lpfnInlineEditProcInst); SetFocus(hEdit); SendMessage(hEdit, EM_SETSEL, 0, MAKELONG(0, -1)); } }
-                        }
-                    }
-                }
-                else if (id == 4005 && g_ContextId[0] != '\0') { lstrcpy(g_EditShortcutId, g_ContextId); CreateCenteredDialog(g_hInst, hwnd, "ShortcutDlgClass", "Properties", 360, 300); }
-                else if (id == 4011 || id == 4012) {
-                    if (hFocus == hTree) {
-                        lstrcpy(g_ClipPath, g_ContextId); 
-                        lstrcpy(g_ClipName, "");
-                        g_ClipIsVirtual = g_ContextIsVirtual;
-                        g_ClipIsDir = g_ContextIsFolder;
-                    } else {
-                        if (g_ViewMode == 0 || g_ViewMode == 1) {
-                            lstrcpy(g_ClipPath, g_SelectedListItemPath); lstrcpy(g_ClipName, g_SelectedListItemName); g_ClipIsVirtual = g_SelectedListItemIsVirtual; g_ClipIsDir = g_SelectedListItemIsDir;
-                        } else {
-                            int sel = SendMessage(hList, LB_GETCARETINDEX, 0, 0);
-                            if (sel != LB_ERR && SendMessage(hList, LB_GETSEL, sel, 0) > 0) {
-                                int FAR* pType = (int FAR*)SendMessage(hList, LB_GETITEMDATA, sel, 0);
-                                if (pType && *pType == 1) {
-                                    ListItemData FAR* item = (ListItemData FAR*)pType;
-                                    lstrcpy(g_ClipPath, item->path); lstrcpy(g_ClipName, item->name); g_ClipIsVirtual = item->isVirtual; g_ClipIsDir = item->isDir;
-                                }
-                            }
-                        }
-                    }
-                    if (g_ClipName[0] == '\0') { 
-                        if (!g_ClipIsVirtual) {
-                            char tempP[MAX_PATH]; lstrcpy(tempP, g_ClipPath);
-                            if (tempP[0] && tempP[lstrlen(tempP)-1] == '\\') tempP[lstrlen(tempP)-1] = '\0';
-                            char* p = strrchr(tempP, '\\');
-                            if (p) lstrcpy(g_ClipName, p + 1); else lstrcpy(g_ClipName, tempP);
-                        } else {
-                            int k; for(k=0; k<g_IniShortcutCount; k++) if(lstrcmp(g_IniShortcuts[k]->id, g_ClipPath) == 0) { lstrcpy(g_ClipName, g_IniShortcuts[k]->name); break; } 
-                        }
-                    }
-                    g_ClipOp = (id == 4011) ? 2 : 1; if (g_ClipIsVirtual) lstrcpy(g_ClipId, g_ClipPath);
-                }
-                else if (id == 4013) {
-                    if (g_ClipOp == 0) return 0;
-                    if (g_ClipIsVirtual || g_CurrentIsVirtual) {
-                        char newId[16]; IniShortcut FAR* sh = (IniShortcut FAR*)malloc(sizeof(IniShortcut));
-                        if (sh) {
-                            memset(sh, 0, sizeof(IniShortcut)); GetNewIniId(newId); lstrcpy(sh->id, newId);
-                            lstrcpy(sh->name, g_ClipName); lstrcpy(sh->parentId, g_CurrentPathOrId); sh->isFolder = g_ClipIsDir;
-                            if (g_ClipIsVirtual) { int i; for(i=0; i<g_IniShortcutCount; i++) if (lstrcmp(g_IniShortcuts[i]->id, g_ClipId) == 0) { lstrcpy(sh->exe, g_IniShortcuts[i]->exe); lstrcpy(sh->params, g_IniShortcuts[i]->params); lstrcpy(sh->icon, g_IniShortcuts[i]->icon); sh->minimized = g_IniShortcuts[i]->minimized; break; } if (g_ClipOp == 2) { WritePrivateProfileString("Shortcut", g_ClipId, NULL, g_szExplorerIni); g_ClipOp = 0; } } else lstrcpy(sh->exe, g_ClipPath);
-                            
-                            if (NameExists(g_CurrentPathOrId, sh->name, TRUE)) {
-                                char temp[MAX_PATH];
-                                sprintf(temp, "Copy of %s", sh->name);
-                                lstrcpy(sh->name, temp);
-                            }
-                            
-                            if (!NameExists(g_CurrentPathOrId, sh->name, TRUE)) { SaveIniEntry(sh); LoadIniShortcuts(); RebuildTree(hTree); RebuildList(hwnd); }
-                            free(sh);
-                        }
-                    } else {
-                        lstrcpy(g_CurrentJob.src, g_ClipPath); lstrcpy(g_CurrentJob.dst, g_CurrentPathOrId); if (g_CurrentJob.dst[0] != '\0' && g_CurrentJob.dst[lstrlen(g_CurrentJob.dst)-1] != '\\') lstrcat(g_CurrentJob.dst, "\\"); lstrcat(g_CurrentJob.dst, g_ClipName); 
-                        
-                        if (g_ClipOp == 1 && lstrcmpi(g_CurrentJob.src, g_CurrentJob.dst) == 0) {
-                            char tempDst[MAX_PATH];
-                            lstrcpy(tempDst, g_CurrentPathOrId);
-                            if (tempDst[0] != '\0' && tempDst[lstrlen(tempDst)-1] != '\\') lstrcat(tempDst, "\\");
-                            lstrcat(tempDst, "Copy of ");
-                            lstrcat(tempDst, g_ClipName);
-                            lstrcpy(g_CurrentJob.dst, tempDst);
-                        } else if (g_ClipOp == 2 && lstrcmpi(g_CurrentJob.src, g_CurrentJob.dst) == 0) {
-                            g_ClipOp = 0; return 0;
-                        }
-                        
-                        g_CurrentJob.isMove = (g_ClipOp == 2); g_CurrentJob.isDir = g_ClipIsDir; g_ReplaceMode = 0; if (g_ClipOp == 2) g_ClipOp = 0; CreateCenteredDialog(g_hInst, hwnd, "CopyProgressDlgClass", g_CurrentJob.isMove ? "Moving" : "Copying", 280, 140);
-                    }
-                }
-                else if (id == 4014) {
-                    if (g_ClipOp == 0) return 0; char newId[16]; IniShortcut FAR* sh = (IniShortcut FAR*)malloc(sizeof(IniShortcut));
-                    if (sh) {
-                        memset(sh, 0, sizeof(IniShortcut)); GetNewIniId(newId); lstrcpy(sh->id, newId);
-                        sprintf(sh->name, "Shortcut to %s", g_ClipName); lstrcpy(sh->parentId, g_CurrentPathOrId); sh->isFolder = FALSE;
-                        if (g_ClipIsVirtual) { int i; for(i=0; i<g_IniShortcutCount; i++) if (lstrcmp(g_IniShortcuts[i]->id, g_ClipId) == 0) { lstrcpy(sh->exe, g_IniShortcuts[i]->exe); lstrcpy(sh->params, g_IniShortcuts[i]->params); lstrcpy(sh->icon, g_IniShortcuts[i]->icon); sh->minimized = g_IniShortcuts[i]->minimized; break; } } else lstrcpy(sh->exe, g_ClipPath); if (!NameExists(g_CurrentPathOrId, sh->name, TRUE)) SaveIniEntry(sh); LoadIniShortcuts(); RebuildTree(hTree); RebuildList(hwnd);
-                        free(sh);
-                    }
-                }
-                else if (id == 4015) { SendMessage(hList, LB_SETSEL, TRUE, -1); }
-                else if (id == 4016) { int i, count = SendMessage(hList, LB_GETCOUNT, 0, 0); for (i=0; i<count; i++) { BOOL sel = SendMessage(hList, LB_GETSEL, i, 0); SendMessage(hList, LB_SETSEL, !sel, i); } }
-            }
-            else if ((id == ID_LIST && HIWORD(lp) == LBN_DBLCLK) || id == 5002 || id == 5001) {
-                if (g_ViewMode != 0 && g_ViewMode != 1) {
-                    int sel = SendMessage(hList, LB_GETCARETINDEX, 0, 0);
-                    if (sel != LB_ERR) {
-                        int FAR* pType = (int FAR*)SendMessage(hList, LB_GETITEMDATA, sel, 0);
-                        if (pType && *pType == 1) {
-                            ListItemData FAR* item = (ListItemData FAR*)pType;
-                            if (item->isDir) { lstrcpy(g_CurrentPathOrId, item->path); g_CurrentIsVirtual = item->isVirtual; SetWindowText(hwnd, item->name); if (g_CurrentIsVirtual) ExpandAllParentsVirtual(g_CurrentPathOrId); else ExpandAllParentsFS(g_CurrentPathOrId); if (!IsExpanded(item->path)) ToggleExpand(item->path); RebuildTree(hTree); RebuildList(hwnd); } else { if (item->isVirtual) { int i; for (i = 0; i < g_IniShortcutCount; i++) { if (lstrcmpi(g_IniShortcuts[i]->id, item->path) == 0) { if (g_IniShortcuts[i]->exe[0]) ShellExecute(hwnd, "open", g_IniShortcuts[i]->exe, g_IniShortcuts[i]->params, NULL, SW_SHOWNORMAL); break; } } } else ShellExecute(hwnd, "open", item->path, NULL, NULL, SW_SHOWNORMAL); }
-                        }
-                    }
-                }
-            } return 0;
+                SendMessage(hList, WM_SETREDRAW, FALSE, 0); SendMessage(hList, LB_RESETCONTENT, 0, 0); g_bStopSearch = FALSE; EnableWindow(GetDlgItem(hwnd, 105), TRUE); EnableWindow(GetDlgItem(hwnd, 103), FALSE);
+                DoRecursiveSearch(arr, path, name, &count, filterType, filterBytes, containing);
+                g_bStopSearch = FALSE; EnableWindow(GetDlgItem(hwnd, 105), FALSE); EnableWindow(GetDlgItem(hwnd, 103), TRUE);
+                SortListItems(arr, count); LayoutListItems(hList, arr, count, state->viewMode); 
+                
+                free(arr);
+            } else if (wp == 105) { g_bStopSearch = TRUE; EnableWindow(GetDlgItem(hwnd, 105), FALSE); EnableWindow(GetDlgItem(hwnd, 103), TRUE);
+            } else if (wp == 104) { SetWindowText(GetDlgItem(hwnd, 601), "*.*"); SendMessage(GetDlgItem(hwnd, ID_LIST), LB_RESETCONTENT, 0, 0); } else if (wp >= 4001 && wp <= 4050) { HandleListCommand(hwnd, wp, lp, state); }
+            return 0;
         }
-        case WM_DESTROY: if (!FindWindow("Win95DesktopClass", "Desktop")) PostQuitMessage(0); return 0;
+        case WM_DESTROY: { 
+            if (state) { free(state); SetWindowLong(hwnd, 0, 0); } 
+            if (!FindWindow("Win95DesktopClass", "Desktop") && !FindWindow("Win95FolderClass", NULL)) PostQuitMessage(0); 
+            return 0; 
+        }
     } return DefWindowProc(hwnd, msg, wp, lp);
 }
 
 /* --- Entry Point --- */
 int PASCAL WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nCmdShow) {
-    WNDCLASS wc; MSG msg; BOOL isWindowed = FALSE; char startPath[MAX_PATH] = ""; char* p = lpCmdLine; g_hInst = hInst;
-    while (*p) { while (*p == ' ') p++; if (!*p) break; if (p[0] == '-' && (p[1] == 'w' || p[1] == 'W')) { isWindowed = TRUE; p += 2; } else { int i = 0; if (*p == '"') { p++; while (*p && *p != '"' && i < MAX_PATH - 1) startPath[i++] = *p++; if (*p == '"') p++; } else { while (*p && *p != ' ' && i < MAX_PATH - 1) startPath[i++] = *p++; } startPath[i] = '\0'; } }
+    WNDCLASS wc; MSG msg; char startPath[MAX_PATH] = ""; char searchPath[MAX_PATH] = ""; char* p = lpCmdLine; g_hInst = hInst; int i;
+    
+    while (*p) { 
+        while (*p == ' ') p++; if (!*p) break; 
+        if (strncmp(p, "-w", 2) == 0 || strncmp(p, "-W", 2) == 0) { g_bIsWindowed = TRUE; p += 2; } 
+        else if (strncmp(p, "-search:", 8) == 0) {
+            p += 8; i = 0; if (*p == '"') { p++; while (*p && *p != '"' && i < MAX_PATH - 1) searchPath[i++] = *p++; if (*p == '"') p++; } else { while (*p && *p != ' ' && i < MAX_PATH - 1) searchPath[i++] = *p++; } searchPath[i] = '\0';
+        } else { 
+            i = 0; if (*p == '"') { p++; while (*p && *p != '"' && i < MAX_PATH - 1) startPath[i++] = *p++; if (*p == '"') p++; } else { while (*p && *p != ' ' && i < MAX_PATH - 1) startPath[i++] = *p++; } startPath[i] = '\0'; 
+        } 
+    }
 
-    /* Generate Global Process Instances (Memory Leak Patch) */
     g_lpfnTreeProcInst = MakeProcInstance((FARPROC)TreeProc, hInst);
     g_lpfnListProcInst = MakeProcInstance((FARPROC)ListProc, hInst);
     g_lpfnToolbarProcInst = MakeProcInstance((FARPROC)ToolbarProc, hInst);
     g_lpfnInlineEditProcInst = MakeProcInstance((FARPROC)InlineEditProc, hInst);
 
-    memset(&wc, 0, sizeof(WNDCLASS)); wc.style = CS_DBLCLKS; wc.lpfnWndProc = DesktopProc; wc.hInstance = hInst; wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = CreateSolidBrush(RGB(0, 128, 128)); wc.lpszClassName = "Win95DesktopClass"; RegisterClass(&wc);
-    memset(&wc, 0, sizeof(WNDCLASS)); wc.style = CS_DBLCLKS; wc.lpfnWndProc = FolderWndProc; wc.hInstance = hInst; wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); wc.lpszClassName = "Win95FolderClass"; RegisterClass(&wc);
+    g_hbrDesktop = g_bIsWindowed ? CreateSolidBrush(RGB(0, 128, 128)) : CreateSolidBrush(GetSysColor(COLOR_BACKGROUND));
+    g_hbrWindow = CreateSolidBrush(GetSysColor(COLOR_WINDOW));
+    g_hbrHighlight = CreateSolidBrush(GetSysColor(COLOR_HIGHLIGHT));
+
+    memset(&wc, 0, sizeof(WNDCLASS)); wc.cbWndExtra = sizeof(WindowState FAR*); wc.style = CS_DBLCLKS; wc.lpfnWndProc = DesktopProc; wc.hInstance = hInst; wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = g_hbrDesktop; wc.lpszClassName = "Win95DesktopClass"; RegisterClass(&wc);
+    memset(&wc, 0, sizeof(WNDCLASS)); wc.cbWndExtra = sizeof(WindowState FAR*); wc.style = CS_DBLCLKS; wc.lpfnWndProc = FolderWndProc; wc.hInstance = hInst; wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); wc.lpszClassName = "Win95FolderClass"; RegisterClass(&wc);
+    memset(&wc, 0, sizeof(WNDCLASS)); wc.cbWndExtra = sizeof(WindowState FAR*); wc.style = CS_DBLCLKS; wc.lpfnWndProc = SearchWndProc; wc.hInstance = hInst; wc.hCursor = LoadCursor(NULL, IDC_ARROW); wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); wc.lpszClassName = "Win95SearchClass"; RegisterClass(&wc);
+    
     memset(&wc, 0, sizeof(WNDCLASS)); wc.lpfnWndProc = PromptDlgProc; wc.hInstance = hInst; wc.lpszClassName = "PromptDlgClass"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); RegisterClass(&wc);
     memset(&wc, 0, sizeof(WNDCLASS)); wc.lpfnWndProc = ShortcutDlgProc; wc.hInstance = hInst; wc.lpszClassName = "ShortcutDlgClass"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); RegisterClass(&wc);
     memset(&wc, 0, sizeof(WNDCLASS)); wc.lpfnWndProc = CopyProgressDlgProc; wc.hInstance = hInst; wc.lpszClassName = "CopyProgressDlgClass"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); RegisterClass(&wc);
     memset(&wc, 0, sizeof(WNDCLASS)); wc.lpfnWndProc = DeleteProgressDlgProc; wc.hInstance = hInst; wc.lpszClassName = "DeleteProgressDlgClass"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); RegisterClass(&wc);
     memset(&wc, 0, sizeof(WNDCLASS)); wc.lpfnWndProc = ReplaceDlgProc; wc.hInstance = hInst; wc.lpszClassName = "ReplaceDlgClass"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); RegisterClass(&wc);
+    memset(&wc, 0, sizeof(WNDCLASS)); wc.lpfnWndProc = FilePropDlgProc; wc.hInstance = hInst; wc.lpszClassName = "FilePropDlgClass"; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); RegisterClass(&wc);
 
-    if (startPath[0] == '\0' || isWindowed) { if (isWindowed) CreateWindowEx(0, "Win95DesktopClass", "Desktop", WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, NULL, NULL, hInst, NULL); else CreateWindowEx(0, "Win95DesktopClass", "Desktop", WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), NULL, NULL, hInst, NULL); }
-    if (startPath[0] != '\0') { g_hwndMain = CreateWindowEx(0, "Win95FolderClass", startPath, WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, NULL, NULL, hInst, (LPVOID)startPath); } else if (isWindowed) { g_hwndMain = FindWindow("Win95DesktopClass", "Desktop"); }
+    if (startPath[0] == '\0' || !g_bIsWindowed) {
+        if (g_bIsWindowed) g_hwndMain = CreateWindowEx(0, "Win95DesktopClass", "Desktop", (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME) | WS_VISIBLE | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, NULL, NULL, hInst, NULL);
+        else { g_hwndMain = CreateWindowEx(0, "Win95DesktopClass", "Desktop", WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), NULL, NULL, hInst, NULL); SetWindowPos(g_hwndMain, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); }
+    }
+    if (startPath[0] != '\0') { g_hwndMain = CreateWindowEx(0, "Win95FolderClass", startPath, (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME) | WS_VISIBLE | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 640, 480, NULL, NULL, hInst, (LPVOID)startPath); } else if (g_bIsWindowed) { g_hwndMain = FindWindow("Win95DesktopClass", "Desktop"); }
+    if (searchPath[0] != '\0') { CreateWindowEx(0, "Win95SearchClass", "Find: All Files", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 480, 420, NULL, NULL, hInst, (LPVOID)searchPath); }
     
     while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
+    
+    /* Memory Leak Cleanup */
+    DeleteObject(g_hbrDesktop); DeleteObject(g_hbrWindow); DeleteObject(g_hbrHighlight);
+    for (i = 0; i < g_ExpandedCount; i++) free(g_ExpandedNodes[i]);
+    for (i = 0; i < g_IniShortcutCount; i++) free(g_IniShortcuts[i]);
+    FreeProcInstance(g_lpfnTreeProcInst); FreeProcInstance(g_lpfnListProcInst); FreeProcInstance(g_lpfnToolbarProcInst); FreeProcInstance(g_lpfnInlineEditProcInst);
     
     return (int)msg.wParam;
 }
