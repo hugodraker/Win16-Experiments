@@ -82,12 +82,26 @@ typedef struct {
     char name[64]; 
     Shape* shapes; 
     int shapeCount; 
-    char tNames[MAX_TAGS][32];  /* Restored */
-    char tVals[MAX_TAGS][128];  /* Restored */
-    int tCount;                 /* Restored */
+    char tNames[MAX_TAGS][32];  
+    char tVals[MAX_TAGS][128];  
+    int tCount;                 
     Dimension dims[MAX_DIMS];
     int dimCount;
+    char pageName[64];
+    char unitName[32];
+    double pageScale;
 } IconDef;
+
+char activePageName[64] = "A4 (210x297)";
+char activeUnitName[32] = "mm";
+double activePageScale = 1.0;
+
+char customPageSizes[10][64] = {0};
+char activePageOrient[32] = "Landscape";
+
+int customPageCount = 0;
+int g_RenderRefDepth = 0;
+int previewDirty = 1;
 
 typedef struct {
     char path[260];
@@ -359,6 +373,28 @@ void EscapeNewlines(const char* in, char* out) {
     }
     *out = '\0';
 }
+void FormatDimension(double val, const char* unit, char* outBuf) {
+    if (stricmp(unit, "feet-inches") == 0) {
+        int feet = (int)(val / 12.0);
+        double inches = val - (feet * 12.0);
+        if (fabs(inches - round(inches)) < 0.001) {
+            sprintf(outBuf, "%d'-%d\"", feet, (int)round(inches));
+        } else if (fabs(inches * 10.0 - round(inches * 10.0)) < 0.001) {
+            sprintf(outBuf, "%d'-%.1f\"", feet, inches);
+        } else {
+            sprintf(outBuf, "%d'-%.2f\"", feet, inches);
+        }
+    } else if (stricmp(unit, "inches") == 0) {
+        if (fabs(val - round(val)) < 0.001) sprintf(outBuf, "%d\"", (int)round(val));
+        else sprintf(outBuf, "%.2f\"", val);
+    } else if (stricmp(unit, "None") == 0 || unit[0] == '\0') {
+        if (fabs(val - round(val)) < 0.001) sprintf(outBuf, "%d", (int)round(val));
+        else sprintf(outBuf, "%.2f", val);
+    } else {
+        if (fabs(val - round(val)) < 0.001) sprintf(outBuf, "%d %s", (int)round(val), unit);
+        else sprintf(outBuf, "%.2f %s", val, unit);
+    }
+}
 char* FindQuote(char* start) {
     char* p = start;
     while (*p) {
@@ -464,29 +500,252 @@ LRESULT CALLBACK _export MultiEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     return CallWindowProc((FARPROC)oldMultiEditProc, hwnd, msg, wParam, lParam);
 }
 LRESULT CALLBACK _export PageSizeProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    static HWND hComboPage = NULL, hComboUnits = NULL, hComboScale = NULL, hComboOrient = NULL;
+    static int inOrientSync = 0;
     switch(msg) {
         case WM_CREATE: {
-            char buf[16];
+            char buf[32]; int i;
+            double pW = 0, pH = 0;
+            char *p1, *p2;
+
             CreateWindow("STATIC", "Width (Grid Units):", WS_CHILD|WS_VISIBLE, 10, 10, 120, 20, hwnd, NULL, hInst, NULL);
-            hEditW = CreateWindow("EDIT", "", WS_CHILD|WS_VISIBLE|WS_BORDER, 130, 10, 50, 20, hwnd, NULL, hInst, NULL);
-            CreateWindow("STATIC", "Height (Grid Units):", WS_CHILD|WS_VISIBLE, 10, 40, 120, 20, hwnd, NULL, hInst, NULL);
-            hEditH = CreateWindow("EDIT", "", WS_CHILD|WS_VISIBLE|WS_BORDER, 130, 40, 50, 20, hwnd, NULL, hInst, NULL);
-            CreateWindow("BUTTON", "Apply", WS_CHILD|WS_VISIBLE, 60, 70, 80, 25, hwnd, (HMENU)1, hInst, NULL);
+            hEditW = CreateWindow("EDIT", "", WS_CHILD|WS_VISIBLE|WS_BORDER, 130, 10, 150, 20, hwnd, (HMENU)105, hInst, NULL);
+            CreateWindow("STATIC", "Height (Grid Units):", WS_CHILD|WS_VISIBLE, 10, 35, 120, 20, hwnd, NULL, hInst, NULL);
+            hEditH = CreateWindow("EDIT", "", WS_CHILD|WS_VISIBLE|WS_BORDER, 130, 35, 150, 20, hwnd, (HMENU)106, hInst, NULL);
+            
+            CreateWindow("STATIC", "Page Size:", WS_CHILD|WS_VISIBLE, 10, 60, 120, 20, hwnd, NULL, hInst, NULL);
+            hComboPage = CreateWindow("COMBOBOX", "", WS_CHILD|WS_VISIBLE|CBS_DROPDOWN|WS_VSCROLL, 130, 60, 150, 120, hwnd, (HMENU)101, hInst, NULL);
+            {
+                const char* sizes[] = {"A4 (210x297)", "Letter (215.9x279.4)", "A3 (297x420)", "A2 (420x594)", "A1 (594x841)", "A0 (841x1189)", "A5 (148x210)", "Legal (215.9x355.6)", "Tabloid (279.4x431.8)", "Arch D (609.6x914.4)", "Custom (100x100)"};
+                for(i=0; i<11; i++) SendMessage(hComboPage, CB_ADDSTRING, 0, (LPARAM)sizes[i]);
+            }
+            for(i = 0; i < customPageCount; i++) SendMessage(hComboPage, CB_ADDSTRING, 0, (LPARAM)customPageSizes[i]);
+            SetWindowText(hComboPage, activePageName);
+
+            /* Auto-detect orientation from width vs height numbers in activePageName */
+            p1 = strchr(activePageName, '(');
+            if (p1) {
+                p2 = strchr(p1, 'x');
+                if (p2) { pW = atof(p1 + 1); pH = atof(p2 + 1); }
+            }
+            if (pW > 0 && pH > 0) {
+                if (pW >= pH) strcpy(activePageOrient, "Landscape");
+                else strcpy(activePageOrient, "Portrait");
+            } else if (activePageOrient[0] == '\0') {
+                strcpy(activePageOrient, "Landscape");
+            }
+
+            CreateWindow("STATIC", "Orientation:", WS_CHILD|WS_VISIBLE, 10, 85, 120, 20, hwnd, NULL, hInst, NULL);
+            hComboOrient = CreateWindow("COMBOBOX", "", WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL, 130, 85, 150, 60, hwnd, (HMENU)107, hInst, NULL);
+            SendMessage(hComboOrient, CB_ADDSTRING, 0, (LPARAM)"Landscape");
+            SendMessage(hComboOrient, CB_ADDSTRING, 0, (LPARAM)"Portrait");
+            if (strcmp(activePageOrient, "Portrait") == 0) {
+                SendMessage(hComboOrient, CB_SETCURSEL, 1, 0);
+            } else {
+                SendMessage(hComboOrient, CB_SETCURSEL, 0, 0);
+            }
+            SetWindowText(hComboOrient, activePageOrient);
+
+            CreateWindow("STATIC", "Units:", WS_CHILD|WS_VISIBLE, 10, 110, 120, 20, hwnd, NULL, hInst, NULL);
+            hComboUnits = CreateWindow("COMBOBOX", "", WS_CHILD|WS_VISIBLE|CBS_DROPDOWN|WS_VSCROLL, 130, 110, 150, 120, hwnd, (HMENU)102, hInst, NULL);
+            SendMessage(hComboUnits, CB_ADDSTRING, 0, (LPARAM)"None");
+            SendMessage(hComboUnits, CB_ADDSTRING, 0, (LPARAM)"mm");
+            SendMessage(hComboUnits, CB_ADDSTRING, 0, (LPARAM)"cm");
+            SendMessage(hComboUnits, CB_ADDSTRING, 0, (LPARAM)"m");
+            SendMessage(hComboUnits, CB_ADDSTRING, 0, (LPARAM)"inches");
+            SendMessage(hComboUnits, CB_ADDSTRING, 0, (LPARAM)"feet");
+            SendMessage(hComboUnits, CB_ADDSTRING, 0, (LPARAM)"feet-inches");
+            SetWindowText(hComboUnits, activeUnitName);
+
+            /* 0x0100L is SS_NOTIFY */
+            CreateWindow("STATIC", "Scale Ratio:", WS_CHILD|WS_VISIBLE|0x0100L, 10, 135, 120, 20, hwnd, (HMENU)104, hInst, NULL);
+            hComboScale = CreateWindow("COMBOBOX", "", WS_CHILD|WS_VISIBLE|CBS_DROPDOWN|WS_VSCROLL, 130, 135, 150, 120, hwnd, (HMENU)103, hInst, NULL);
+            {
+                const char* scales[] = {"1:1", "1:2", "1:4", "1:5", "1:10", "1:20", "1:25", "1:40", "1:50", "1:100", "1:200", "1:500", "1:1000"};
+                for(i=0; i<13; i++) SendMessage(hComboScale, CB_ADDSTRING, 0, (LPARAM)scales[i]);
+            }
+            if (activePageScale > 0 && activePageScale <= 1.0) {
+                sprintf(buf, "1:%g", 1.0 / activePageScale);
+            } else {
+                sprintf(buf, "%g", activePageScale);
+            }
+            SetWindowText(hComboScale, buf);
+
+            CreateWindow("BUTTON", "Apply", WS_CHILD|WS_VISIBLE, 100, 170, 80, 25, hwnd, (HMENU)1, hInst, NULL);
+            
             sprintf(buf, "%d", gridW); SetWindowText(hEditW, buf);
             sprintf(buf, "%d", gridH); SetWindowText(hEditH, buf);
             break;
         }
         case WM_COMMAND:
             if (LOWORD(wParam) == 1) {
-                char buf[16];
-                GetWindowText(hEditW, buf, 16); gridW = atoi(buf);
-                GetWindowText(hEditH, buf, 16); gridH = atoi(buf);
+                char buf[64]; char* colon;
+                int i, isNew = 1;
+                const char* stdSizes[] = {"A4", "Letter", "A3", "A2", "A1", "A0", "A5", "Legal", "Tabloid", "Arch D", "Custom"};
+                
+                GetWindowText(hEditW, buf, 64); gridW = atoi(buf);
+                GetWindowText(hEditH, buf, 64); gridH = atoi(buf);
+                GetWindowText(hComboPage, activePageName, 64);
+                GetWindowText(hComboUnits, activeUnitName, 32);
+                GetWindowText(hComboOrient, activePageOrient, 32);
+                GetWindowText(hComboScale, buf, 64); 
+                
+                colon = strchr(buf, ':');
+                if (colon) {
+                    double v1 = atof(buf);
+                    double v2 = atof(colon + 1);
+                    if (v2 != 0) activePageScale = v1 / v2;
+                } else {
+                    activePageScale = atof(buf);
+                }
+                
+                for (i = 0; i < 11; i++) {
+                    if (strncmp(activePageName, stdSizes[i], strlen(stdSizes[i])) == 0) isNew = 0;
+                }
+                for (i = 0; i < customPageCount; i++) if (strcmp(customPageSizes[i], activePageName) == 0) isNew = 0;
+                if (isNew && customPageCount < 10) strcpy(customPageSizes[customPageCount++], activePageName);
+
                 if (gridW < 5) gridW = 5; if (gridH < 5) gridH = 5;
+
+                if (currentIconIdx >= 0 && currentIconIdx < parsedCount) {
+                    strcpy(parsedIcons[currentIconIdx].pageName, activePageName);
+                    strcpy(parsedIcons[currentIconIdx].unitName, activeUnitName);
+                    parsedIcons[currentIconIdx].pageScale = activePageScale;
+                }
+
                 SendMessage(hMain, WM_SIZE, 0, MAKELPARAM(clientW, clientH));
                 InvalidateRect(hMain, NULL, TRUE); DestroyWindow(hwnd);
+            } else {
+                int cmd = LOWORD(wParam);
+                int evt = HIWORD(lParam);
+
+                if (inOrientSync) break;
+
+                /* Handle manual flip from Orientation dropdown */
+                if (cmd == 107 && evt == CBN_SELCHANGE) {
+                    char bufPage[64], bufOrient[32], prefix[32];
+                    double pW = 0, pH = 0;
+                    char *p1, *p2;
+
+                    int idx = SendMessage(hComboOrient, CB_GETCURSEL, 0, 0);
+                    if (idx != CB_ERR) SendMessage(hComboOrient, CB_GETLBTEXT, idx, (LPARAM)bufOrient);
+                    else GetWindowText(hComboOrient, bufOrient, 32);
+
+                    GetWindowText(hComboPage, bufPage, 64);
+                    p1 = strchr(bufPage, '(');
+                    if (p1) {
+                        p2 = strchr(p1, 'x');
+                        if (p2) {
+                            int len = (int)(p1 - bufPage);
+                            if (len > 31) len = 31;
+                            strncpy(prefix, bufPage, len);
+                            prefix[len] = '\0';
+                            pW = atof(p1 + 1);
+                            pH = atof(p2 + 1);
+
+                            if ((strcmp(bufOrient, "Landscape") == 0 && pW < pH) ||
+                                (strcmp(bufOrient, "Portrait") == 0 && pW > pH)) {
+                                inOrientSync = 1;
+                                sprintf(bufPage, "%s(%g%s%g)", prefix, pH, "x", pW);
+                                SetWindowText(hComboPage, bufPage);
+                                inOrientSync = 0;
+                            }
+                        }
+                    }
+                }
+
+                /* Handle Page Size changes: auto-detect and sync Orientation dropdown */
+                if (cmd == 101 && (evt == CBN_SELCHANGE || evt == CBN_EDITCHANGE || evt == CBN_KILLFOCUS)) {
+                    char bufPage[64];
+                    double pW = 0, pH = 0;
+                    char *p1, *p2;
+
+                    if (evt == CBN_SELCHANGE) {
+                        int idx = SendMessage(hComboPage, CB_GETCURSEL, 0, 0);
+                        if (idx != CB_ERR) SendMessage(hComboPage, CB_GETLBTEXT, idx, (LPARAM)bufPage);
+                        else GetWindowText(hComboPage, bufPage, 64);
+                    } else {
+                        GetWindowText(hComboPage, bufPage, 64);
+                    }
+
+                    p1 = strchr(bufPage, '(');
+                    if (p1) {
+                        p2 = strchr(p1, 'x');
+                        if (p2) {
+                            pW = atof(p1 + 1);
+                            pH = atof(p2 + 1);
+                            if (pW > 0 && pH > 0) {
+                                inOrientSync = 1;
+                                if (pW >= pH) {
+                                    SetWindowText(hComboOrient, "Landscape");
+                                    SendMessage(hComboOrient, CB_SETCURSEL, 0, 0);
+                                } else {
+                                    SetWindowText(hComboOrient, "Portrait");
+                                    SendMessage(hComboOrient, CB_SETCURSEL, 1, 0);
+                                }
+                                inOrientSync = 0;
+                            }
+                        }
+                    }
+                }
+
+                if (cmd == 104 || (cmd == 101 && (evt == CBN_SELCHANGE || evt == CBN_EDITCHANGE || evt == CBN_KILLFOCUS)) || 
+                    (cmd == 102 && evt == CBN_SELCHANGE) || (cmd == 107 && evt == CBN_SELCHANGE) || 
+                    ((cmd == 105 || cmd == 106) && (evt == EN_CHANGE || evt == EN_KILLFOCUS))) {
+                    
+                    char bufPage[64], bufUnits[32], bufOrient[32], bufW[32], bufH[32];
+                    double pW = 0, pH = 0, exact_scale;
+                    char *p1, *p2;
+                    int i, gW = gridW, gH = gridH;
+                    double std_scales[] = {1.0, 0.5, 0.25, 0.2, 0.1, 0.05, 0.04, 0.025, 0.02, 0.01, 0.005, 0.002, 0.001};
+                    const char* std_scale_strs[] = {"1:1", "1:2", "1:4", "1:5", "1:10", "1:20", "1:25", "1:40", "1:50", "1:100", "1:200", "1:500", "1:1000"};
+                    int chosen_idx = 12;
+                    double unitFactor = 1.0;
+
+                    if (cmd == 101 && evt == CBN_SELCHANGE) {
+                        int idx = SendMessage(hComboPage, CB_GETCURSEL, 0, 0);
+                        if (idx != CB_ERR) SendMessage(hComboPage, CB_GETLBTEXT, idx, (LPARAM)bufPage);
+                        else GetWindowText(hComboPage, bufPage, 64);
+                    } else { GetWindowText(hComboPage, bufPage, 64); }
+                    
+                    if (cmd == 107 && evt == CBN_SELCHANGE) {
+                        int idx = SendMessage(hComboOrient, CB_GETCURSEL, 0, 0);
+                        if (idx != CB_ERR) SendMessage(hComboOrient, CB_GETLBTEXT, idx, (LPARAM)bufOrient);
+                        else GetWindowText(hComboOrient, bufOrient, 32);
+                    } else { GetWindowText(hComboOrient, bufOrient, 32); }
+
+                    if (cmd == 102 && evt == CBN_SELCHANGE) {
+                        int idx = SendMessage(hComboUnits, CB_GETCURSEL, 0, 0);
+                        if (idx != CB_ERR) SendMessage(hComboUnits, CB_GETLBTEXT, idx, (LPARAM)bufUnits);
+                        else GetWindowText(hComboUnits, bufUnits, 32);
+                    } else { GetWindowText(hComboUnits, bufUnits, 32); }
+
+                    GetWindowText(hEditW, bufW, 32); if (atoi(bufW) > 0) gW = atoi(bufW);
+                    GetWindowText(hEditH, bufH, 32); if (atoi(bufH) > 0) gH = atoi(bufH);
+
+                    if (strcmp(bufUnits, "cm") == 0) unitFactor = 10.0;
+                    else if (strcmp(bufUnits, "m") == 0) unitFactor = 1000.0;
+                    else if (strcmp(bufUnits, "inches") == 0 || strcmp(bufUnits, "feet-inches") == 0) unitFactor = 25.4;
+                    else if (strcmp(bufUnits, "feet") == 0) unitFactor = 304.8;
+                    else unitFactor = 1.0;
+
+                    p1 = strchr(bufPage, '(');
+                    if (p1) {
+                        p2 = strchr(p1, 'x');
+                        if (p2) { pW = atof(p1 + 1); pH = atof(p2 + 1); }
+                    }
+
+                    if (pW > 0 && pH > 0 && gW > 0 && gH > 0) {
+                        exact_scale = fmin(pW / (gW * unitFactor), pH / (gH * unitFactor));
+                        for (i = 0; i < 13; i++) {
+                            if (std_scales[i] <= exact_scale) { chosen_idx = i; break; }
+                        }
+                        SetWindowText(hComboScale, std_scale_strs[chosen_idx]);
+                    }
+                }
             }
             break;
-        case WM_DESTROY: hPageSizeDlg = NULL; break;
+        case WM_DESTROY: hPageSizeDlg = NULL; hComboPage = NULL; hComboUnits = NULL; hComboScale = NULL; hComboOrient = NULL; break;
         default: return DefWindowProc(hwnd, msg, wParam, lParam);
     }
     return 0;
@@ -588,16 +847,29 @@ void SilentLoadC(const char* path, RefCache* ref) {
 
         while (st < endBlock && ref->shapeCount < MAX_SHAPES) {
             char *pt = strstr(st, "POINT "), *lStr = strstr(st, "L(");
+            char *ext = strstr(st, "EXT_REF("); 
             char *tag = strstr(st, "TAG_TEXT("), *dim = strstr(st, "DIMENSION(");
             char *colorSearch, *next = pt ? pt : lStr;
             Shape* s = &ref->shapes[ref->shapeCount];
 
             if (lStr && (!next || lStr < next)) next = lStr;
+            if (ext && (!next || ext < next)) next = ext; 
             if (tag && (!next || tag < next)) next = tag;
             if (dim && (!next || dim < next)) next = dim;
             if (!next || next >= endBlock) break;
 
-            if (next == dim) { st = strchr(next, ';'); if (!st) st = next + 1; continue; }
+            if (next == dim) { 
+                int s1, p1, s2, p2, md; double off, tp;
+                if (sscanf(next, "DIMENSION(%d , %d , %d , %d , %lf , %lf , %d)", &s1, &p1, &s2, &p2, &off, &tp, &md) == 7) {
+                    if (ref->dimCount < MAX_DIMS) {
+                        ref->dims[ref->dimCount].s1 = s1; ref->dims[ref->dimCount].p1 = p1;
+                        ref->dims[ref->dimCount].s2 = s2; ref->dims[ref->dimCount].p2 = p2;
+                        ref->dims[ref->dimCount].offset = off; ref->dims[ref->dimCount].textPos = tp;
+                        ref->dims[ref->dimCount].mode = md; ref->dimCount++;
+                    }
+                }
+                st = strchr(next, ';'); if (!st) st = next + 1; continue; 
+            }
 
             memset(s, 0, sizeof(Shape));
             s->useFill = 1; s->useStroke = 1; s->fill = RGB(128, 128, 128); s->stroke = RGB(0, 0, 0);
@@ -627,6 +899,30 @@ void SilentLoadC(const char* path, RefCache* ref) {
             } else if (next == lStr) {
                 s->type = 1; s->ptCount = 2;
                 if (sscanf(next, "L(%lf,%lf,%lf,%lf)", &s->ptsX[0], &s->ptsY[0], &s->ptsX[1], &s->ptsY[1]) == 4) ref->shapeCount++;
+            } else if (next == ext) {
+                static char refStr[128]; static char tagStr[256]; tagStr[0] = '\0';
+                char* pOpen = strchr(next, '(');
+                char* q1 = pOpen ? FindQuote(pOpen) : NULL;
+                char* q2 = q1 ? FindQuote(q1 + 1) : NULL;
+                if (pOpen && q1 && q2) {
+                    char* comma1 = strchr(pOpen + 1, ',');
+                    int rLen = q2 - (q1 + 1); if (rLen > 127) rLen = 127;
+                    strncpy(refStr, q1 + 1, rLen); refStr[rLen] = '\0';
+                    
+                    char* comma3 = q2 ? strchr(q2 + 1, ',') : NULL;
+                    if (comma3) {
+                        char* q3 = FindQuote(comma3);
+                        char* q4 = q3 ? FindQuote(q3 + 1) : NULL;
+                        if (q3 && q4) {
+                            int tLen = q4 - (q3 + 1); if (tLen > 255) tLen = 255;
+                            strncpy(tagStr, q3 + 1, tLen); tagStr[tLen] = '\0';
+                        }
+                    }
+                    s->type = 3; s->ptsX[0] = atof(pOpen + 1); s->ptsY[0] = comma1 ? atof(comma1 + 1) : 0.0;
+                    s->ptCount = 1; strcpy(s->text, refStr); 
+                    UnescapeCString(tagStr, s->tagData, 128);
+                    ref->shapeCount++;
+                }
             } else if (next == tag) {
                 char* pOpen = strchr(next, '(');
                 char* q1 = pOpen ? FindQuote(pOpen) : NULL;
@@ -854,9 +1150,16 @@ LRESULT CALLBACK _export TagEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                     
                     if (pathLen > 0 && pathLen < 260 && strncmp(shapes[i].text, "{{EXT_REF=", 10) == 0) {
                         char absPath[260]; int rIdx; char baseForResolve[260];
+                        char fileName[64]; char* slash;
+
                         strncpy(refPath, shapes[i].text + 10, pathLen);
                         refPath[pathLen] = '\0';
                         while(pathLen > 0 && isspace((unsigned char)refPath[pathLen-1])) refPath[--pathLen] = '\0';
+                        
+                        slash = strrchr(refPath, '\\');
+                        if (!slash) slash = strrchr(refPath, '/');
+                        strncpy(fileName, slash ? slash + 1 : refPath, 63);
+                        fileName[63] = '\0';
                         
                         GetResolveBase(baseForResolve);
                         ResolvePath(baseForResolve, refPath, absPath);
@@ -868,7 +1171,7 @@ LRESULT CALLBACK _export TagEditorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                                     editMap[editMapCount].isRef = 1;
                                     editMap[editMapCount].shapeIdx = i;
                                     editMap[editMapCount].tagIdx = refTagIdx;
-                                    sprintf(editMap[editMapCount].label, "[Ref] TAG%d", refTagIdx + 1);
+                                    sprintf(editMap[editMapCount].label, "[%s] TAG%d", fileName, refTagIdx + 1);
                                     GetPipeValue(shapes[i].tagData, refTagIdx, editMap[editMapCount].value, 128);
                                     editMapCount++;
                                     refTagIdx++;
@@ -974,7 +1277,7 @@ void UpdateStatusBar(void) {
 void RedrawCanvas(HWND hwnd) {
     RECT r;
     r.left = 0; r.top = 0;
-    r.right = clientW - PANEL_WIDTH + 14;
+    r.right = clientW - PANEL_WIDTH; 
     r.bottom = clientH - 20; 
     InvalidateRect(hwnd, &r, TRUE); 
 }
@@ -1051,6 +1354,10 @@ void CommitCurrentIcon(void) {
         
         parsedIcons[currentIconIdx].dimCount = dimCount;
         for(i=0; i<dimCount; i++) parsedIcons[currentIconIdx].dims[i] = dims[i];
+
+        strcpy(parsedIcons[currentIconIdx].pageName, activePageName);
+        strcpy(parsedIcons[currentIconIdx].unitName, activeUnitName);
+        parsedIcons[currentIconIdx].pageScale = activePageScale;
     }
 }
 
@@ -1073,7 +1380,22 @@ void SwitchToIcon(int idx) {
         
         dimCount = parsedIcons[idx].dimCount;
         for(i=0; i<dimCount; i++) dims[i] = parsedIcons[idx].dims[i];
-    } else { shapeCount = 0; dimCount = 0; tagCount = 0; }
+        
+        if (parsedIcons[idx].pageName[0] == '\0') {
+            strcpy(activePageName, "A4 (210x297)");
+            strcpy(activeUnitName, "mm");
+            activePageScale = 1.0;
+        } else {
+            strcpy(activePageName, parsedIcons[idx].pageName);
+            strcpy(activeUnitName, parsedIcons[idx].unitName);
+            activePageScale = parsedIcons[idx].pageScale;
+        }
+    } else { 
+        shapeCount = 0; dimCount = 0; tagCount = 0; 
+        strcpy(activePageName, "A4 (210x297)");
+        strcpy(activeUnitName, "mm");
+        activePageScale = 1.0;
+    }
     
     undoIndex = -1; ClearSelection(); selectedShape = -1;
     if (shapeCount == 0) currentMode = 3; else currentMode = 0;
@@ -1101,13 +1423,16 @@ void LoadCFile(const char* path, HWND hwnd) {
         fread(d, 1, (size_t)sz, f); d[sz] = '\0'; fclose(f); cur = d;
 
         while ((cur = strstr(cur, "case ")) != NULL && parsedCount < MAX_ICONS) {
+            char tmpPageName[64]; char tmpUnitName[32]; double tmpPageScale;
             cId = atoi(cur + 5); endBlock = strstr(cur, "break;");
             tmpCount = 0; tmpDimCount = 0; st = cur;
+            strcpy(tmpPageName, "A4 (210x297)"); strcpy(tmpUnitName, "mm"); tmpPageScale = 1.0;
             if (!endBlock) endBlock = cur + strlen(cur);
 
             while (st < endBlock && tmpCount < MAX_SHAPES) {
                 char* colorSearch; Shape* s = &dragStartSnapshot[tmpCount];
                 char *dim = strstr(st, "DIMENSION(");
+                char *pgDef = strstr(st, "PAGE_DEF(");
                 pt = strstr(st, "POINT "); lStr = strstr(st, "L(");
                 ext = strstr(st, "EXT_REF("); tag = strstr(st, "TAG_TEXT(");
 
@@ -1116,20 +1441,40 @@ void LoadCFile(const char* path, HWND hwnd) {
                 if (ext && (!next || ext < next)) next = ext;
                 if (tag && (!next || tag < next)) next = tag;
                 if (dim && (!next || dim < next)) next = dim;
+                if (pgDef && (!next || pgDef < next)) next = pgDef;
                 if (!next || next >= endBlock) break;
 
-                if (next == dim) {
-                    int s1, p1, s2, p2, md; double off, tp;
-                    if (sscanf(next, "DIMENSION(%d , %d , %d , %d , %lf , %lf , %d)", &s1, &p1, &s2, &p2, &off, &tp, &md) == 7) {
-                        if (tmpDimCount < MAX_DIMS) {
-                            tmpDims[tmpDimCount].s1 = s1; tmpDims[tmpDimCount].p1 = p1;
-                            tmpDims[tmpDimCount].s2 = s2; tmpDims[tmpDimCount].p2 = p2;
-                            tmpDims[tmpDimCount].offset = off; tmpDims[tmpDimCount].textPos = tp;
-                            tmpDims[tmpDimCount].mode = md; tmpDimCount++;
+                if (next == pgDef) {
+                    char* pOpen = strchr(next, '(');
+                    char* q1 = pOpen ? FindQuote(pOpen) : NULL;
+                    char* q2 = q1 ? FindQuote(q1 + 1) : NULL;
+                    if (q2) {
+                        char* q3 = FindQuote(q2 + 1);
+                        char* q4 = q3 ? FindQuote(q3 + 1) : NULL;
+                        char* comma = q4 ? strchr(q4 + 1, ',') : NULL;
+                        if (q1 && q2 && q3 && q4 && comma) {
+                            int l1 = q2 - (q1 + 1); if (l1 > 63) l1 = 63;
+                            strncpy(tmpPageName, q1 + 1, l1); tmpPageName[l1] = '\0';
+                            int l2 = q4 - (q3 + 1); if (l2 > 31) l2 = 31;
+                            strncpy(tmpUnitName, q3 + 1, l2); tmpUnitName[l2] = '\0';
+                            tmpPageScale = atof(comma + 1);
                         }
                     }
                     st = strchr(next, ';'); if (!st) st = next + 1; continue;
                 }
+
+if (next == dim) { 
+    int s1, p1, s2, p2, md; double off, tp;
+    if (sscanf(next, "DIMENSION(%d , %d , %d , %d , %lf , %lf , %d)", &s1, &p1, &s2, &p2, &off, &tp, &md) == 7) {
+        if (tmpDimCount < MAX_DIMS) {
+            tmpDims[tmpDimCount].s1 = s1; tmpDims[tmpDimCount].p1 = p1;
+            tmpDims[tmpDimCount].s2 = s2; tmpDims[tmpDimCount].p2 = p2;
+            tmpDims[tmpDimCount].offset = off; tmpDims[tmpDimCount].textPos = tp;
+            tmpDims[tmpDimCount].mode = md; tmpDimCount++;
+        }
+    }
+    st = strchr(next, ';'); if (!st) st = next + 1; continue; 
+}
 
                 memset(s, 0, sizeof(Shape));
                 s->useFill = 1; s->useStroke = 1; s->fill = RGB(128, 128, 128); s->stroke = RGB(0, 0, 0);
@@ -1242,6 +1587,10 @@ void LoadCFile(const char* path, HWND hwnd) {
             parsedIcons[parsedCount].dimCount = tmpDimCount;
             for(i=0; i<tmpDimCount; i++) parsedIcons[parsedCount].dims[i] = tmpDims[i];
             
+            strcpy(parsedIcons[parsedCount].pageName, tmpPageName);
+            strcpy(parsedIcons[parsedCount].unitName, tmpUnitName);
+            parsedIcons[parsedCount].pageScale = tmpPageScale;
+            
             if (tmpCount > 0) {
                 exact = (Shape*)GlobalAllocPtr(GHND, tmpCount * sizeof(Shape));
                 if (exact) { memcpy(exact, dragStartSnapshot, tmpCount * sizeof(Shape)); parsedIcons[parsedCount].shapes = exact; } 
@@ -1349,7 +1698,7 @@ void LoadCFile(const char* path, HWND hwnd) {
 void DoSaveFile(HWND hwnd) {
     FILE* f; int i, j;
     static OPENFILENAME ofn; static char szFile[260]; 
-    static char savePath[260]; /* Use static to clear Win16 Stack Size */
+    static char savePath[260];
     
     if (loadedCFile[0] != '\0') {
         for (i = 0; i < refCacheCount; i++) {
@@ -1381,6 +1730,11 @@ void DoSaveFile(HWND hwnd) {
             Dimension* iconDims = (i == currentIconIdx) ? dims : parsedIcons[i].dims;
             
             fprintf(f, "case %d: {\n", parsedIcons[i].caseId);
+            fprintf(f, "    PAGE_DEF(\"%s\", \"%s\", %g);\n", 
+                    parsedIcons[i].pageName[0] ? parsedIcons[i].pageName : "A4 (210x297)", 
+                    parsedIcons[i].unitName[0] ? parsedIcons[i].unitName : "mm", 
+                    parsedIcons[i].pageScale != 0 ? parsedIcons[i].pageScale : 1.0);
+
             if (iconShapes) {
                 for (j = 0; j < iconShapeCount; j++) {
                     WriteShapeToC(f, &iconShapes[j], j);
@@ -1904,15 +2258,45 @@ void RenderShapes(HDC dc, Shape* sArr, int sCnt, double sc, int offX, int offY, 
 
                     for (r = 0; r < refCache[rIdx].shapeCount; r++) {
                         Shape* sub = &refCache[rIdx].shapes[r];
-                        if (sub->type == 3) continue;
+                        
+                        if (sub->type == 3) {
+                            if (g_RenderRefDepth < 3 && strncmp(sub->text, "{{EXT_REF=", 10) == 0) {
+                                Shape tempRef = *sub;
+                                char subPath[260]; double subSc = 1.0, subRot = 0.0;
+                                char *spS = strstr(sub->text, " scale="), *spR = strstr(sub->text, " rot="), *spE = strstr(sub->text, "}}");
+                                int sLen;
+                                
+                                if (spS) sLen = (int)(spS - (sub->text + 10)); else if (spE) sLen = (int)(spE - (sub->text + 10)); else sLen = strlen(sub->text + 10);
+                                if (sLen > 0 && sLen < 260) {
+                                    strncpy(subPath, sub->text + 10, sLen); subPath[sLen] = '\0';
+                                    while (sLen > 0 && isspace((unsigned char)subPath[sLen - 1])) subPath[--sLen] = '\0';
+                                    if (spS) sscanf(spS, " scale=%lf", &subSc);
+                                    if (spR) sscanf(spR, " rot=%lf", &subRot);
+                                    
+                                    {
+                                        double dx = (sub->ptsX[0] - lcx) * refScale;
+                                        double dy = (sub->ptsY[0] - lcy) * refScale;
+                                        tempRef.ptsX[0] = objCx + dx * cosR - dy * sinR;
+                                        tempRef.ptsY[0] = objCy + dx * sinR + dy * cosR;
+                                        sprintf(tempRef.text, "{{EXT_REF=%s scale=%.2f rot=%.2f}}", subPath, subSc * refScale, subRot + refRot);
+                                        
+                                        g_RenderRefDepth++;
+                                        RenderShapes(dc, &tempRef, 1, sc, offX, offY, NULL, 0, isPreview);
+                                        g_RenderRefDepth--;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
 
                         if (sub->type == 4) {
+                            double dx = (sub->ptsX[0] - lcx) * refScale;
+                            double dy = (sub->ptsY[0] - lcy) * refScale;
+                            double wx = objCx + dx * cosR - dy * sinR;
+                            double wy = objCy + dx * sinR + dy * cosR;
+                            
                             if (!isPreview) {
                                 char tagBuf[128]; RECT rTag = {0, 0, 0, 0};
-                                double dx = (sub->ptsX[0] - lcx) * refScale;
-                                double dy = (sub->ptsY[0] - lcy) * refScale;
-                                double wx = objCx + dx * cosR - dy * sinR;
-                                double wy = objCy + dx * sinR + dy * cosR;
                                 int tx = offX + (int)round(wx * sc);
                                 int ty = offY + (int)round(wy * sc);
                                 
@@ -1931,8 +2315,16 @@ void RenderShapes(HDC dc, Shape* sArr, int sCnt, double sc, int offX, int offY, 
                                     strcpy(tagBuf, cleanTag);
                                 }
 
+                                if (strcmp(tagBuf, "SHEETSCALE") == 0) {
+                                    if (activePageScale > 0 && activePageScale <= 1.0) {
+                                        sprintf(tagBuf, "1:%g", 1.0 / activePageScale);
+                                    } else {
+                                        sprintf(tagBuf, "%g", activePageScale);
+                                    }
+                                }
+
                                 int fSize = sub->fontSize > 0 ? sub->fontSize : 24;
-                                int fH = (int)(fSize * refScale * viewZoom);
+                                int fH = (int)(fSize * refScale * (sc / 10.0));
                                 if (fH < 2) fH = 2;
                                 HFONT hFont = CreateFont(fH, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
                                 HGDIOBJ oldFont = SelectObject(dc, hFont);
@@ -1967,10 +2359,10 @@ void RenderShapes(HDC dc, Shape* sArr, int sCnt, double sc, int offX, int offY, 
                                     textHits[textHitCount].box = rTag;
                                     textHitCount++;
                                 }
-                                
-                                if (currentPt < MAX_POINTS) {
-                                    s->ptsX[currentPt] = wx; s->ptsY[currentPt] = wy; currentPt++;
-                                }
+                            }
+                            
+                            if (currentPt < MAX_POINTS) {
+                                s->ptsX[currentPt] = wx; s->ptsY[currentPt] = wy; currentPt++;
                             }
                             refTagIdx++;
                         } else {
@@ -2001,6 +2393,121 @@ void RenderShapes(HDC dc, Shape* sArr, int sCnt, double sc, int offX, int offY, 
                             SelectObject(dc, ob); SelectObject(dc, op);
                             if (sub->useFill) DeleteObject(b); if (sub->useStroke) DeleteObject(p);
                         }
+                    }
+
+                    if (!isPreview && refCache[rIdx].dimCount > 0) {
+                        int dIdx;
+                        HPEN hDimPen = CreatePen(PS_SOLID, 1, RGB(0, 128, 255));
+                        HBRUSH hDimBr = CreateSolidBrush(RGB(0, 128, 255));
+                        int fSize = (int)(14 * refScale * (sc / 10.0));
+                        HFONT hDimFont;
+                        HGDIOBJ oldPen2, oldBr2, oldFont2;
+
+                        if (fSize < 2) fSize = 2;
+                        hDimFont = CreateFont(fSize, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
+                        
+                        oldPen2 = SelectObject(dc, hDimPen);
+                        oldBr2 = SelectObject(dc, hDimBr);
+                        oldFont2 = SelectObject(dc, hDimFont);
+                        
+                        SetTextColor(dc, RGB(0, 128, 255));
+                        SetBkMode(dc, TRANSPARENT);
+
+                        for (dIdx = 0; dIdx < refCache[rIdx].dimCount; dIdx++) {
+                            Dimension* d = &refCache[rIdx].dims[dIdx];
+                            if (d->s1 < refCache[rIdx].shapeCount && d->s2 < refCache[rIdx].shapeCount) {
+                                double lA1x = refCache[rIdx].shapes[d->s1].ptsX[d->p1];
+                                double lA1y = refCache[rIdx].shapes[d->s1].ptsY[d->p1];
+                                double lA2x = refCache[rIdx].shapes[d->s2].ptsX[d->p2];
+                                double lA2y = refCache[rIdx].shapes[d->s2].ptsY[d->p2];
+                                
+                                double dX = lA2x - lA1x, dY = lA2y - lA1y;
+                                double val;
+                                
+                                double sOffset = d->offset * refScale * sc;
+                                double dx_r, dy_r, gA1x, gA1y, gA2x, gA2y;
+                                int sA1x, sA1y, sA2x, sA2y, sD1x, sD1y, sD2x, sD2y, sMidX, sMidY;
+
+                                dx_r = (lA1x - lcx) * refScale; dy_r = (lA1y - lcy) * refScale;
+                                gA1x = objCx + (dx_r * cosR - dy_r * sinR); gA1y = objCy + (dx_r * sinR + dy_r * cosR);
+                                dx_r = (lA2x - lcx) * refScale; dy_r = (lA2y - lcy) * refScale;
+                                gA2x = objCx + (dx_r * cosR - dy_r * sinR); gA2y = objCy + (dx_r * sinR + dy_r * cosR);
+
+                                sA1x = offX + (int)round(gA1x * sc); sA1y = offY + (int)round(gA1y * sc);
+                                sA2x = offX + (int)round(gA2x * sc); sA2y = offY + (int)round(gA2y * sc);
+
+                                if (d->mode == 0) {
+                                    double sDX = sA2x - sA1x, sDY = sA2y - sA1y;
+                                    double ang = atan2(sDY, sDX);
+                                    double nX = -sin(ang), nY = cos(ang);
+                                    sD1x = sA1x + (int)round(nX * sOffset);
+                                    sD1y = sA1y + (int)round(nY * sOffset);
+                                    sD2x = sA2x + (int)round(nX * sOffset);
+                                    sD2y = sA2y + (int)round(nY * sOffset);
+                                    val = sqrt(dX*dX + dY*dY) * refScale;
+                                } else if (d->mode == 1) {
+                                    sD1x = sA1x; sD1y = sA1y + (int)round(sOffset);
+                                    sD2x = sA2x; sD2y = sA1y + (int)round(sOffset);
+                                    val = fabs(dX) * refScale;
+                                } else {
+                                    sD1x = sA1x + (int)round(sOffset); sD1y = sA1y;
+                                    sD2x = sA1x + (int)round(sOffset); sD2y = sA2y;
+                                    val = fabs(dY) * refScale;
+                                }
+
+                                {
+                                    double L1dx = sD1x - sA1x, L1dy = sD1y - sA1y;
+                                    double L1len = sqrt(L1dx*L1dx + L1dy*L1dy);
+                                    if (L1len > 5.0) {
+                                        MoveTo(dc, sA1x + (int)round(L1dx/L1len*5.0), sA1y + (int)round(L1dy/L1len*5.0));
+                                        LineTo(dc, sD1x + (int)round(L1dx/L1len*2.0), sD1y + (int)round(L1dy/L1len*2.0));
+                                    }
+                                    double L2dx = sD2x - sA2x, L2dy = sD2y - sA2y;
+                                    double L2len = sqrt(L2dx*L2dx + L2dy*L2dy);
+                                    if (L2len > 5.0) {
+                                        MoveTo(dc, sA2x + (int)round(L2dx/L2len*5.0), sA2y + (int)round(L2dy/L2len*5.0));
+                                        LineTo(dc, sD2x + (int)round(L2dx/L2len*2.0), sD2y + (int)round(L2dy/L2len*2.0));
+                                    }
+                                }
+
+                                MoveTo(dc, sD1x, sD1y); LineTo(dc, sD2x, sD2y);
+
+                                {
+                                    double dimDx = sD2x - sD1x, dimDy = sD2y - sD1y;
+                                    double dimLen = sqrt(dimDx*dimDx + dimDy*dimDy);
+                                    if (dimLen > 0) {
+                                        double dirX = dimDx/dimLen, dirY = dimDy/dimLen;
+                                        POINT pts[3];
+                                        pts[0].x = sD1x; pts[0].y = sD1y;
+                                        pts[1].x = sD1x + (int)round(dirX*10 - dirY*3); pts[1].y = sD1y + (int)round(dirY*10 + dirX*3);
+                                        pts[2].x = sD1x + (int)round(dirX*10 + dirY*3); pts[2].y = sD1y + (int)round(dirY*10 - dirX*3);
+                                        Polygon(dc, pts, 3);
+                                        
+                                        pts[0].x = sD2x; pts[0].y = sD2y;
+                                        pts[1].x = sD2x - (int)round(dirX*10 - dirY*3); pts[1].y = sD2y - (int)round(dirY*10 + dirX*3);
+                                        pts[2].x = sD2x - (int)round(dirX*10 + dirY*3); pts[2].y = sD2y - (int)round(dirY*10 - dirX*3);
+                                        Polygon(dc, pts, 3);
+                                    }
+                                }
+
+                                sMidX = sD1x + (int)round((sD2x - sD1x) * d->textPos);
+                                sMidY = sD1y + (int)round((sD2y - sD1y) * d->textPos);
+
+                                char buf[64];
+                                FormatDimension(val, activeUnitName, buf);
+                                DWORD ext = GetTextExtent(dc, buf, strlen(buf));
+                                int tW = LOWORD(ext); int tH = HIWORD(ext);
+                                int tx = sMidX - tW/2; int ty = sMidY - tH/2;
+                                RECT tR;
+                                tR.left = tx - 2; tR.top = ty - 2; tR.right = tx + tW + 2; tR.bottom = ty + tH + 2;
+                                
+                                FillRect(dc, &tR, (HBRUSH)GetStockObject(WHITE_BRUSH));
+                                TextOut(dc, tx, ty, buf, strlen(buf));
+                            }
+                        }
+                        SelectObject(dc, oldPen2); DeleteObject(hDimPen);
+                        SelectObject(dc, oldBr2); DeleteObject(hDimBr);
+                        SelectObject(dc, oldFont2); DeleteObject(hDimFont);
                     }
 
                     bx[0] = refCache[rIdx].minX; by[0] = refCache[rIdx].minY;
@@ -2042,8 +2549,16 @@ void RenderShapes(HDC dc, Shape* sArr, int sCnt, double sc, int offX, int offY, 
                     strcpy(dispT, s->text);
                 }
 
+                if (strcmp(dispT, "SHEETSCALE") == 0) {
+                    if (activePageScale > 0 && activePageScale <= 1.0) {
+                        sprintf(dispT, "1:%g", 1.0 / activePageScale);
+                    } else {
+                        sprintf(dispT, "%g", activePageScale);
+                    }
+                }
+
                 int fSize = s->fontSize > 0 ? s->fontSize : 24;
-                int fH = (int)(fSize * viewZoom);
+                int fH = (int)(fSize * (sc / 10.0));
                 if (fH < 2) fH = 2;
                 HFONT hFont = CreateFont(fH, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
                 HGDIOBJ oldFont = SelectObject(dc, hFont);
@@ -2098,23 +2613,32 @@ void RenderShapes(HDC dc, Shape* sArr, int sCnt, double sc, int offX, int offY, 
 }
 
 void DrawPreview(HDC dc) {
+    static HBITMAP hbmPrev = NULL;
+    static HDC memDC = NULL;
     int cx = clientW - PANEL_WIDTH + 15;
     int px = cx + 220, py = 420; 
-    HBRUSH hBr = (HBRUSH)GetStockObject(WHITE_BRUSH);
-    HPEN hPen = (HPEN)GetStockObject(BLACK_PEN);
-    HGDIOBJ hOldBr = SelectObject(dc, hBr);
-    HGDIOBJ hOldPen = SelectObject(dc, hPen);
     
-    Rectangle(dc, px, py, px + 34, py + 34);
-    SelectObject(dc, hOldBr); SelectObject(dc, hOldPen);
-    
-    if (shapes) {
-        double pScaleX = 32.0 / gridW;
-        double pScaleY = 32.0 / gridH;
-        double pScale = fmin(pScaleX, pScaleY);
-        RenderShapes(dc, shapes, shapeCount, pScale, px + 1, py + 1, NULL, 0, 1);
+    if (!memDC) {
+        memDC = CreateCompatibleDC(dc);
+        hbmPrev = CreateCompatibleBitmap(dc, 34, 34);
+        SelectObject(memDC, hbmPrev);
     }
-    SetBkMode(dc, TRANSPARENT); 
+    
+    if (previewDirty) {
+        RECT r; r.left = 0; r.top = 0; r.right = 34; r.bottom = 34;
+        FillRect(memDC, &r, (HBRUSH)GetStockObject(WHITE_BRUSH));
+        FrameRect(memDC, &r, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        
+        if (shapes) {
+            double pScaleX = 32.0 / gridW;
+            double pScaleY = 32.0 / gridH;
+            double pScale = fmin(pScaleX, pScaleY);
+            RenderShapes(memDC, shapes, shapeCount, pScale, 1, 1, NULL, 0, 1);
+        }
+        previewDirty = 0;
+    }
+    
+    BitBlt(dc, px, py, 34, 34, memDC, 0, 0, SRCCOPY);
 }
 
 void DrawNodes(HDC dc) {
@@ -2172,9 +2696,10 @@ void DrawDimensions(HDC dc) {
         double A1x, A1y, A2x, A2y;
         double D1x, D1y, D2x, D2y;
         double dx, dy, ang, nx, ny, val;
-        char buf[32];
+        double scOffset;
+        char buf[64];
         
-        if (dims[i].s1 >= shapeCount || dims[i].s2 >= shapeCount) continue;
+        if (dims[i].s1 < 0 || dims[i].s1 >= shapeCount || dims[i].s2 < 0 || dims[i].s2 >= shapeCount) continue;
         if (shapes[dims[i].s1].type != 3 && dims[i].p1 >= shapes[dims[i].s1].ptCount) continue;
         if (shapes[dims[i].s2].type != 3 && dims[i].p2 >= shapes[dims[i].s2].ptCount) continue;
 
@@ -2184,24 +2709,25 @@ void DrawDimensions(HDC dc) {
         A2y = shapes[dims[i].s2].ptsY[dims[i].p2] * (scaleFactor * viewZoom) + viewPanY;
         
         dx = A2x - A1x; dy = A2y - A1y;
+        scOffset = dims[i].offset * (scaleFactor * viewZoom);
         
         if (dims[i].mode == 0) { 
             ang = atan2(dy, dx);
             nx = -sin(ang); ny = cos(ang);
-            D1x = A1x + nx * dims[i].offset; D1y = A1y + ny * dims[i].offset;
-            D2x = A2x + nx * dims[i].offset; D2y = A2y + ny * dims[i].offset;
+            D1x = A1x + nx * scOffset; D1y = A1y + ny * scOffset;
+            D2x = A2x + nx * scOffset; D2y = A2y + ny * scOffset;
             val = sqrt(pow(shapes[dims[i].s2].ptsX[dims[i].p2] - shapes[dims[i].s1].ptsX[dims[i].p1], 2) + pow(shapes[dims[i].s2].ptsY[dims[i].p2] - shapes[dims[i].s1].ptsY[dims[i].p1], 2));
         } else if (dims[i].mode == 1) { 
-            D1x = A1x; D1y = A1y + dims[i].offset;
-            D2x = A2x; D2y = A1y + dims[i].offset;
+            D1x = A1x; D1y = A1y + scOffset;
+            D2x = A2x; D2y = A1y + scOffset;
             val = fabs(shapes[dims[i].s2].ptsX[dims[i].p2] - shapes[dims[i].s1].ptsX[dims[i].p1]);
         } else { 
-            D1x = A1x + dims[i].offset; D1y = A1y;
-            D2x = A1x + dims[i].offset; D2y = A2y;
+            D1x = A1x + scOffset; D1y = A1y;
+            D2x = A1x + scOffset; D2y = A2y;
             val = fabs(shapes[dims[i].s2].ptsY[dims[i].p2] - shapes[dims[i].s1].ptsY[dims[i].p1]);
         }
         
-        sprintf(buf, "%.2f", val);
+        FormatDimension(val, activeUnitName, buf);
 
         {
             double L1dx = D1x - A1x, L1dy = D1y - A1y;
@@ -2349,6 +2875,9 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             parsedCount = 1; currentIconIdx = -1; currentCaseId = 1;
             parsedIcons[0].caseId = 1; strcpy(parsedIcons[0].name, "New");
             parsedIcons[0].shapes = NULL; parsedIcons[0].shapeCount = 0; parsedIcons[0].dimCount = 0; parsedIcons[0].tCount = 0;
+            strcpy(parsedIcons[0].pageName, "A4 (210x297)");
+            strcpy(parsedIcons[0].unitName, "mm");
+            parsedIcons[0].pageScale = 1.0;
 
             hStatus = CreateWindow("STATIC", " Ready", WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 0, 0, hwnd, (HMENU)100, hInst, NULL);
             hScrlSides = CreateWindow("SCROLLBAR", "", WS_CHILD|WS_VISIBLE|SBS_HORZ, 0,0,1,1, hwnd, (HMENU)153, hInst, NULL);
@@ -2513,34 +3042,37 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             if (wParam == VK_RETURN) {
                 if (currentMode == 0 && selOrderCount == 2) { SendMessage(hwnd, WM_COMMAND, 222, 0); return 0; } 
                 if (isDrawing && (currentMode >= 3 && currentMode <= 5) && currentShape.ptCount >= 2) { 
-                    SaveState(); shapes[shapeCount++] = currentShape; isDrawing = 0; currentShape.ptCount = 0; selectedShape = shapeCount - 1; currentMode = 0; UpdateStatusBar(); RedrawCanvas(hwnd); 
+                    currentShape.ptCount--; 
+                    if (currentShape.ptCount >= (currentMode == 3 ? 3 : 2)) {
+                        SaveState(); shapes[shapeCount++] = currentShape; isDrawing = 0; currentShape.ptCount = 0; selectedShape = shapeCount - 1; currentMode = 0; UpdateStatusBar(); RedrawCanvas(hwnd); 
+                    } else {
+                        isDrawing = 0; currentShape.ptCount = 0; currentMode = 0; RedrawCanvas(hwnd);
+                    }
                     return 0;
                 }
             }
             if (wParam == VK_DELETE || wParam == VK_BACK) {
+                if (dragDimIdx != -1) {
+                    for(m = dragDimIdx; m < dimCount - 1; m++) {
+                        dims[m] = dims[m + 1];
+                    }
+                    dimCount--;
+                    dragDimIdx = -1;
+                    ReleaseCapture();
+                    RedrawCanvas(hwnd);
+                    return 0;
+                }
+
                 if (isDrawing && currentShape.ptCount > 0) { 
                     currentShape.ptCount--; if (currentShape.ptCount == 0) isDrawing = 0; RedrawCanvas(hwnd); 
                 }
                 else if (currentMode == 0 || currentMode == 1 || currentMode == 2 || currentMode == 27) {
                     if (currentMode == 27 && selOrderCount == 2) {
-                        int delIdx = -1;
-                        for (i = 0; i < dimCount; i++) {
-                            if ((dims[i].s1 == selOrderS[0] && dims[i].p1 == selOrderP[0] &&
-                                 dims[i].s2 == selOrderS[1] && dims[i].p2 == selOrderP[1]) ||
-                                (dims[i].s1 == selOrderS[1] && dims[i].p1 == selOrderP[1] &&
-                                 dims[i].s2 == selOrderS[0] && dims[i].p2 == selOrderP[0])) {
-                                delIdx = i; break;
-                            }
-                        }
-                        if (delIdx != -1) {
-                            SaveState();
-                            for (i = delIdx; i < dimCount - 1; i++) dims[i] = dims[i+1];
-                            dimCount--;
-                            ClearSelection();
-                            UpdateStatusBar();
-                            RedrawCanvas(hwnd);
-                            return 0;
-                        }
+                        ClearSelection();
+                        UpdateStatusBar();
+                        RedrawCanvas(hwnd);
+                        ShowStatus(" Deleting dimensions is disabled.");
+                        return 0;
                     }
 
                     if (selOrderCount > 0) {
@@ -2636,7 +3168,8 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
                 for (i = 0; i < dimCount; i++) {
                     double A1x, A1y, A2x, A2y, D1x, D1y, D2x, D2y;
-                    double midX, midY, val; char buf[32]; DWORD ext; int tW, tH, tx, ty, hx, hy;
+                    double midX, midY, val; char buf[64]; DWORD ext; int tW, tH, tx, ty, hx, hy;
+                    double scOffset;
                     
                     if (dims[i].s1 >= shapeCount || dims[i].s2 >= shapeCount) continue;
                     if (shapes[dims[i].s1].type != 3 && dims[i].p1 >= shapes[dims[i].s1].ptCount) continue;
@@ -2647,19 +3180,22 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     A2x = shapes[dims[i].s2].ptsX[dims[i].p2] * (scaleFactor * viewZoom) + viewPanX; 
                     A2y = shapes[dims[i].s2].ptsY[dims[i].p2] * (scaleFactor * viewZoom) + viewPanY;
                     
+                    scOffset = dims[i].offset * (scaleFactor * viewZoom);
+
                     if (dims[i].mode == 0) {
                         double dX = A2x - A1x, dY = A2y - A1y;
                         double ang = atan2(dY, dX); double nX = -sin(ang), nY = cos(ang);
-                        D1x = A1x + nX * dims[i].offset; D1y = A1y + nY * dims[i].offset;
-                        D2x = A2x + nX * dims[i].offset; D2y = A2y + nY * dims[i].offset;
+                        D1x = A1x + nX * scOffset; D1y = A1y + nY * scOffset;
+                        D2x = A2x + nX * scOffset; D2y = A2y + nY * scOffset;
                     } else if (dims[i].mode == 1) {
-                        D1x = A1x; D1y = A1y + dims[i].offset; D2x = A2x; D2y = A1y + dims[i].offset;
+                        D1x = A1x; D1y = A1y + scOffset; D2x = A2x; D2y = A1y + scOffset;
                     } else {
-                        D1x = A1x + dims[i].offset; D1y = A1y; D2x = A1x + dims[i].offset; D2y = A2y;
+                        D1x = A1x + scOffset; D1y = A1y; D2x = A1x + scOffset; D2y = A2y;
                     }
                     midX = D1x + (D2x - D1x) * dims[i].textPos; midY = D1y + (D2y - D1y) * dims[i].textPos;
                     
-                    sprintf(buf, "%.2f", 0.0); ext = GetTextExtent(hdc, buf, strlen(buf));
+                    FormatDimension(0.0, activeUnitName, buf);
+                    ext = GetTextExtent(hdc, buf, strlen(buf));
                     tW = LOWORD(ext); tH = HIWORD(ext); tx = (int)(midX - tW/2.0); ty = (int)(midY - tH/2.0);
                     hx = tx + tW + 8; hy = (int)midY;
                     
@@ -2814,7 +3350,8 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                                 if (dimCount < MAX_DIMS) {
                                     dims[dimCount].s1 = selOrderS[0]; dims[dimCount].p1 = selOrderP[0];
                                     dims[dimCount].s2 = selOrderS[1]; dims[dimCount].p2 = selOrderP[1];
-                                    dims[dimCount].offset = 20.0; dims[dimCount].textPos = 0.5; dims[dimCount].mode = 0;
+                                    dims[dimCount].offset = 20.0 / (scaleFactor * viewZoom); 
+                                    dims[dimCount].textPos = 0.5; dims[dimCount].mode = 0;
                                     dimCount++;
                                 }
                                 ClearSelection();
@@ -2974,18 +3511,27 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             if (dragDimIdx != -1) {
                 Dimension* dptr = &dims[dragDimIdx];
                 if (dptr->s1 < shapeCount && dptr->s2 < shapeCount) {
-                    double A1x = shapes[dptr->s1].ptsX[dptr->p1] * (scaleFactor * viewZoom) + viewPanX;
-                    double A1y = shapes[dptr->s1].ptsY[dptr->p1] * (scaleFactor * viewZoom) + viewPanY;
-                    double A2x = shapes[dptr->s2].ptsX[dptr->p2] * (scaleFactor * viewZoom) + viewPanX;
-                    double A2y = shapes[dptr->s2].ptsY[dptr->p2] * (scaleFactor * viewZoom) + viewPanY;
+                    double lA1x = shapes[dptr->s1].ptsX[dptr->p1];
+                    double lA1y = shapes[dptr->s1].ptsY[dptr->p1];
+                    double lA2x = shapes[dptr->s2].ptsX[dptr->p2];
+                    double lA2y = shapes[dptr->s2].ptsY[dptr->p2];
+                    
+                    double lMouseX = exactX;
+                    double lMouseY = exactY;
+
                     if (dptr->mode == 0) {
-                        double dimDx = A2x - A1x, dimDy = A2y - A1y; double ang = atan2(dimDy, dimDx);
-                        double nX = -sin(ang), nY = cos(ang); dptr->offset = ((x - A1x) * nX + (y - A1y) * nY);
-                        double len2 = dimDx*dimDx + dimDy*dimDy; if (len2 > 0) dptr->textPos = ((x - A1x) * dimDx + (y - A1y) * dimDy) / len2;
+                        double dimDx = lA2x - lA1x, dimDy = lA2y - lA1y; 
+                        double ang = atan2(dimDy, dimDx);
+                        double nX = -sin(ang), nY = cos(ang); 
+                        dptr->offset = ((lMouseX - lA1x) * nX + (lMouseY - lA1y) * nY);
+                        double len2 = dimDx*dimDx + dimDy*dimDy; 
+                        if (len2 > 0) dptr->textPos = ((lMouseX - lA1x) * dimDx + (lMouseY - lA1y) * dimDy) / len2;
                     } else if (dptr->mode == 1) {
-                        dptr->offset = y - A1y; double dimDx = A2x - A1x; if (dimDx != 0) dptr->textPos = (x - A1x) / dimDx;
+                        dptr->offset = lMouseY - lA1y; 
+                        double dimDx = lA2x - lA1x; if (dimDx != 0) dptr->textPos = (lMouseX - lA1x) / dimDx;
                     } else if (dptr->mode == 2) {
-                        dptr->offset = x - A1x; double dimDy = A2y - A1y; if (dimDy != 0) dptr->textPos = (y - A1y) / dimDy;
+                        dptr->offset = lMouseX - lA1x; 
+                        double dimDy = lA2y - lA1y; if (dimDy != 0) dptr->textPos = (lMouseY - lA1y) / dimDy;
                     }
                     if (dptr->textPos < 0.0) dptr->textPos = 0.0; if (dptr->textPos > 1.0) dptr->textPos = 1.0;
                     needsRedraw = 1;
@@ -3171,7 +3717,7 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             }
             
             if (needsRedraw || hoverShape != oldHoverS || hoverPt != oldHoverP || hoverSegShape != oldSegS || hoverSegPt != oldSegP) {
-                InvalidateRect(hwnd, NULL, TRUE);
+                RedrawCanvas(hwnd);
             }
             break;
         }
@@ -3268,12 +3814,13 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                         }
                     }
                 }
-            } else if (isDrawing && (currentMode >= 3 && currentMode <= 5)) { 
+} else if (isDrawing && (currentMode >= 3 && currentMode <= 5)) { 
+                currentShape.ptCount--; 
                 if (currentShape.ptCount >= (currentMode == 3 ? 3 : 2) && shapeCount < MAX_SHAPES) {
                     SaveState(); shapes[shapeCount++] = currentShape; selectedShape = shapeCount - 1; currentMode = 0;
                 }
                 currentShape.ptCount = 0; isDrawing = 0; RedrawCanvas(hwnd); 
-            } else { 
+            } else {
                 currentShape.ptCount = 0; isDrawing = 0; if (shapeCount > 0) currentMode = 0; else currentMode = 3; RedrawCanvas(hwnd); 
             }
             break;
@@ -3345,15 +3892,17 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     A2x = shapes[dims[i].s2].ptsX[dims[i].p2] * (scaleFactor * viewZoom) + viewPanX;
                     A2y = shapes[dims[i].s2].ptsY[dims[i].p2] * (scaleFactor * viewZoom) + viewPanY;
                     
+                    double scOffset = dims[i].offset * (scaleFactor * viewZoom);
+
                     if (dims[i].mode == 0) {
                         dX = A2x - A1x; dY = A2y - A1y;
                         ang = atan2(dY, dX); nX = -sin(ang); nY = cos(ang);
-                        D1x = A1x + nX * dims[i].offset; D1y = A1y + nY * dims[i].offset;
-                        D2x = A2x + nX * dims[i].offset; D2y = A2y + nY * dims[i].offset;
+                        D1x = A1x + nX * scOffset; D1y = A1y + nY * scOffset;
+                        D2x = A2x + nX * scOffset; D2y = A2y + nY * scOffset;
                     } else if (dims[i].mode == 1) {
-                        D1x = A1x; D1y = A1y + dims[i].offset; D2x = A2x; D2y = A1y + dims[i].offset;
+                        D1x = A1x; D1y = A1y + scOffset; D2x = A2x; D2y = A1y + scOffset;
                     } else {
-                        D1x = A1x + dims[i].offset; D1y = A1y; D2x = A1x + dims[i].offset; D2y = A2y;
+                        D1x = A1x + scOffset; D1y = A1y; D2x = A1x + scOffset; D2y = A2y;
                     }
                     midX = D1x + (D2x - D1x) * dims[i].textPos;
                     midY = D1y + (D2y - D1y) * dims[i].textPos;
@@ -3488,6 +4037,7 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     parsedIcons[parsedCount].shapes = NULL;
                     parsedIcons[parsedCount].shapeCount = 0;
                     parsedIcons[parsedCount].dimCount = 0;
+                    parsedIcons[parsedCount].tCount = 0;
                     parsedCount++;
                     SetScrollRange(hScrlIcon, SB_CTL, 0, parsedCount - 1, TRUE);
                     SwitchToIcon(parsedCount - 1);
@@ -3613,7 +4163,7 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     currentMode = 27; isDrawing = 0; dragType = 0; ClearSelection(); UpdateStatusBar(); InvalidateRect(hwnd, NULL, TRUE);
                 }
                 else if (btnId == 28) { 
-                    if (!hPageSizeDlg) hPageSizeDlg = CreateWindow("PageSizeClass", "Edit Page Size", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 210, 140, hwnd, NULL, hInst, NULL);
+                    if (!hPageSizeDlg) hPageSizeDlg = CreateWindow("PageSizeClass", "Edit Page Size", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 320, 250, hwnd, NULL, hInst, NULL);
                     SetFocus(hPageSizeDlg);
                 }
                 else if (btnId == 29) {
@@ -3671,7 +4221,19 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 else if (btnId == 16) { 
                     if (selectedShape != -1 && (shapes[selectedShape].type == 0 || shapes[selectedShape].type == 2)) {
                         SaveState();
-                        shapes[selectedShape].type = (shapes[selectedShape].type == 0) ? 2 : 0;
+                        if (shapes[selectedShape].type == 0) {
+                            shapes[selectedShape].type = 2;
+                            if (shapes[selectedShape].ptCount > 0 && shapes[selectedShape].ptCount < MAX_POINTS) {
+                                shapes[selectedShape].ptsX[shapes[selectedShape].ptCount] = shapes[selectedShape].ptsX[0];
+                                shapes[selectedShape].ptsY[shapes[selectedShape].ptCount] = shapes[selectedShape].ptsY[0];
+                                shapes[selectedShape].ptCount++;
+                            }
+                        } else {
+                            shapes[selectedShape].type = 0;
+                            if (shapes[selectedShape].ptCount > 0) {
+                                shapes[selectedShape].ptCount--;
+                            }
+                        }
                         UpdateStatusBar();
                         RedrawCanvas(hwnd);
                     }
@@ -3849,31 +4411,34 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 DrawGrid(hdc); RenderShapes(hdc, shapes, shapeCount, scaleFactor * viewZoom, (int)viewPanX, (int)viewPanY, &currentShape, isDrawing, 0);
                 if (currentMode == 0 || currentMode == 1 || currentMode == 2 || currentMode == 27) DrawNodes(hdc);
                 DrawDimensions(hdc);
-                DrawPalette(hdc); DrawPreview(hdc); 
+                
+                if (ps.rcPaint.right > clientW - PANEL_WIDTH + 10) {
+                    DrawPalette(hdc); DrawPreview(hdc); 
+                }
             }
             EndPaint(hwnd, &ps);
             break;
         }
         case WM_DESTROY: {
             int i;
-            if (hDistEdit && oldEditProc) {
-                SetWindowLong(hDistEdit, GWL_WNDPROC, (LONG)oldEditProc);
+            if (shapes) { GlobalFreePtr(shapes); shapes = NULL; }
+            if (dragStartSnapshot) { GlobalFreePtr(dragStartSnapshot); dragStartSnapshot = NULL; }
+            for(i=0; i<MAX_UNDO; i++) {
+                if (history[i]) { GlobalFreePtr(history[i]); history[i] = NULL; }
             }
-            if (shapes) GlobalFreePtr(shapes);
-            if (dragStartSnapshot) GlobalFreePtr(dragStartSnapshot);
-            for(i=0; i<MAX_UNDO; i++) if (history[i]) GlobalFreePtr(history[i]);
             
             if (parsedIcons) {
-                for(i=0; i<MAX_ICONS; i++) if (parsedIcons[i].shapes) GlobalFreePtr(parsedIcons[i].shapes);
-                GlobalFreePtr(parsedIcons);
+                for(i=0; i<MAX_ICONS; i++) if (parsedIcons[i].shapes) { GlobalFreePtr(parsedIcons[i].shapes); parsedIcons[i].shapes = NULL; }
+                GlobalFreePtr(parsedIcons); parsedIcons = NULL;
             }
             if (refCache) {
-                for(i=0; i<MAX_REFS; i++) if (refCache[i].shapes) GlobalFreePtr(refCache[i].shapes);
-                GlobalFreePtr(refCache);
+                for(i=0; i<MAX_REFS; i++) if (refCache[i].shapes) { GlobalFreePtr(refCache[i].shapes); refCache[i].shapes = NULL; }
+                GlobalFreePtr(refCache); refCache = NULL;
             }
-            if (editMap) GlobalFreePtr(editMap);
+            if (editMap) { GlobalFreePtr(editMap); editMap = NULL; }
             
-            if (subclassThunk) FreeProcInstance(subclassThunk);
+            if (subclassThunk) { FreeProcInstance(subclassThunk); subclassThunk = NULL; }
+            if (multiSubclassThunk) { FreeProcInstance(multiSubclassThunk); multiSubclassThunk = NULL; }
             
             PostQuitMessage(0); break;
         }
