@@ -2,7 +2,7 @@
  * Vector Icon Editor for Win16 - Saves icons as GDI Polygons
  * ============================================================================
  * OPENWATCOM WIN16 C PORT (Windows 3.1x / 16-bit Target)
- * wcl -ml -za99 -bt=windows -l=windows -k16k -zq -os -s icoedtv.c commdlg.lib
+ * wcl -ml -za99 -bt=windows -l=windows -k16k -zq -os -s icoedtv.c commdlg.lib shell.lib
  *
  * PUBLIC DOMAIN NOTICE
  * Free and unencumbered software released into the public domain.
@@ -20,6 +20,7 @@
 #include <math.h>
 #include <ctype.h>
 #include <direct.h>
+#include <shellapi.h>
 
 #ifndef PI
 #define PI 3.14159265358979323846
@@ -90,6 +91,9 @@ typedef struct {
     char pageName[64];
     char unitName[32];
     double pageScale;
+    char iconTitle[64];
+    int gridW;
+    int gridH;
 } IconDef;
 
 char activePageName[64] = "A4 (210x297)";
@@ -144,6 +148,7 @@ Dimension dims[MAX_DIMS];
 int dimCount = 0;
 int dragDimIdx = -1;
 int editDimIdx = -1; /* For inline editing */
+char pendingRefFile[260] = "";
 
 double Snap(double val);
 double CLAMP(double v, double minv, double maxv);
@@ -247,8 +252,9 @@ const char* const bT[33] = {
     "Save .C", "P<->L", "Merge", "Move Up", "Move Down",
     "Align Vert", "Align Horz", "Set Dist", "Set Width", "Set Height", 
     "Duplicate", "Set Angle", "Dimension", "Page Size", "Tag Editor", 
-    "Add Tag", "Save as Ref", "Show All"
+    "Add Tag", "(Lock Axis)", "Show All"
 };
+int lockAxis = 0;
 
 HWND hScrlZoom;
 double viewZoom = 1.0;
@@ -499,8 +505,35 @@ LRESULT CALLBACK _export MultiEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     }
     return CallWindowProc((FARPROC)oldMultiEditProc, hwnd, msg, wParam, lParam);
 }
+void ProcessDropFile(const char* filePath, HWND hwnd) {
+    if (filePath && strstr(filePath, ".c") && !loadedCFile[0]) {
+        LoadCFile(filePath, hwnd);
+        ShowStatus(" File opened via drag-drop.");
+    } else if (filePath && strstr(filePath, ".c")) {
+        ShowRefListDialog(filePath, hwnd);
+    } else if (filePath && strstr(filePath, ".svg")) {
+        char relPath[260];
+        if (loadedCFile[0]) {
+            GetRelativePath(loadedCFile, filePath, relPath);
+        } else {
+            strcpy(relPath, filePath);
+        }
+        if (shapeCount < MAX_SHAPES) {
+            SaveState();
+            memset(&shapes[shapeCount], 0, sizeof(Shape));
+            shapes[shapeCount].type = 3; 
+            shapes[shapeCount].ptCount = 1; 
+            shapes[shapeCount].stroke = currentStroke;
+            sprintf(shapes[shapeCount].text, "{{EXT_REF=%s scale=1.00 rot=0.00}}", relPath);
+            shapeCount++;
+            RedrawCanvas(hwnd);
+            ShowStatus(" SVG Reference added.");
+        }
+    }
+}
 LRESULT CALLBACK _export PageSizeProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static HWND hComboPage = NULL, hComboUnits = NULL, hComboScale = NULL, hComboOrient = NULL;
+    static HWND hEditTitle = NULL;
     static int inOrientSync = 0;
     switch(msg) {
         case WM_CREATE: {
@@ -508,13 +541,16 @@ LRESULT CALLBACK _export PageSizeProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             double pW = 0, pH = 0;
             char *p1, *p2;
 
-            CreateWindow("STATIC", "Width (Grid Units):", WS_CHILD|WS_VISIBLE, 10, 10, 120, 20, hwnd, NULL, hInst, NULL);
-            hEditW = CreateWindow("EDIT", "", WS_CHILD|WS_VISIBLE|WS_BORDER, 130, 10, 150, 20, hwnd, (HMENU)105, hInst, NULL);
-            CreateWindow("STATIC", "Height (Grid Units):", WS_CHILD|WS_VISIBLE, 10, 35, 120, 20, hwnd, NULL, hInst, NULL);
-            hEditH = CreateWindow("EDIT", "", WS_CHILD|WS_VISIBLE|WS_BORDER, 130, 35, 150, 20, hwnd, (HMENU)106, hInst, NULL);
+            CreateWindow("STATIC", "Title:", WS_CHILD|WS_VISIBLE, 10, 10, 120, 20, hwnd, NULL, hInst, NULL);
+            hEditTitle = CreateWindow("EDIT", "", WS_CHILD|WS_VISIBLE|WS_BORDER, 130, 10, 150, 20, hwnd, (HMENU)108, hInst, NULL);
+
+            CreateWindow("STATIC", "Width (Grid Units):", WS_CHILD|WS_VISIBLE, 10, 35, 120, 20, hwnd, NULL, hInst, NULL);
+            hEditW = CreateWindow("EDIT", "", WS_CHILD|WS_VISIBLE|WS_BORDER, 130, 35, 150, 20, hwnd, (HMENU)105, hInst, NULL);
+            CreateWindow("STATIC", "Height (Grid Units):", WS_CHILD|WS_VISIBLE, 10, 60, 120, 20, hwnd, NULL, hInst, NULL);
+            hEditH = CreateWindow("EDIT", "", WS_CHILD|WS_VISIBLE|WS_BORDER, 130, 60, 150, 20, hwnd, (HMENU)106, hInst, NULL);
             
-            CreateWindow("STATIC", "Page Size:", WS_CHILD|WS_VISIBLE, 10, 60, 120, 20, hwnd, NULL, hInst, NULL);
-            hComboPage = CreateWindow("COMBOBOX", "", WS_CHILD|WS_VISIBLE|CBS_DROPDOWN|WS_VSCROLL, 130, 60, 150, 120, hwnd, (HMENU)101, hInst, NULL);
+            CreateWindow("STATIC", "Page Size:", WS_CHILD|WS_VISIBLE, 10, 85, 120, 20, hwnd, NULL, hInst, NULL);
+            hComboPage = CreateWindow("COMBOBOX", "", WS_CHILD|WS_VISIBLE|CBS_DROPDOWN|WS_VSCROLL, 130, 85, 150, 120, hwnd, (HMENU)101, hInst, NULL);
             {
                 const char* sizes[] = {"A4 (210x297)", "Letter (215.9x279.4)", "A3 (297x420)", "A2 (420x594)", "A1 (594x841)", "A0 (841x1189)", "A5 (148x210)", "Legal (215.9x355.6)", "Tabloid (279.4x431.8)", "Arch D (609.6x914.4)", "Custom (100x100)"};
                 for(i=0; i<11; i++) SendMessage(hComboPage, CB_ADDSTRING, 0, (LPARAM)sizes[i]);
@@ -522,7 +558,6 @@ LRESULT CALLBACK _export PageSizeProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             for(i = 0; i < customPageCount; i++) SendMessage(hComboPage, CB_ADDSTRING, 0, (LPARAM)customPageSizes[i]);
             SetWindowText(hComboPage, activePageName);
 
-            /* Auto-detect orientation from width vs height numbers in activePageName */
             p1 = strchr(activePageName, '(');
             if (p1) {
                 p2 = strchr(p1, 'x');
@@ -535,8 +570,8 @@ LRESULT CALLBACK _export PageSizeProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 strcpy(activePageOrient, "Landscape");
             }
 
-            CreateWindow("STATIC", "Orientation:", WS_CHILD|WS_VISIBLE, 10, 85, 120, 20, hwnd, NULL, hInst, NULL);
-            hComboOrient = CreateWindow("COMBOBOX", "", WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL, 130, 85, 150, 60, hwnd, (HMENU)107, hInst, NULL);
+            CreateWindow("STATIC", "Orientation:", WS_CHILD|WS_VISIBLE, 10, 110, 120, 20, hwnd, NULL, hInst, NULL);
+            hComboOrient = CreateWindow("COMBOBOX", "", WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL, 130, 110, 150, 60, hwnd, (HMENU)107, hInst, NULL);
             SendMessage(hComboOrient, CB_ADDSTRING, 0, (LPARAM)"Landscape");
             SendMessage(hComboOrient, CB_ADDSTRING, 0, (LPARAM)"Portrait");
             if (strcmp(activePageOrient, "Portrait") == 0) {
@@ -546,8 +581,8 @@ LRESULT CALLBACK _export PageSizeProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             }
             SetWindowText(hComboOrient, activePageOrient);
 
-            CreateWindow("STATIC", "Units:", WS_CHILD|WS_VISIBLE, 10, 110, 120, 20, hwnd, NULL, hInst, NULL);
-            hComboUnits = CreateWindow("COMBOBOX", "", WS_CHILD|WS_VISIBLE|CBS_DROPDOWN|WS_VSCROLL, 130, 110, 150, 120, hwnd, (HMENU)102, hInst, NULL);
+            CreateWindow("STATIC", "Units:", WS_CHILD|WS_VISIBLE, 10, 135, 120, 20, hwnd, NULL, hInst, NULL);
+            hComboUnits = CreateWindow("COMBOBOX", "", WS_CHILD|WS_VISIBLE|CBS_DROPDOWN|WS_VSCROLL, 130, 135, 150, 120, hwnd, (HMENU)102, hInst, NULL);
             SendMessage(hComboUnits, CB_ADDSTRING, 0, (LPARAM)"None");
             SendMessage(hComboUnits, CB_ADDSTRING, 0, (LPARAM)"mm");
             SendMessage(hComboUnits, CB_ADDSTRING, 0, (LPARAM)"cm");
@@ -557,9 +592,8 @@ LRESULT CALLBACK _export PageSizeProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             SendMessage(hComboUnits, CB_ADDSTRING, 0, (LPARAM)"feet-inches");
             SetWindowText(hComboUnits, activeUnitName);
 
-            /* 0x0100L is SS_NOTIFY */
-            CreateWindow("STATIC", "Scale Ratio:", WS_CHILD|WS_VISIBLE|0x0100L, 10, 135, 120, 20, hwnd, (HMENU)104, hInst, NULL);
-            hComboScale = CreateWindow("COMBOBOX", "", WS_CHILD|WS_VISIBLE|CBS_DROPDOWN|WS_VSCROLL, 130, 135, 150, 120, hwnd, (HMENU)103, hInst, NULL);
+            CreateWindow("STATIC", "Scale Ratio:", WS_CHILD|WS_VISIBLE|0x0100L, 10, 160, 120, 20, hwnd, (HMENU)104, hInst, NULL);
+            hComboScale = CreateWindow("COMBOBOX", "", WS_CHILD|WS_VISIBLE|CBS_DROPDOWN|WS_VSCROLL, 130, 160, 150, 120, hwnd, (HMENU)103, hInst, NULL);
             {
                 const char* scales[] = {"1:1", "1:2", "1:4", "1:5", "1:10", "1:20", "1:25", "1:40", "1:50", "1:100", "1:200", "1:500", "1:1000"};
                 for(i=0; i<13; i++) SendMessage(hComboScale, CB_ADDSTRING, 0, (LPARAM)scales[i]);
@@ -571,10 +605,16 @@ LRESULT CALLBACK _export PageSizeProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             }
             SetWindowText(hComboScale, buf);
 
-            CreateWindow("BUTTON", "Apply", WS_CHILD|WS_VISIBLE, 100, 170, 80, 25, hwnd, (HMENU)1, hInst, NULL);
+            CreateWindow("BUTTON", "Apply", WS_CHILD|WS_VISIBLE, 100, 195, 80, 25, hwnd, (HMENU)1, hInst, NULL);
             
             sprintf(buf, "%d", gridW); SetWindowText(hEditW, buf);
             sprintf(buf, "%d", gridH); SetWindowText(hEditH, buf);
+            
+            if (currentIconIdx >= 0 && parsedIcons[currentIconIdx].iconTitle[0]) {
+                SetWindowText(hEditTitle, parsedIcons[currentIconIdx].iconTitle);
+            } else if (activePageName[0]) {
+                SetWindowText(hEditTitle, activePageName);
+            }
             break;
         }
         case WM_COMMAND:
@@ -588,7 +628,11 @@ LRESULT CALLBACK _export PageSizeProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 GetWindowText(hComboPage, activePageName, 64);
                 GetWindowText(hComboUnits, activeUnitName, 32);
                 GetWindowText(hComboOrient, activePageOrient, 32);
-                GetWindowText(hComboScale, buf, 64); 
+                GetWindowText(hComboScale, buf, 64);
+                
+                char newTitle[64];
+                GetWindowText(hEditTitle, newTitle, 64);
+                if (strlen(newTitle) == 0) strcpy(newTitle, activePageName);
                 
                 colon = strchr(buf, ':');
                 if (colon) {
@@ -611,6 +655,9 @@ LRESULT CALLBACK _export PageSizeProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                     strcpy(parsedIcons[currentIconIdx].pageName, activePageName);
                     strcpy(parsedIcons[currentIconIdx].unitName, activeUnitName);
                     parsedIcons[currentIconIdx].pageScale = activePageScale;
+                    parsedIcons[currentIconIdx].gridW = gridW;
+                    parsedIcons[currentIconIdx].gridH = gridH;
+                    strcpy(parsedIcons[currentIconIdx].iconTitle, newTitle);
                 }
 
                 SendMessage(hMain, WM_SIZE, 0, MAKELPARAM(clientW, clientH));
@@ -621,7 +668,6 @@ LRESULT CALLBACK _export PageSizeProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 
                 if (inOrientSync) break;
 
-                /* Handle manual flip from Orientation dropdown */
                 if (cmd == 107 && evt == CBN_SELCHANGE) {
                     char bufPage[64], bufOrient[32], prefix[32];
                     double pW = 0, pH = 0;
@@ -654,7 +700,6 @@ LRESULT CALLBACK _export PageSizeProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                     }
                 }
 
-                /* Handle Page Size changes: auto-detect and sync Orientation dropdown */
                 if (cmd == 101 && (evt == CBN_SELCHANGE || evt == CBN_EDITCHANGE || evt == CBN_KILLFOCUS)) {
                     char bufPage[64];
                     double pW = 0, pH = 0;
@@ -745,11 +790,90 @@ LRESULT CALLBACK _export PageSizeProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 }
             }
             break;
-        case WM_DESTROY: hPageSizeDlg = NULL; hComboPage = NULL; hComboUnits = NULL; hComboScale = NULL; hComboOrient = NULL; break;
+        case WM_DESTROY: hPageSizeDlg = NULL; hComboPage = NULL; hComboUnits = NULL; hComboScale = NULL; hComboOrient = NULL; hEditTitle = NULL; hEditW = NULL; hEditH = NULL; break;
         default: return DefWindowProc(hwnd, msg, wParam, lParam);
     }
     return 0;
 }
+LRESULT CALLBACK _export RefListProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    static HWND hList = NULL;
+    switch(msg) {
+        case WM_CREATE: {
+            hList = CreateWindow("LISTBOX", NULL, WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_HASSTRINGS,
+                                 10, 10, 360, 200, hwnd, (HMENU)101, hInst, NULL);
+            CreateWindow("BUTTON", "Select", WS_CHILD | WS_VISIBLE, 140, 220, 100, 30, hwnd, (HMENU)1, hInst, NULL);
+            
+            FILE* f = fopen(pendingRefFile, "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+                if (sz > 0 && sz <= 60000L) {
+                    char* d = (char*)GlobalAllocPtr(GHND, sz + 1);
+                    if (d) {
+                        fread(d, 1, (size_t)sz, f); d[sz] = '\0';
+                        char* cur = d; int idx = 0;
+                        while ((cur = strstr(cur, "case ")) != NULL) {
+                            char* endBlock = strstr(cur, "break;");
+                            if (!endBlock) endBlock = cur + strlen(cur);
+                            
+                            char title[64] = "Untitled";
+                            char* pgDef = strstr(cur, "PAGE_DEF(");
+                            if (pgDef && pgDef < endBlock) {
+                                char* q1 = FindQuote(pgDef);
+                                char* q2 = q1 ? FindQuote(q1 + 1) : NULL;
+                                if (q1 && q2) {
+                                    int len = q2 - (q1 + 1); if (len > 63) len = 63;
+                                    strncpy(title, q1 + 1, len); title[len] = '\0';
+                                }
+                            }
+                            
+                            char buf[128];
+                            sprintf(buf, "Index: %d - Title: %s", idx, title);
+                            int li = SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)buf);
+                            SendMessage(hList, LB_SETITEMDATA, li, idx);
+                            idx++;
+                            cur = endBlock;
+                        }
+                        GlobalFreePtr(d);
+                    }
+                }
+                fclose(f);
+            }
+            SendMessage(hList, LB_SETCURSEL, 0, 0);
+            return 0;
+        }
+        case WM_COMMAND: {
+            if (LOWORD(wParam) == 1 || (LOWORD(wParam) == 101 && HIWORD(wParam) == LBN_DBLCLK)) {
+                int sel = SendMessage(hList, LB_GETCURSEL, 0, 0);
+                if (sel != LB_ERR) {
+                    int refIdx = SendMessage(hList, LB_GETITEMDATA, sel, 0);
+                    
+                    if (shapeCount < MAX_SHAPES) {
+                        char relPath[260];
+                        if (loadedCFile[0]) {
+                            GetRelativePath(loadedCFile, pendingRefFile, relPath);
+                        } else {
+                            strcpy(relPath, pendingRefFile);
+                        }
+                        
+                        SaveState();
+                        memset(&shapes[shapeCount], 0, sizeof(Shape));
+                        shapes[shapeCount].type = 3; 
+                        shapes[shapeCount].ptCount = 1; 
+                        shapes[shapeCount].stroke = currentStroke;
+                        sprintf(shapes[shapeCount].text, "{{EXT_REF=%s scale=1.00 rot=0.00}}", relPath);
+                        shapeCount++;
+                        RedrawCanvas(hMain);
+                        ShowStatus(" Reference added from list.");
+                    }
+                }
+                DestroyWindow(hwnd);
+            }
+            return 0;
+        }
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
 void ResolvePath(const char* base, const char* rel, char* out) {
     char tempRel[260];
     char* p;
@@ -796,6 +920,12 @@ void ResolvePath(const char* base, const char* rel, char* out) {
         }
     }
     strncat(out, p, 259 - strlen(out));
+}
+void ShowRefListDialog(const char* filePath, HWND hwnd) {
+    strcpy(pendingRefFile, filePath);
+    CreateWindow("RefListClass", "Select Reference Icon", 
+                 WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_VISIBLE,
+                 100, 100, 400, 300, hwnd, NULL, hInst, NULL);
 }
 void SetPipeValue(char* tagData, int idx, const char* newVal) {
     /* Use static buffer to prevent Win16 stack overflow crash! */
@@ -1343,6 +1473,8 @@ void CommitCurrentIcon(void) {
         if (shapeCount > 0) {
             parsedIcons[currentIconIdx].shapes = (Shape*)GlobalAllocPtr(GHND, sizeof(Shape) * shapeCount);
             if (parsedIcons[currentIconIdx].shapes) memcpy(parsedIcons[currentIconIdx].shapes, shapes, sizeof(Shape) * shapeCount);
+        } else {
+            parsedIcons[currentIconIdx].shapes = NULL;
         }
         parsedIcons[currentIconIdx].shapeCount = shapeCount;
         
@@ -1358,6 +1490,8 @@ void CommitCurrentIcon(void) {
         strcpy(parsedIcons[currentIconIdx].pageName, activePageName);
         strcpy(parsedIcons[currentIconIdx].unitName, activeUnitName);
         parsedIcons[currentIconIdx].pageScale = activePageScale;
+        parsedIcons[currentIconIdx].gridW = gridW;
+        parsedIcons[currentIconIdx].gridH = gridH;
     }
 }
 
@@ -1390,17 +1524,28 @@ void SwitchToIcon(int idx) {
             strcpy(activeUnitName, parsedIcons[idx].unitName);
             activePageScale = parsedIcons[idx].pageScale;
         }
+        if (parsedIcons[idx].gridW > 0) gridW = parsedIcons[idx].gridW; else gridW = 32;
+        if (parsedIcons[idx].gridH > 0) gridH = parsedIcons[idx].gridH; else gridH = 32;
     } else { 
         shapeCount = 0; dimCount = 0; tagCount = 0; 
         strcpy(activePageName, "A4 (210x297)");
         strcpy(activeUnitName, "mm");
         activePageScale = 1.0;
+        gridW = 32; gridH = 32;
+    }
+    
+    if (hEditW && IsWindow(hEditW)) {
+        char buf[16];
+        sprintf(buf, "%d", gridW); SetWindowText(hEditW, buf);
+        sprintf(buf, "%d", gridH); SetWindowText(hEditH, buf);
     }
     
     undoIndex = -1; ClearSelection(); selectedShape = -1;
     if (shapeCount == 0) currentMode = 3; else currentMode = 0;
     if (hScrlIcon) SetScrollPos(hScrlIcon, SB_CTL, currentIconIdx >= 0 ? currentIconIdx : 0, TRUE);
-    UpdateStatusBar(); RedrawCanvas(hMain);
+    UpdateStatusBar(); 
+    SendMessage(hMain, WM_SIZE, 0, MAKELPARAM(clientW, clientH));
+    RedrawCanvas(hMain);
 }
 
 void LoadCFile(const char* path, HWND hwnd) {
@@ -1424,9 +1569,11 @@ void LoadCFile(const char* path, HWND hwnd) {
 
         while ((cur = strstr(cur, "case ")) != NULL && parsedCount < MAX_ICONS) {
             char tmpPageName[64]; char tmpUnitName[32]; double tmpPageScale;
+            int tH = 32, tW = 32;
             cId = atoi(cur + 5); endBlock = strstr(cur, "break;");
             tmpCount = 0; tmpDimCount = 0; st = cur;
             strcpy(tmpPageName, "A4 (210x297)"); strcpy(tmpUnitName, "mm"); tmpPageScale = 1.0;
+            strcpy(parsedIcons[parsedCount].iconTitle, "Untitled");
             if (!endBlock) endBlock = cur + strlen(cur);
 
             while (st < endBlock && tmpCount < MAX_SHAPES) {
@@ -1446,35 +1593,78 @@ void LoadCFile(const char* path, HWND hwnd) {
 
                 if (next == pgDef) {
                     char* pOpen = strchr(next, '(');
-                    char* q1 = pOpen ? FindQuote(pOpen) : NULL;
-                    char* q2 = q1 ? FindQuote(q1 + 1) : NULL;
-                    if (q2) {
-                        char* q3 = FindQuote(q2 + 1);
-                        char* q4 = q3 ? FindQuote(q3 + 1) : NULL;
-                        char* comma = q4 ? strchr(q4 + 1, ',') : NULL;
-                        if (q1 && q2 && q3 && q4 && comma) {
-                            int l1 = q2 - (q1 + 1); if (l1 > 63) l1 = 63;
-                            strncpy(tmpPageName, q1 + 1, l1); tmpPageName[l1] = '\0';
-                            int l2 = q4 - (q3 + 1); if (l2 > 31) l2 = 31;
-                            strncpy(tmpUnitName, q3 + 1, l2); tmpUnitName[l2] = '\0';
-                            tmpPageScale = atof(comma + 1);
+                    char* qTStart = pOpen ? FindQuote(pOpen) : NULL;
+                    char* qTEnd = qTStart ? FindQuote(qTStart + 1) : NULL;
+
+                    if (qTStart && qTEnd) {
+                        int len = qTEnd - (qTStart + 1); if (len > 63) len = 63;
+                        strncpy(parsedIcons[parsedCount].iconTitle, qTStart + 1, len);
+                        parsedIcons[parsedCount].iconTitle[len] = '\0';
+                        
+                        char* comma1 = strchr(qTEnd + 1, ',');
+                        if (comma1) {
+                            char* c1_val = comma1 + 1;
+                            while (*c1_val && isspace((unsigned char)*c1_val)) c1_val++;
+                            
+                            if (*c1_val == '"') {
+                                tH = 32; tW = 32;
+                                char* qPStart = FindQuote(comma1);
+                                char* qPEnd = qPStart ? FindQuote(qPStart + 1) : NULL;
+                                if (qPStart && qPEnd) {
+                                    len = qPEnd - (qPStart + 1); if (len > 63) len = 63;
+                                    strncpy(tmpPageName, qPStart + 1, len); tmpPageName[len] = '\0';
+                                    
+                                    char* qUStart = FindQuote(qPEnd + 1);
+                                    char* qUEnd = qUStart ? FindQuote(qUStart + 1) : NULL;
+                                    if (qUStart && qUEnd) {
+                                        len = qUEnd - (qUStart + 1); if (len > 31) len = 31;
+                                        strncpy(tmpUnitName, qUStart + 1, len); tmpUnitName[len] = '\0';
+                                        
+                                        char* commaScale = strchr(qUEnd + 1, ',');
+                                        if (commaScale) tmpPageScale = atof(commaScale + 1);
+                                    }
+                                }
+                            } else {
+                                tH = atoi(c1_val);
+                                char* comma2 = strchr(c1_val, ',');
+                                if (comma2) {
+                                    tW = atoi(comma2 + 1);
+                                    char* qPStart = FindQuote(comma2 + 1);
+                                    char* qPEnd = qPStart ? FindQuote(qPStart + 1) : NULL;
+                                    if (qPStart && qPEnd) {
+                                        len = qPEnd - (qPStart + 1); if (len > 63) len = 63;
+                                        strncpy(tmpPageName, qPStart + 1, len); tmpPageName[len] = '\0';
+                                        
+                                        char* qUStart = FindQuote(qPEnd + 1);
+                                        char* qUEnd = qUStart ? FindQuote(qUStart + 1) : NULL;
+                                        if (qUStart && qUEnd) {
+                                            len = qUEnd - (qUStart + 1); if (len > 31) len = 31;
+                                            strncpy(tmpUnitName, qUStart + 1, len); tmpUnitName[len] = '\0';
+                                            
+                                            char* commaScale = strchr(qUEnd + 1, ',');
+                                            if (commaScale) tmpPageScale = atof(commaScale + 1);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
+                    if (tH <= 0) tH = 32; if (tW <= 0) tW = 32;
                     st = strchr(next, ';'); if (!st) st = next + 1; continue;
                 }
 
-if (next == dim) { 
-    int s1, p1, s2, p2, md; double off, tp;
-    if (sscanf(next, "DIMENSION(%d , %d , %d , %d , %lf , %lf , %d)", &s1, &p1, &s2, &p2, &off, &tp, &md) == 7) {
-        if (tmpDimCount < MAX_DIMS) {
-            tmpDims[tmpDimCount].s1 = s1; tmpDims[tmpDimCount].p1 = p1;
-            tmpDims[tmpDimCount].s2 = s2; tmpDims[tmpDimCount].p2 = p2;
-            tmpDims[tmpDimCount].offset = off; tmpDims[tmpDimCount].textPos = tp;
-            tmpDims[tmpDimCount].mode = md; tmpDimCount++;
-        }
-    }
-    st = strchr(next, ';'); if (!st) st = next + 1; continue; 
-}
+                if (next == dim) { 
+                    int s1, p1, s2, p2, md; double off, tp;
+                    if (sscanf(next, "DIMENSION(%d , %d , %d , %d , %lf , %lf , %d)", &s1, &p1, &s2, &p2, &off, &tp, &md) == 7) {
+                        if (tmpDimCount < MAX_DIMS) {
+                            tmpDims[tmpDimCount].s1 = s1; tmpDims[tmpDimCount].p1 = p1;
+                            tmpDims[tmpDimCount].s2 = s2; tmpDims[tmpDimCount].p2 = p2;
+                            tmpDims[tmpDimCount].offset = off; tmpDims[tmpDimCount].textPos = tp;
+                            tmpDims[tmpDimCount].mode = md; tmpDimCount++;
+                        }
+                    }
+                    st = strchr(next, ';'); if (!st) st = next + 1; continue; 
+                }
 
                 memset(s, 0, sizeof(Shape));
                 s->useFill = 1; s->useStroke = 1; s->fill = RGB(128, 128, 128); s->stroke = RGB(0, 0, 0);
@@ -1590,6 +1780,8 @@ if (next == dim) {
             strcpy(parsedIcons[parsedCount].pageName, tmpPageName);
             strcpy(parsedIcons[parsedCount].unitName, tmpUnitName);
             parsedIcons[parsedCount].pageScale = tmpPageScale;
+            parsedIcons[parsedCount].gridW = tW;
+            parsedIcons[parsedCount].gridH = tH;
             
             if (tmpCount > 0) {
                 exact = (Shape*)GlobalAllocPtr(GHND, tmpCount * sizeof(Shape));
@@ -1601,87 +1793,15 @@ if (next == dim) {
         GlobalFreePtr(d);
 
         if (parsedCount > 0) {
-            double maxGridX = 32.0, maxGridY = 32.0;
             strcpy(loadedCFile, path);
             SetScrollRange(hScrlIcon, SB_CTL, 0, parsedCount - 1, TRUE);
-
-            for (i = 0; i < parsedCount; i++) {
-                int j;
-                for (j = 0; j < parsedIcons[i].shapeCount; j++) {
-                    Shape* s = &parsedIcons[i].shapes[j];
-                    if (s->type == 3) {
-                        static char refPath[260]; double refScale = 1.0, refRot = 0.0;
-                        char *pScale, *pRot, *pEnd; int pathLen;
-
-                        if (strncmp(s->text, "{{EXT_REF=", 10) == 0) {
-                            pScale = strstr(s->text, " scale="); pRot = strstr(s->text, " rot="); pEnd = strstr(s->text, "}}");
-                            if (pScale) pathLen = (int)(pScale - (s->text + 10));
-                            else if (pEnd) pathLen = (int)(pEnd - (s->text + 10));
-                            else pathLen = strlen(s->text + 10);
-
-                            if (pathLen > 0 && pathLen < 260) {
-                                strncpy(refPath, s->text + 10, pathLen); refPath[pathLen] = '\0';
-                                while (pathLen > 0 && isspace((unsigned char)refPath[pathLen - 1])) refPath[--pathLen] = '\0';
-                                if (pScale) sscanf(pScale, " scale=%lf", &refScale);
-                                if (pRot) sscanf(pRot, " rot=%lf", &refRot);
-
-                                {
-                                    static char absPath[260]; int rIdx; static char baseForResolve[260];
-                                    GetResolveBase(baseForResolve);
-                                    ResolvePath(baseForResolve, refPath, absPath);
-                                    if (loadedCFile[0] && stricmp(absPath, loadedCFile) == 0) continue;
-
-                                    rIdx = EnsureRefLoaded(absPath);
-                                    if (rIdx != -1) {
-                                        double lcx = (refCache[rIdx].minX + refCache[rIdx].maxX) / 2.0;
-                                        double lcy = (refCache[rIdx].minY + refCache[rIdx].maxY) / 2.0;
-                                        double objCx = s->ptsX[0] + lcx * refScale;
-                                        double objCy = s->ptsY[0] + lcy * refScale;
-                                        double rRad = refRot * PI / 180.0, cosR = cos(rRad), sinR = sin(rRad);
-                                        double bx[4], by[4]; int r;
-                                        
-                                        bx[0] = refCache[rIdx].minX; by[0] = refCache[rIdx].minY;
-                                        bx[1] = refCache[rIdx].maxX; by[1] = refCache[rIdx].minY;
-                                        bx[2] = refCache[rIdx].maxX; by[2] = refCache[rIdx].maxY;
-                                        bx[3] = refCache[rIdx].minX; by[3] = refCache[rIdx].maxY;
-
-                                        for (r = 0; r < 4; r++) {
-                                            double dx_r = (bx[r] - lcx) * refScale, dy_r = (by[r] - lcy) * refScale;
-                                            double px_t = objCx + (dx_r * cosR - dy_r * sinR);
-                                            double py_t = objCy + (dx_r * sinR + dy_r * cosR);
-                                            maxGridX = fmax(maxGridX, px_t); maxGridY = fmax(maxGridY, py_t);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else if (s->type != 4) {
-                        int pIdx;
-                        for (pIdx = 0; pIdx < s->ptCount; pIdx++) {
-                            maxGridX = fmax(maxGridX, s->ptsX[pIdx]); maxGridY = fmax(maxGridY, s->ptsY[pIdx]);
-                        }
-                    } else if (s->type == 4) {
-                        maxGridX = fmax(maxGridX, s->ptsX[0] + 15.0); maxGridY = fmax(maxGridY, s->ptsY[0] + 5.0);
-                    }
-                }
-            }
-            
-            gridW = (int)(maxGridX + 2.5); gridH = (int)(maxGridY + 2.5);
-            if (gridW < 32) gridW = 32; if (gridH < 32) gridH = 32;
-            
-            if (hEditW && IsWindow(hEditW)) {
-                char buf[16];
-                sprintf(buf, "%d", gridW); SetWindowText(hEditW, buf);
-                sprintf(buf, "%d", gridH); SetWindowText(hEditH, buf);
-            }
-            SendMessage(hwnd, WM_SIZE, 0, MAKELPARAM(clientW, clientH));
-
             SwitchToIcon(0); ShowStatus(" C Data File Loaded.");
         } else {
             parsedCount = 1; currentCaseId = 1;
             parsedIcons[0].caseId = 1; strcpy(parsedIcons[0].name, "New");
             parsedIcons[0].shapes = NULL; parsedIcons[0].shapeCount = 0; 
             parsedIcons[0].dimCount = 0;
+            parsedIcons[0].gridW = 32; parsedIcons[0].gridH = 32;
             SetScrollRange(hScrlIcon, SB_CTL, 0, 0, TRUE); SwitchToIcon(0);
             ShowStatus(" No valid icons found. Reset to default.");
         }
@@ -1691,6 +1811,7 @@ if (next == dim) {
         parsedIcons[0].caseId = 1; strcpy(parsedIcons[0].name, "New");
         parsedIcons[0].shapes = NULL; parsedIcons[0].shapeCount = 0; 
         parsedIcons[0].dimCount = 0;
+        parsedIcons[0].gridW = 32; parsedIcons[0].gridH = 32;
         SetScrollRange(hScrlIcon, SB_CTL, 0, 0, TRUE); SwitchToIcon(0);
     }
 }
@@ -1730,9 +1851,13 @@ void DoSaveFile(HWND hwnd) {
             Dimension* iconDims = (i == currentIconIdx) ? dims : parsedIcons[i].dims;
             
             fprintf(f, "case %d: {\n", parsedIcons[i].caseId);
-            fprintf(f, "    PAGE_DEF(\"%s\", \"%s\", %g);\n", 
+            
+            fprintf(f, "    PAGE_DEF(\"%s\", %d, %d, \"%s\", \"%s\", %g);\n", 
+                    parsedIcons[i].iconTitle[0] ? parsedIcons[i].iconTitle : (parsedIcons[i].pageName[0] ? parsedIcons[i].pageName : "Title"),
+                    parsedIcons[i].gridH > 0 ? parsedIcons[i].gridH : 32,
+                    parsedIcons[i].gridW > 0 ? parsedIcons[i].gridW : 32,
                     parsedIcons[i].pageName[0] ? parsedIcons[i].pageName : "A4 (210x297)", 
-                    parsedIcons[i].unitName[0] ? parsedIcons[i].unitName : "mm", 
+                    parsedIcons[i].unitName[0] ? parsedIcons[i].unitName : "mm",
                     parsedIcons[i].pageScale != 0 ? parsedIcons[i].pageScale : 1.0);
 
             if (iconShapes) {
@@ -2399,11 +2524,10 @@ void RenderShapes(HDC dc, Shape* sArr, int sCnt, double sc, int offX, int offY, 
                         int dIdx;
                         HPEN hDimPen = CreatePen(PS_SOLID, 1, RGB(0, 128, 255));
                         HBRUSH hDimBr = CreateSolidBrush(RGB(0, 128, 255));
-                        int fSize = (int)(14 * refScale * (sc / 10.0));
+                        int fSize = 14; 
                         HFONT hDimFont;
                         HGDIOBJ oldPen2, oldBr2, oldFont2;
 
-                        if (fSize < 2) fSize = 2;
                         hDimFont = CreateFont(fSize, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
                         
                         oldPen2 = SelectObject(dc, hDimPen);
@@ -2424,7 +2548,7 @@ void RenderShapes(HDC dc, Shape* sArr, int sCnt, double sc, int offX, int offY, 
                                 double dX = lA2x - lA1x, dY = lA2y - lA1y;
                                 double val;
                                 
-                                double sOffset = d->offset * refScale * sc;
+                                double sOffset = d->offset * sc;
                                 double dx_r, dy_r, gA1x, gA1y, gA2x, gA2y;
                                 int sA1x, sA1y, sA2x, sA2y, sD1x, sD1y, sD2x, sD2y, sMidX, sMidY;
 
@@ -2819,7 +2943,6 @@ void WriteShapeToC(FILE* f, Shape* s, int j) {
     }
     
     if (s->useFill || s->useStroke) {
-        fprintf(f, "    {\n");
         if (s->useFill) fprintf(f, "        HBRUSH hBr = CreateSolidBrush(RGB(%d,%d,%d)); HGDIOBJ oBr = SelectObject(hdc, hBr);\n", (int)(s->fill & 0xFF), (int)((s->fill >> 8) & 0xFF), (int)((s->fill >> 16) & 0xFF));
         if (s->useStroke) fprintf(f, "        HPEN hPen = CreatePen(PS_SOLID, %d, RGB(%d,%d,%d)); HGDIOBJ oPen = SelectObject(hdc, hPen);\n", s->strokeWidth > 0 ? s->strokeWidth : 1, (int)(s->stroke & 0xFF), (int)((s->stroke >> 8) & 0xFF), (int)((s->stroke >> 16) & 0xFF));
     }
@@ -2837,7 +2960,6 @@ void WriteShapeToC(FILE* f, Shape* s, int j) {
     if (s->useFill || s->useStroke) {
         if (s->useFill) fprintf(f, "        SelectObject(hdc, oBr); DeleteObject(hBr);\n");
         if (s->useStroke) fprintf(f, "        SelectObject(hdc, oPen); DeleteObject(hPen);\n");
-        fprintf(f, "    }\n");
     }
 }
 
@@ -2853,6 +2975,7 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         case WM_CREATE: {
             int i; int allocFailed = 0;
             hMain = hwnd;
+            DragAcceptFiles(hwnd, TRUE);
 
             shapes = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
             dragStartSnapshot = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
@@ -2878,6 +3001,7 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             strcpy(parsedIcons[0].pageName, "A4 (210x297)");
             strcpy(parsedIcons[0].unitName, "mm");
             parsedIcons[0].pageScale = 1.0;
+            parsedIcons[0].gridW = 32; parsedIcons[0].gridH = 32;
 
             hStatus = CreateWindow("STATIC", " Ready", WS_CHILD | WS_VISIBLE | SS_LEFT, 0, 0, 0, 0, hwnd, (HMENU)100, hInst, NULL);
             hScrlSides = CreateWindow("SCROLLBAR", "", WS_CHILD|WS_VISIBLE|SBS_HORZ, 0,0,1,1, hwnd, (HMENU)153, hInst, NULL);
@@ -2907,6 +3031,15 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             hMultiEdit = CreateWindow("EDIT", "", WS_CHILD | WS_BORDER | ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL, 0, 0, 150, 60, hwnd, (HMENU)301, hInst, NULL);
             multiSubclassThunk = MakeProcInstance((FARPROC)MultiEditProc, hInst);
             oldMultiEditProc = (FARPROC)SetWindowLong(hMultiEdit, GWL_WNDPROC, (LONG)multiSubclassThunk);
+            break;
+        }
+        case WM_DROPFILES: {
+            char filePath[260];
+            HDROP hDrop = (HDROP)wParam;
+            if (DragQueryFile(hDrop, 0, filePath, 260)) {
+                ProcessDropFile(filePath, hwnd);
+            }
+            DragFinish(hDrop);
             break;
         }
         case WM_SIZE: {
@@ -3428,7 +3561,7 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                         }
                     }
                     memcpy(dragStartSnapshot, shapes, sizeof(Shape) * shapeCount);
-                    dragType = (currentMode == 0) ? (shiftDown ? 3 : 1) : (currentMode == 1 ? 3 : 4); 
+                    dragType = (currentMode == 0) ? ((shiftDown && !lockAxis) ? 3 : 1) : (currentMode == 1 ? 3 : 4); 
                     dragStartX = startX; dragStartY = startY; isDraggingPoint = isPartialSelection;
                     
                     minX = 99999; maxX = -99999; minY = 99999; maxY = -99999;
@@ -3481,7 +3614,7 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         }
         case WM_MOUSEMOVE: {
             double nx, ny, dx, dy, bestDist, prX, prY, d, newX, newY, minX, maxX, minY, maxY;
-            int x, y, i, j, p, np, ctrlDown;
+            int x, y, i, j, p, np, ctrlDown, shiftDown;
             double diff, ox, oy, d1, d2, scale, actualDx, actualDy;
             double exactX, exactY;
             
@@ -3537,7 +3670,9 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     needsRedraw = 1;
                 }
             } else if (dragType > 0) {
-                ctrlDown = (GetKeyState(VK_CONTROL) & 0x8000); dx = nx - dragStartX; dy = ny - dragStartY;
+                ctrlDown = (GetKeyState(VK_CONTROL) & 0x8000); 
+                shiftDown = (GetKeyState(VK_SHIFT) & 0x8000); 
+                dx = nx - dragStartX; dy = ny - dragStartY;
                 
                 if (dragType == 1) {
                     minX = gridW; maxX = 0; minY = gridH; maxY = 0;
@@ -3569,7 +3704,7 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     if (minY + dy < 0) dy = -minY; if (maxY + dy > gridH) dy = gridH - maxY;
                     if (ctrlDown && isDraggingPoint) { if (fabs(dx) > fabs(dy)) dy = 0; else dx = 0; }
                     
-                    if (dx != 0 || dy != 0) {
+                    if (dx != 0 || dy != 0 || lockAxis) {
                         for(i = 0; i < shapeCount; i++) {
                             int anySelected = 0;
                             for(j=0; j<shapes[i].ptCount; j++) if(ptSelected[i][j]) anySelected = 1;
@@ -3584,8 +3719,55 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                                 } else {
                                     for(j = 0; j < shapes[i].ptCount; j++) {
                                         if (ptSelected[i][j]) {
-                                            newX = dragStartSnapshot[i].ptsX[j] + dx; newY = dragStartSnapshot[i].ptsY[j] + dy;
-                                            shapes[i].ptsX[j] = snapToGrid ? round(newX) : newX; shapes[i].ptsY[j] = snapToGrid ? round(newY) : newY;
+                                            int handledByLock = 0;
+                                            if (lockAxis && isDraggingPoint) {
+                                                int fixP = -1;
+                                                if (shapes[i].ptCount == 2) {
+                                                    if (!ptSelected[i][1 - j]) fixP = 1 - j;
+                                                } else if (shapes[i].type == 0 || shapes[i].type == 2) {
+                                                    int prev = (j - 1 + shapes[i].ptCount) % shapes[i].ptCount;
+                                                    int next = (j + 1) % shapes[i].ptCount;
+                                                    if (shapes[i].type == 2 && j == 0) prev = -1;
+                                                    if (shapes[i].type == 2 && j == shapes[i].ptCount - 1) next = -1;
+                                                    
+                                                    if (shiftDown) {
+                                                        if (next != -1 && !ptSelected[i][next]) fixP = next;
+                                                        else if (prev != -1 && !ptSelected[i][prev]) fixP = prev;
+                                                    } else {
+                                                        if (prev != -1 && !ptSelected[i][prev]) fixP = prev;
+                                                        else if (next != -1 && !ptSelected[i][next]) fixP = next;
+                                                    }
+                                                }
+
+                                                if (fixP != -1) {
+                                                    double fx = dragStartSnapshot[i].ptsX[fixP];
+                                                    double fy = dragStartSnapshot[i].ptsY[fixP];
+                                                    double ox = dragStartSnapshot[i].ptsX[j];
+                                                    double oy = dragStartSnapshot[i].ptsY[j];
+                                                    double vx = ox - fx;
+                                                    double vy = oy - fy;
+                                                    
+                                                    if (fabs(vx) < 0.001) { 
+                                                        shapes[i].ptsX[j] = ox;
+                                                        shapes[i].ptsY[j] = snapToGrid ? round(exactY) : exactY;
+                                                    } else if (fabs(vy) < 0.001) { 
+                                                        shapes[i].ptsX[j] = snapToGrid ? round(exactX) : exactX;
+                                                        shapes[i].ptsY[j] = oy;
+                                                    } else { 
+                                                        double len2 = vx*vx + vy*vy;
+                                                        double t = ((exactX - fx)*vx + (exactY - fy)*vy) / len2;
+                                                        shapes[i].ptsX[j] = fx + t * vx;
+                                                        shapes[i].ptsY[j] = fy + t * vy;
+                                                    }
+                                                    handledByLock = 1;
+                                                }
+                                            }
+                                            if (!handledByLock) {
+                                                newX = dragStartSnapshot[i].ptsX[j] + dx; 
+                                                newY = dragStartSnapshot[i].ptsY[j] + dy;
+                                                shapes[i].ptsX[j] = snapToGrid ? round(newX) : newX; 
+                                                shapes[i].ptsY[j] = snapToGrid ? round(newY) : newY;
+                                            }
                                         }
                                     }
                                 }
@@ -3814,7 +3996,7 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                         }
                     }
                 }
-} else if (isDrawing && (currentMode >= 3 && currentMode <= 5)) { 
+            } else if (isDrawing && (currentMode >= 3 && currentMode <= 5)) { 
                 currentShape.ptCount--; 
                 if (currentShape.ptCount >= (currentMode == 3 ? 3 : 2) && shapeCount < MAX_SHAPES) {
                     SaveState(); shapes[shapeCount++] = currentShape; selectedShape = shapeCount - 1; currentMode = 0;
@@ -4090,10 +4272,14 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
             if (btnId >= 0 && btnId < 33) {
                 if (btnId >= 0 && btnId <= 5) { 
-                    int keepSel = (btnId == 0 && selectedShape != -1 && shapes[selectedShape].type == 3);
-                    currentMode = btnId; isDrawing = 0; dragType = 0; 
-                    if (!keepSel) ClearSelection(); 
-                    UpdateStatusBar(); InvalidateRect(hwnd, NULL, TRUE); 
+                    if (btnId == 1 && lockAxis) {
+                        ShowStatus(" Rotation disabled while Lock Axis is on.");
+                    } else {
+                        int keepSel = (btnId == 0 && selectedShape != -1 && shapes[selectedShape].type == 3);
+                        currentMode = btnId; isDrawing = 0; dragType = 0; 
+                        if (!keepSel) ClearSelection(); 
+                        UpdateStatusBar(); InvalidateRect(hwnd, NULL, TRUE); 
+                    }
                 }
                 else if (btnId == 7) { currentMode = 7; isDrawing = 0; dragType = 0; ClearSelection(); UpdateStatusBar(); RedrawCanvas(hwnd); }
                 else if (btnId == 8) { currentMode = 8; isDrawing = 0; dragType = 0; ClearSelection(); UpdateStatusBar(); InvalidateRect(hwnd, NULL, TRUE); }
@@ -4163,7 +4349,7 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     currentMode = 27; isDrawing = 0; dragType = 0; ClearSelection(); UpdateStatusBar(); InvalidateRect(hwnd, NULL, TRUE);
                 }
                 else if (btnId == 28) { 
-                    if (!hPageSizeDlg) hPageSizeDlg = CreateWindow("PageSizeClass", "Edit Page Size", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 320, 250, hwnd, NULL, hInst, NULL);
+                    if (!hPageSizeDlg) hPageSizeDlg = CreateWindow("PageSizeClass", "Edit Page Size", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, 320, 270, hwnd, NULL, hInst, NULL);
                     SetFocus(hPageSizeDlg);
                 }
                 else if (btnId == 29) {
@@ -4204,7 +4390,14 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     ReleaseCapture(); return 0;
                 }
                 else if (btnId == 31) {
-                    DoSaveRef(hwnd);
+                    lockAxis = !lockAxis;
+                    SetWindowText(hBtn[31], lockAxis ? "Lock Axis" : "(Lock Axis)");
+                    if (lockAxis && currentMode == 1) {
+                        currentMode = 0;
+                        ClearSelection();
+                        InvalidateRect(hwnd, NULL, TRUE);
+                    }
+                    UpdateStatusBar();
                 }
                 else if (btnId == 32) {
                     viewPanX = 0; viewPanY = 0; viewZoom = 1.0; 
@@ -4385,7 +4578,9 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                     if (selectedShape != -1 && shapeCount < MAX_SHAPES) { SaveState(); shapes[shapeCount] = shapes[selectedShape]; selectedShape = shapeCount++; RedrawCanvas(hwnd); }
                 }
                 else if (btnId == 26) { 
-                    if (selOrderCount == 2) {
+                    if (lockAxis) {
+                        ShowStatus(" Angle setting disabled while Lock Axis is on.");
+                    } else if (selOrderCount == 2) {
                         int s1_l = selOrderS[0], p1_l = selOrderP[0], s2_l = selOrderS[1], p2_l = selOrderP[1];
                         double dx = shapes[s2_l].ptsX[p2_l] - shapes[s1_l].ptsX[p1_l];
                         double dy = shapes[s2_l].ptsY[p2_l] - shapes[s1_l].ptsY[p1_l];
@@ -4421,6 +4616,9 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         }
         case WM_DESTROY: {
             int i;
+            if (IsWindow(hDistEdit) && oldEditProc) { SetWindowLong(hDistEdit, GWL_WNDPROC, (LONG)oldEditProc); oldEditProc = NULL; }
+            if (IsWindow(hMultiEdit) && oldMultiEditProc) { SetWindowLong(hMultiEdit, GWL_WNDPROC, (LONG)oldMultiEditProc); oldMultiEditProc = NULL; }
+
             if (shapes) { GlobalFreePtr(shapes); shapes = NULL; }
             if (dragStartSnapshot) { GlobalFreePtr(dragStartSnapshot); dragStartSnapshot = NULL; }
             for(i=0; i<MAX_UNDO; i++) {
@@ -4458,10 +4656,10 @@ int PASCAL WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpszCmdLi
         wc.lpszMenuName = NULL; wc.lpszClassName = "IconEditClass";
         if (!RegisterClass(&wc)) return FALSE;
 
-        /* Register Custom Dialog Classes */
         wc.lpfnWndProc = PageSizeProc; wc.lpszClassName = "PageSizeClass"; RegisterClass(&wc);
         wc.lpfnWndProc = TagEditorProc; wc.lpszClassName = "TagEditorClass"; RegisterClass(&wc);
         wc.lpfnWndProc = ScaleDlgProc; wc.lpszClassName = "ScaleDlgClass"; RegisterClass(&wc);
+        wc.lpfnWndProc = RefListProc; wc.lpszClassName = "RefListClass"; RegisterClass(&wc);
     }
 
     hMain = CreateWindow("IconEditClass", "Win16 C Pro Vector Editor", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 680, 560, NULL, NULL, hInstance, NULL);
