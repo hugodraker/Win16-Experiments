@@ -21,6 +21,19 @@
 #include <ctype.h>
 #include <direct.h>
 #include <shellapi.h>
+#include <stdarg.h>
+
+void WriteLog(const char* fmt, ...) {
+    FILE* f = fopen("debug.log", "a");
+    if (f) {
+        va_list args;
+        va_start(args, fmt);
+        vfprintf(f, fmt, args);
+        va_end(args);
+        fprintf(f, "\n");
+        fclose(f);
+    }
+}
 
 #ifndef PI
 #define PI 3.14159265358979323846
@@ -106,6 +119,17 @@ char activePageOrient[32] = "Landscape";
 int customPageCount = 0;
 int g_RenderRefDepth = 0;
 int previewDirty = 1;
+
+Shape* g_tempRef = NULL;
+POINT* g_subPts = NULL;
+POINT* g_pA = NULL;
+
+POINT g_boxPts[5][5];
+char g_refPath[5][260];
+char g_absPath[5][260];
+char g_subPath[5][260];
+char g_tagBuf[5][128];
+char g_instVal[5][128];
 
 typedef struct {
     char path[260];
@@ -318,7 +342,8 @@ void EscapeCString(const char* in, char* out, int maxLen) {
 #pragma code_seg ( "IO_TEXT" );
 int EnsureRefLoaded(const char* path) {
     int i, j;
-    double minX, minY, maxX, maxY;
+    double minX = 99999.0, minY = 99999.0;
+    double maxX = -99999.0, maxY = -99999.0;
 
     if (!path || !path[0]) return -1;
 
@@ -327,7 +352,6 @@ int EnsureRefLoaded(const char* path) {
     }
     if (refCacheCount >= MAX_REFS) return -1;
 
-    /* Allocate far heap buffer for cached shapes if not already allocated */
     if (!refCache[refCacheCount].shapes) {
         refCache[refCacheCount].shapes = (Shape*)GlobalAllocPtr(GHND, MAX_SHAPES * sizeof(Shape));
         if (!refCache[refCacheCount].shapes) return -1;
@@ -344,23 +368,17 @@ int EnsureRefLoaded(const char* path) {
         SilentLoadC(path, &refCache[refCacheCount]);
     }
 
-    minX = 99999.0; minY = 99999.0;
-    maxX = -99999.0; maxY = -99999.0;
-
     for (i = 0; i < refCache[refCacheCount].shapeCount; i++) {
         Shape* sh = &refCache[refCacheCount].shapes[i];
         for (j = 0; j < sh->ptCount; j++) {
-            minX = fmin(minX, sh->ptsX[j]);
-            maxX = fmax(maxX, sh->ptsX[j]);
-            minY = fmin(minY, sh->ptsY[j]);
-            maxY = fmax(maxY, sh->ptsY[j]);
+            if (sh->ptsX[j] < minX) minX = sh->ptsX[j];
+            if (sh->ptsX[j] > maxX) maxX = sh->ptsX[j];
+            if (sh->ptsY[j] < minY) minY = sh->ptsY[j];
+            if (sh->ptsY[j] > maxY) maxY = sh->ptsY[j];
         }
     }
 
-    if (minX > maxX) {
-        minX = 0; minY = 0;
-        maxX = GRID_SIZE; maxY = GRID_SIZE;
-    }
+    if (minX > maxX) { minX = 0; minY = 0; maxX = GRID_SIZE; maxY = GRID_SIZE; }
 
     refCache[refCacheCount].minX = minX;
     refCache[refCacheCount].minY = minY;
@@ -979,7 +997,7 @@ void SilentLoadC(const char* path, RefCache* ref) {
             char *pt = strstr(st, "POINT "), *lStr = strstr(st, "L(");
             char *ext = strstr(st, "EXT_REF("); 
             char *tag = strstr(st, "TAG_TEXT("), *dim = strstr(st, "DIMENSION(");
-            char *colorSearch, *next = pt ? pt : lStr;
+            char *next = pt ? pt : lStr;
             Shape* s = &ref->shapes[ref->shapeCount];
 
             if (lStr && (!next || lStr < next)) next = lStr;
@@ -989,115 +1007,137 @@ void SilentLoadC(const char* path, RefCache* ref) {
             if (!next || next >= endBlock) break;
 
             if (next == dim) { 
-                int s1, p1, s2, p2, md; double off, tp;
-                if (sscanf(next, "DIMENSION(%d , %d , %d , %d , %lf , %lf , %d)", &s1, &p1, &s2, &p2, &off, &tp, &md) == 7) {
-                    if (ref->dimCount < MAX_DIMS) {
-                        ref->dims[ref->dimCount].s1 = s1; ref->dims[ref->dimCount].p1 = p1;
-                        ref->dims[ref->dimCount].s2 = s2; ref->dims[ref->dimCount].p2 = p2;
-                        ref->dims[ref->dimCount].offset = off; ref->dims[ref->dimCount].textPos = tp;
-                        ref->dims[ref->dimCount].mode = md; ref->dimCount++;
+                char* pOpen = strchr(next, '(');
+                if (pOpen) {
+                    char* c1 = strchr(pOpen, ','); char* c2 = c1 ? strchr(c1 + 1, ',') : NULL;
+                    char* c3 = c2 ? strchr(c2 + 1, ',') : NULL; char* c4 = c3 ? strchr(c3 + 1, ',') : NULL;
+                    char* c5 = c4 ? strchr(c4 + 1, ',') : NULL; char* c6 = c5 ? strchr(c5 + 1, ',') : NULL;
+                    if (c1 && c2 && c3 && c4 && c5 && c6 && ref->dimCount < MAX_DIMS) {
+                        int vS1 = atoi(pOpen + 1); int vP1 = atoi(c1 + 1);
+                        int vS2 = atoi(c2 + 1); int vP2 = atoi(c3 + 1);
+                        double vOff = atof(c4 + 1); double vTPos = atof(c5 + 1); int vMd = atoi(c6 + 1);
+                        
+                        ref->dims[ref->dimCount].s1 = vS1; ref->dims[ref->dimCount].p1 = vP1;
+                        ref->dims[ref->dimCount].s2 = vS2; ref->dims[ref->dimCount].p2 = vP2;
+                        ref->dims[ref->dimCount].offset = vOff; ref->dims[ref->dimCount].textPos = vTPos;
+                        ref->dims[ref->dimCount].mode = vMd; ref->dimCount++;
                     }
                 }
                 st = strchr(next, ';'); if (!st) st = next + 1; continue; 
             }
 
             memset(s, 0, sizeof(Shape));
-            s->useFill = 1; s->useStroke = 1; s->fill = RGB(128, 128, 128); s->stroke = RGB(0, 0, 0);
-            s->strokeWidth = 1;
-            s->fontSize = 24;
+            s->useFill = 1; s->useStroke = 1; s->fill = RGB(128, 128, 128); s->stroke = RGB(0, 0, 0); s->strokeWidth = 1; s->fontSize = 24;
 
-            colorSearch = st;
-            while (colorSearch < next) {
-                int cr, cg, cb, sw;
-                if (sscanf(colorSearch, "CreateSolidBrush(RGB(%d,%d,%d))", &cr, &cg, &cb) == 3) { s->fill = RGB(cr, cg, cb); s->useFill = 1; }
-                if (sscanf(colorSearch, "CreatePen(PS_SOLID, %d, RGB(%d,%d,%d))", &sw, &cr, &cg, &cb) == 4) { s->stroke = RGB(cr, cg, cb); s->useStroke = 1; s->strokeWidth = sw; }
-                else if (sscanf(colorSearch, "CreatePen(PS_SOLID, 1, RGB(%d,%d,%d))", &cr, &cg, &cb) == 3) { s->stroke = RGB(cr, cg, cb); s->useStroke = 1; s->strokeWidth = 1; }
-                colorSearch++;
+            {
+                char savedChar = *next; *next = '\0';
+                char* brushSearch = strstr(st, "CreateSolidBrush(RGB(");
+                if (brushSearch) {
+                    char* rgb = strstr(brushSearch, "RGB(");
+                    if (rgb) {
+                        int cr = atoi(rgb + 4); char* comma1 = strchr(rgb + 4, ',');
+                        if (comma1) {
+                            int cg = atoi(comma1 + 1); char* comma2 = strchr(comma1 + 1, ',');
+                            if (comma2) { int cb = atoi(comma2 + 1); s->fill = RGB(cr, cg, cb); s->useFill = 1; }
+                        }
+                    }
+                }
+                char* penSearch = strstr(st, "CreatePen(PS_SOLID, ");
+                if (penSearch) {
+                    int sw = atoi(penSearch + 20); char* rgb = strstr(penSearch, "RGB(");
+                    if (rgb) {
+                        int cr = atoi(rgb + 4); char* comma1 = strchr(rgb + 4, ',');
+                        if (comma1) {
+                            int cg = atoi(comma1 + 1); char* comma2 = strchr(comma1 + 1, ',');
+                            if (comma2) { int cb = atoi(comma2 + 1); s->stroke = RGB(cr, cg, cb); s->useStroke = 1; s->strokeWidth = sw > 0 ? sw : 1; }
+                        }
+                    }
+                }
+                *next = savedChar;
             }
 
             if (next == pt) {
+                char* searchLimit = endBlock;
+                char* nPt = strstr(next + 1, "POINT "); if (nPt && nPt < searchLimit) searchLimit = nPt;
+                char* nL = strstr(next + 1, "L("); if (nL && nL < searchLimit) searchLimit = nL;
+                char* nEx = strstr(next + 1, "EXT_REF("); if (nEx && nEx < searchLimit) searchLimit = nEx;
+                char* nTg = strstr(next + 1, "TAG_TEXT("); if (nTg && nTg < searchLimit) searchLimit = nTg;
+                char* nDim = strstr(next + 1, "DIMENSION("); if (nDim && nDim < searchLimit) searchLimit = nDim;
+
+                char saved = *searchLimit; *searchLimit = '\0';
+                s->type = strstr(next, "Polyline(") ? 2 : 0; *searchLimit = saved;
+
                 char *pC = next, *bracket = strchr(next, '}');
-                s->type = strstr(next, "Polyline(") ? 2 : 0;
                 while (bracket && (pC = strstr(pC, "PT(")) != NULL && pC < bracket) {
                     char* comma = strchr(pC + 3, ',');
                     if (comma && comma < bracket && s->ptCount < MAX_POINTS) {
-                        s->ptsX[s->ptCount] = atof(pC + 3); s->ptsY[s->ptCount] = atof(comma + 1); s->ptCount++;
+                        double vX = atof(pC + 3); double vY = atof(comma + 1);
+                        s->ptsX[s->ptCount] = vX; s->ptsY[s->ptCount] = vY; s->ptCount++;
                     }
                     pC += 3;
                 }
                 if (s->ptCount > 0) ref->shapeCount++;
             } else if (next == lStr) {
-                s->type = 1; s->ptCount = 2;
-                if (sscanf(next, "L(%lf,%lf,%lf,%lf)", &s->ptsX[0], &s->ptsY[0], &s->ptsX[1], &s->ptsY[1]) == 4) ref->shapeCount++;
+                char* pOpen = strchr(next, '(');
+                if (pOpen) {
+                    char* c1 = strchr(pOpen, ','); char* c2 = c1 ? strchr(c1 + 1, ',') : NULL; char* c3 = c2 ? strchr(c2 + 1, ',') : NULL;
+                    if (c1 && c2 && c3) {
+                        double x1 = atof(pOpen + 1); double y1 = atof(c1 + 1);
+                        double x2 = atof(c2 + 1); double y2 = atof(c3 + 1);
+                        s->type = 1; s->ptCount = 2;
+                        s->ptsX[0] = x1; s->ptsY[0] = y1; s->ptsX[1] = x2; s->ptsY[1] = y2;
+                        ref->shapeCount++;
+                    }
+                }
             } else if (next == ext) {
                 static char refStr[128]; static char tagStr[256]; tagStr[0] = '\0';
-                char* pOpen = strchr(next, '(');
-                char* q1 = pOpen ? FindQuote(pOpen) : NULL;
-                char* q2 = q1 ? FindQuote(q1 + 1) : NULL;
+                char* pOpen = strchr(next, '('); char* q1 = pOpen ? FindQuote(pOpen) : NULL; char* q2 = q1 ? FindQuote(q1 + 1) : NULL;
                 if (pOpen && q1 && q2) {
-                    char* comma1 = strchr(pOpen + 1, ',');
-                    int rLen = q2 - (q1 + 1); if (rLen > 127) rLen = 127;
+                    char* comma1 = strchr(pOpen + 1, ','); int rLen = q2 - (q1 + 1); if (rLen > 127) rLen = 127;
                     strncpy(refStr, q1 + 1, rLen); refStr[rLen] = '\0';
-                    
                     char* comma3 = q2 ? strchr(q2 + 1, ',') : NULL;
                     if (comma3) {
-                        char* q3 = FindQuote(comma3);
-                        char* q4 = q3 ? FindQuote(q3 + 1) : NULL;
+                        char* q3 = FindQuote(comma3); char* q4 = q3 ? FindQuote(q3 + 1) : NULL;
                         if (q3 && q4) {
                             int tLen = q4 - (q3 + 1); if (tLen > 255) tLen = 255;
                             strncpy(tagStr, q3 + 1, tLen); tagStr[tLen] = '\0';
                         }
                     }
-                    s->type = 3; s->ptsX[0] = atof(pOpen + 1); s->ptsY[0] = comma1 ? atof(comma1 + 1) : 0.0;
-                    s->ptCount = 1; strcpy(s->text, refStr); 
-                    UnescapeCString(tagStr, s->tagData, 128);
+                    double px = atof(pOpen + 1); double py = comma1 ? atof(comma1 + 1) : 0.0;
+                    s->type = 3; s->ptsX[0] = px; s->ptsY[0] = py; s->ptCount = 1;
+                    strcpy(s->text, refStr); UnescapeCString(tagStr, s->tagData, 128);
                     ref->shapeCount++;
                 }
             } else if (next == tag) {
-                char* pOpen = strchr(next, '(');
-                char* q1 = pOpen ? FindQuote(pOpen) : NULL;
-                char* q2 = q1 ? FindQuote(q1 + 1) : NULL;
-                
+                char* pOpen = strchr(next, '('); char* q1 = pOpen ? FindQuote(pOpen) : NULL; char* q2 = q1 ? FindQuote(q1 + 1) : NULL;
                 if (pOpen) {
                     char* comma1 = strchr(pOpen, ',');
                     if (comma1 && (!q1 || comma1 < q1)) {
-                        s->type = 4; s->ptsX[0] = atof(pOpen + 1); s->ptsY[0] = atof(comma1 + 1); s->ptCount = 1;
-                        char* comma2 = strchr(comma1 + 1, ',');
-                        char* pClose = strchr(comma2 ? comma2 : pOpen, ')');
+                        double px = atof(pOpen + 1); double py = atof(comma1 + 1);
+                        s->type = 4; s->ptsX[0] = px; s->ptsY[0] = py; s->ptCount = 1;
+                        char* comma2 = strchr(comma1 + 1, ','); char* pClose = strchr(comma2 ? comma2 : pOpen, ')');
 
                         if (q1 && q2 && q1 < pClose) {
                             int tLen = q2 - (q1 + 1); if (tLen > 127) tLen = 127;
-                            static char rawTag[256]; strncpy(rawTag, q1 + 1, tLen); rawTag[tLen] = '\0';
-                            UnescapeCString(rawTag, s->text, 128);
-                            
+                            static char rawTag[256]; strncpy(rawTag, q1 + 1, tLen); rawTag[tLen] = '\0'; UnescapeCString(rawTag, s->text, 128);
                             char* commaAfter = strchr(q2, ',');
                             if (commaAfter && commaAfter < pClose) {
-                                char jChar = 'L'; char* jPtr = commaAfter + 1;
-                                while (*jPtr && isspace((unsigned char)*jPtr)) jPtr++;
-                                jChar = toupper((unsigned char)*jPtr);
+                                char jChar = 'L'; char* jPtr = commaAfter + 1; while (*jPtr && isspace((unsigned char)*jPtr)) jPtr++; jChar = toupper((unsigned char)*jPtr);
                                 if (jChar == 'C') s->useFill = 1; else if (jChar == 'R') s->useFill = 2; else s->useFill = 0;
-                                
-                                char* comma4 = strchr(commaAfter + 1, ',');
-                                if (comma4 && comma4 < pClose) s->fontSize = atoi(comma4 + 1);
+                                char* comma4 = strchr(commaAfter + 1, ','); if (comma4 && comma4 < pClose) s->fontSize = atoi(comma4 + 1);
                             } else s->useFill = 0;
                         } else if (comma2) {
-                            char* comma3 = strchr(comma2 + 1, ',');
-                            char* endMarker = comma3 ? comma3 : pClose;
+                            char* comma3 = strchr(comma2 + 1, ','); char* endMarker = comma3 ? comma3 : pClose;
                             if (endMarker) {
                                 int tLen = endMarker - (comma2 + 1); if (tLen > 127) tLen = 127;
                                 static char rawTag[256]; strncpy(rawTag, comma2 + 1, tLen); rawTag[tLen] = '\0';
                                 char* start = rawTag; while(*start && isspace((unsigned char)*start)) start++;
                                 char* end = start + strlen(start) - 1; while(end > start && isspace((unsigned char)*end)) *end-- = '\0';
                                 UnescapeCString(start, s->text, 128);
-                                
                                 if (comma3) {
-                                    char jChar = 'L'; char* jPtr = comma3 + 1;
-                                    while (*jPtr && isspace((unsigned char)*jPtr)) jPtr++;
-                                    jChar = toupper((unsigned char)*jPtr);
+                                    char jChar = 'L'; char* jPtr = comma3 + 1; while (*jPtr && isspace((unsigned char)*jPtr)) jPtr++; jChar = toupper((unsigned char)*jPtr);
                                     if (jChar == 'C') s->useFill = 1; else if (jChar == 'R') s->useFill = 2; else s->useFill = 0;
-                                    
-                                    char* comma4 = strchr(comma3 + 1, ',');
-                                    if (comma4 && comma4 < pClose) s->fontSize = atoi(comma4 + 1);
+                                    char* comma4 = strchr(comma3 + 1, ','); if (comma4 && comma4 < pClose) s->fontSize = atoi(comma4 + 1);
                                 } else s->useFill = 0;
                             }
                         }
@@ -1577,7 +1617,7 @@ void LoadCFile(const char* path, HWND hwnd) {
             if (!endBlock) endBlock = cur + strlen(cur);
 
             while (st < endBlock && tmpCount < MAX_SHAPES) {
-                char* colorSearch; Shape* s = &dragStartSnapshot[tmpCount];
+                Shape* s = &dragStartSnapshot[tmpCount];
                 char *dim = strstr(st, "DIMENSION(");
                 char *pgDef = strstr(st, "PAGE_DEF(");
                 pt = strstr(st, "POINT "); lStr = strstr(st, "L(");
@@ -1654,115 +1694,138 @@ void LoadCFile(const char* path, HWND hwnd) {
                 }
 
                 if (next == dim) { 
-                    int s1, p1, s2, p2, md; double off, tp;
-                    if (sscanf(next, "DIMENSION(%d , %d , %d , %d , %lf , %lf , %d)", &s1, &p1, &s2, &p2, &off, &tp, &md) == 7) {
-                        if (tmpDimCount < MAX_DIMS) {
-                            tmpDims[tmpDimCount].s1 = s1; tmpDims[tmpDimCount].p1 = p1;
-                            tmpDims[tmpDimCount].s2 = s2; tmpDims[tmpDimCount].p2 = p2;
-                            tmpDims[tmpDimCount].offset = off; tmpDims[tmpDimCount].textPos = tp;
-                            tmpDims[tmpDimCount].mode = md; tmpDimCount++;
+                    char* pOpen = strchr(next, '(');
+                    if (pOpen) {
+                        char* c1 = strchr(pOpen, ','); char* c2 = c1 ? strchr(c1 + 1, ',') : NULL;
+                        char* c3 = c2 ? strchr(c2 + 1, ',') : NULL; char* c4 = c3 ? strchr(c3 + 1, ',') : NULL;
+                        char* c5 = c4 ? strchr(c4 + 1, ',') : NULL; char* c6 = c5 ? strchr(c5 + 1, ',') : NULL;
+                        if (c1 && c2 && c3 && c4 && c5 && c6 && tmpDimCount < MAX_DIMS) {
+                            int vS1 = atoi(pOpen + 1); int vP1 = atoi(c1 + 1);
+                            int vS2 = atoi(c2 + 1); int vP2 = atoi(c3 + 1);
+                            double vOff = atof(c4 + 1); double vTPos = atof(c5 + 1); int vMd = atoi(c6 + 1);
+                            
+                            tmpDims[tmpDimCount].s1 = vS1; tmpDims[tmpDimCount].p1 = vP1;
+                            tmpDims[tmpDimCount].s2 = vS2; tmpDims[tmpDimCount].p2 = vP2;
+                            tmpDims[tmpDimCount].offset = vOff; tmpDims[tmpDimCount].textPos = vTPos;
+                            tmpDims[tmpDimCount].mode = vMd; tmpDimCount++;
                         }
                     }
                     st = strchr(next, ';'); if (!st) st = next + 1; continue; 
                 }
 
                 memset(s, 0, sizeof(Shape));
-                s->useFill = 1; s->useStroke = 1; s->fill = RGB(128, 128, 128); s->stroke = RGB(0, 0, 0);
-                s->strokeWidth = 1;
-                s->fontSize = 24;
+                s->useFill = 1; s->useStroke = 1; s->fill = RGB(128, 128, 128); s->stroke = RGB(0, 0, 0); s->strokeWidth = 1; s->fontSize = 24;
 
-                colorSearch = st;
-                while (colorSearch < next) {
-                    int cr, cg, cb, sw;
-                    if (sscanf(colorSearch, "CreateSolidBrush(RGB(%d,%d,%d))", &cr, &cg, &cb) == 3) { s->fill = RGB(cr, cg, cb); s->useFill = 1; }
-                    if (sscanf(colorSearch, "CreatePen(PS_SOLID, %d, RGB(%d,%d,%d))", &sw, &cr, &cg, &cb) == 4) { s->stroke = RGB(cr, cg, cb); s->useStroke = 1; s->strokeWidth = sw; }
-                    else if (sscanf(colorSearch, "CreatePen(PS_SOLID, 1, RGB(%d,%d,%d))", &cr, &cg, &cb) == 3) { s->stroke = RGB(cr, cg, cb); s->useStroke = 1; s->strokeWidth = 1; }
-                    colorSearch++;
+                {
+                    char savedChar = *next; *next = '\0';
+                    char* brushSearch = strstr(st, "CreateSolidBrush(RGB(");
+                    if (brushSearch) {
+                        char* rgb = strstr(brushSearch, "RGB(");
+                        if (rgb) {
+                            int cr = atoi(rgb + 4); char* comma1 = strchr(rgb + 4, ',');
+                            if (comma1) {
+                                int cg = atoi(comma1 + 1); char* comma2 = strchr(comma1 + 1, ',');
+                                if (comma2) { int cb = atoi(comma2 + 1); s->fill = RGB(cr, cg, cb); s->useFill = 1; }
+                            }
+                        }
+                    }
+                    char* penSearch = strstr(st, "CreatePen(PS_SOLID, ");
+                    if (penSearch) {
+                        int sw = atoi(penSearch + 20); char* rgb = strstr(penSearch, "RGB(");
+                        if (rgb) {
+                            int cr = atoi(rgb + 4); char* comma1 = strchr(rgb + 4, ',');
+                            if (comma1) {
+                                int cg = atoi(comma1 + 1); char* comma2 = strchr(comma1 + 1, ',');
+                                if (comma2) { int cb = atoi(comma2 + 1); s->stroke = RGB(cr, cg, cb); s->useStroke = 1; s->strokeWidth = sw > 0 ? sw : 1; }
+                            }
+                        }
+                    }
+                    *next = savedChar;
                 }
 
                 if (next == pt) {
+                    char* searchLimit = endBlock;
+                    char* nPt = strstr(next + 1, "POINT "); if (nPt && nPt < searchLimit) searchLimit = nPt;
+                    char* nL = strstr(next + 1, "L("); if (nL && nL < searchLimit) searchLimit = nL;
+                    char* nEx = strstr(next + 1, "EXT_REF("); if (nEx && nEx < searchLimit) searchLimit = nEx;
+                    char* nTg = strstr(next + 1, "TAG_TEXT("); if (nTg && nTg < searchLimit) searchLimit = nTg;
+                    char* nDim = strstr(next + 1, "DIMENSION("); if (nDim && nDim < searchLimit) searchLimit = nDim;
+                    char* nPg = strstr(next + 1, "PAGE_DEF("); if (nPg && nPg < searchLimit) searchLimit = nPg;
+
+                    char saved = *searchLimit; *searchLimit = '\0';
+                    s->type = strstr(next, "Polyline(") ? 2 : 0; *searchLimit = saved;
+
                     char *pC = next, *bracket = strchr(next, '}');
-                    s->type = strstr(next, "Polyline(") ? 2 : 0;
                     while (bracket && (pC = strstr(pC, "PT(")) != NULL && pC < bracket) {
                         char* comma = strchr(pC + 3, ',');
                         if (comma && comma < bracket && s->ptCount < MAX_POINTS) {
-                            s->ptsX[s->ptCount] = atof(pC + 3); s->ptsY[s->ptCount] = atof(comma + 1); s->ptCount++;
+                            double vX = atof(pC + 3); double vY = atof(comma + 1);
+                            s->ptsX[s->ptCount] = vX; s->ptsY[s->ptCount] = vY; s->ptCount++;
                         }
                         pC += 3;
                     }
                     if (s->ptCount > 0) tmpCount++;
                 } else if (next == lStr) {
-                    s->type = 1; s->ptCount = 2;
-                    if (sscanf(next, "L(%lf,%lf,%lf,%lf)", &s->ptsX[0], &s->ptsY[0], &s->ptsX[1], &s->ptsY[1]) == 4) tmpCount++;
+                    char* pOpen = strchr(next, '(');
+                    if (pOpen) {
+                        char* c1 = strchr(pOpen, ','); char* c2 = c1 ? strchr(c1 + 1, ',') : NULL; char* c3 = c2 ? strchr(c2 + 1, ',') : NULL;
+                        if (c1 && c2 && c3) {
+                            double x1 = atof(pOpen + 1); double y1 = atof(c1 + 1);
+                            double x2 = atof(c2 + 1); double y2 = atof(c3 + 1);
+                            s->type = 1; s->ptCount = 2;
+                            s->ptsX[0] = x1; s->ptsY[0] = y1; s->ptsX[1] = x2; s->ptsY[1] = y2;
+                            tmpCount++;
+                        }
+                    }
                 } else if (next == ext) {
                     static char refStr[128]; static char tagStr[256]; tagStr[0] = '\0';
-                    char* pOpen = strchr(next, '(');
-                    char* q1 = pOpen ? FindQuote(pOpen) : NULL;
-                    char* q2 = q1 ? FindQuote(q1 + 1) : NULL;
+                    char* pOpen = strchr(next, '('); char* q1 = pOpen ? FindQuote(pOpen) : NULL; char* q2 = q1 ? FindQuote(q1 + 1) : NULL;
                     if (pOpen && q1 && q2) {
-                        char* comma1 = strchr(pOpen + 1, ',');
-                        int rLen = q2 - (q1 + 1); if (rLen > 127) rLen = 127;
+                        char* comma1 = strchr(pOpen + 1, ','); int rLen = q2 - (q1 + 1); if (rLen > 127) rLen = 127;
                         strncpy(refStr, q1 + 1, rLen); refStr[rLen] = '\0';
-                        
                         char* comma3 = q2 ? strchr(q2 + 1, ',') : NULL;
                         if (comma3) {
-                            char* q3 = FindQuote(comma3);
-                            char* q4 = q3 ? FindQuote(q3 + 1) : NULL;
+                            char* q3 = FindQuote(comma3); char* q4 = q3 ? FindQuote(q3 + 1) : NULL;
                             if (q3 && q4) {
                                 int tLen = q4 - (q3 + 1); if (tLen > 255) tLen = 255;
                                 strncpy(tagStr, q3 + 1, tLen); tagStr[tLen] = '\0';
                             }
                         }
-                        s->type = 3; s->ptsX[0] = atof(pOpen + 1); s->ptsY[0] = comma1 ? atof(comma1 + 1) : 0.0;
-                        s->ptCount = 1; strcpy(s->text, refStr); 
-                        UnescapeCString(tagStr, s->tagData, 128);
+                        double px = atof(pOpen + 1); double py = comma1 ? atof(comma1 + 1) : 0.0;
+                        s->type = 3; s->ptsX[0] = px; s->ptsY[0] = py; s->ptCount = 1;
+                        strcpy(s->text, refStr); UnescapeCString(tagStr, s->tagData, 128);
                         tmpCount++;
                     }
                 } else if (next == tag) {
-                    char* pOpen = strchr(next, '(');
-                    char* q1 = pOpen ? FindQuote(pOpen) : NULL;
-                    char* q2 = q1 ? FindQuote(q1 + 1) : NULL;
-                    
+                    char* pOpen = strchr(next, '('); char* q1 = pOpen ? FindQuote(pOpen) : NULL; char* q2 = q1 ? FindQuote(q1 + 1) : NULL;
                     if (pOpen) {
                         char* comma1 = strchr(pOpen, ',');
                         if (comma1 && (!q1 || comma1 < q1)) {
-                            s->type = 4; s->ptsX[0] = atof(pOpen + 1); s->ptsY[0] = atof(comma1 + 1); s->ptCount = 1;
-                            char* comma2 = strchr(comma1 + 1, ',');
-                            char* pClose = strchr(comma2 ? comma2 : pOpen, ')');
+                            double px = atof(pOpen + 1); double py = atof(comma1 + 1);
+                            s->type = 4; s->ptsX[0] = px; s->ptsY[0] = py; s->ptCount = 1;
+                            char* comma2 = strchr(comma1 + 1, ','); char* pClose = strchr(comma2 ? comma2 : pOpen, ')');
 
                             if (q1 && q2 && q1 < pClose) {
                                 int tLen = q2 - (q1 + 1); if (tLen > 127) tLen = 127;
-                                static char rawTag[256]; strncpy(rawTag, q1 + 1, tLen); rawTag[tLen] = '\0';
-                                UnescapeCString(rawTag, s->text, 128);
-                                
+                                static char rawTag[256]; strncpy(rawTag, q1 + 1, tLen); rawTag[tLen] = '\0'; UnescapeCString(rawTag, s->text, 128);
                                 char* commaAfter = strchr(q2, ',');
                                 if (commaAfter && commaAfter < pClose) {
-                                    char jChar = 'L'; char* jPtr = commaAfter + 1;
-                                    while (*jPtr && isspace((unsigned char)*jPtr)) jPtr++;
-                                    jChar = toupper((unsigned char)*jPtr);
+                                    char jChar = 'L'; char* jPtr = commaAfter + 1; while (*jPtr && isspace((unsigned char)*jPtr)) jPtr++; jChar = toupper((unsigned char)*jPtr);
                                     if (jChar == 'C') s->useFill = 1; else if (jChar == 'R') s->useFill = 2; else s->useFill = 0;
-                                    
-                                    char* comma4 = strchr(commaAfter + 1, ',');
-                                    if (comma4 && comma4 < pClose) s->fontSize = atoi(comma4 + 1);
+                                    char* comma4 = strchr(commaAfter + 1, ','); if (comma4 && comma4 < pClose) s->fontSize = atoi(comma4 + 1);
                                 } else s->useFill = 0;
                             } else if (comma2) {
-                                char* comma3 = strchr(comma2 + 1, ',');
-                                char* endMarker = comma3 ? comma3 : pClose;
+                                char* comma3 = strchr(comma2 + 1, ','); char* endMarker = comma3 ? comma3 : pClose;
                                 if (endMarker) {
                                     int tLen = endMarker - (comma2 + 1); if (tLen > 127) tLen = 127;
                                     static char rawTag[256]; strncpy(rawTag, comma2 + 1, tLen); rawTag[tLen] = '\0';
                                     char* start = rawTag; while(*start && isspace((unsigned char)*start)) start++;
                                     char* end = start + strlen(start) - 1; while(end > start && isspace((unsigned char)*end)) *end-- = '\0';
                                     UnescapeCString(start, s->text, 128);
-                                    
                                     if (comma3) {
-                                        char jChar = 'L'; char* jPtr = comma3 + 1;
-                                        while (*jPtr && isspace((unsigned char)*jPtr)) jPtr++;
-                                        jChar = toupper((unsigned char)*jPtr);
+                                        char jChar = 'L'; char* jPtr = comma3 + 1; while (*jPtr && isspace((unsigned char)*jPtr)) jPtr++; jChar = toupper((unsigned char)*jPtr);
                                         if (jChar == 'C') s->useFill = 1; else if (jChar == 'R') s->useFill = 2; else s->useFill = 0;
-                                        
-                                        char* comma4 = strchr(comma3 + 1, ',');
-                                        if (comma4 && comma4 < pClose) s->fontSize = atoi(comma4 + 1);
+                                        char* comma4 = strchr(comma3 + 1, ','); if (comma4 && comma4 < pClose) s->fontSize = atoi(comma4 + 1);
                                     } else s->useFill = 0;
                                 }
                             }
@@ -2334,10 +2397,16 @@ void RenderShapes(HDC dc, Shape* sArr, int sCnt, double sc, int offX, int offY, 
     int i, j;
     RECT tr;
     char dispT[256];
+    int depth = g_RenderRefDepth;
+
+    if (depth > 4) { WriteLog("RenderShapes: Depth limit exceeded!"); return; }
+    
+    if (depth == 0) WriteLog("RenderShapes: Starting render pass, count=%d", sCnt);
 
     for (i = 0; i <= sCnt; i++) {
         Shape* s = (i == sCnt) ? (isActDrawing ? activeShape : NULL) : &sArr[i];
-        HBRUSH b; HPEN p; HGDIOBJ ob, op; POINT pA[MAX_POINTS];
+        HBRUSH b; HPEN p; HGDIOBJ ob, op; 
+        POINT* pA = &g_pA[depth * MAX_POINTS];
 
         if (!s || (s->ptCount == 0 && s->type != 3 && s->type != 4)) continue;
 
@@ -2347,36 +2416,44 @@ void RenderShapes(HDC dc, Shape* sArr, int sCnt, double sc, int offX, int offY, 
         }
 
         if (s->type == 3) {
-            char refPath[260]; double refScale = 1.0, refRot = 0.0;
+            char* refPath = g_refPath[depth]; 
+            double refScale = 1.0, refRot = 0.0;
             char *pScale, *pRot, *pEnd; int pathLen;
 
             if (strncmp(s->text, "{{EXT_REF=", 10) != 0) continue;
+            
+            WriteLog("RenderShapes (Depth %d): Found EXT_REF: %s", depth, s->text);
 
             pScale = strstr(s->text, " scale="); pRot = strstr(s->text, " rot="); pEnd = strstr(s->text, "}}");
             if (pScale) pathLen = (int)(pScale - (s->text + 10));
             else if (pEnd) pathLen = (int)(pEnd - (s->text + 10));
             else pathLen = strlen(s->text + 10);
 
-            if (pathLen <= 0 || pathLen >= 260) continue;
+            if (pathLen <= 0 || pathLen >= 260) { WriteLog("RenderShapes: Path length invalid"); continue; }
             strncpy(refPath, s->text + 10, pathLen); refPath[pathLen] = '\0';
             while (pathLen > 0 && isspace((unsigned char)refPath[pathLen - 1])) refPath[--pathLen] = '\0';
 
-            if (pScale) sscanf(pScale, " scale=%lf", &refScale);
-            if (pRot) sscanf(pRot, " rot=%lf", &refRot);
+            if (pScale) refScale = atof(pScale + 7);
+            if (pRot) refRot = atof(pRot + 5);
 
             {
-                char absPath[260]; int rIdx;
+                char* absPath = g_absPath[depth]; 
+                int rIdx;
+                WriteLog("RenderShapes: Resolving path %s", refPath);
                 ResolvePath(loadedCFile[0] ? loadedCFile : "", refPath, absPath);
-                if (loadedCFile[0] && stricmp(absPath, loadedCFile) == 0) continue;
+                if (loadedCFile[0] && stricmp(absPath, loadedCFile) == 0) { WriteLog("RenderShapes: Circular ref detected"); continue; }
 
                 rIdx = EnsureRefLoaded(absPath);
                 if (rIdx != -1) {
+                    WriteLog("RenderShapes: Preparing to draw nested elements");
                     double lcx = (refCache[rIdx].minX + refCache[rIdx].maxX) / 2.0;
                     double lcy = (refCache[rIdx].minY + refCache[rIdx].maxY) / 2.0;
                     double objCx = s->ptsX[0] + lcx * refScale;
                     double objCy = s->ptsY[0] + lcy * refScale;
                     double rRad = refRot * PI / 180.0, cosR = cos(rRad), sinR = sin(rRad);
-                    double bx[4], by[4]; int r, pIdx; POINT boxPts[5]; HPEN hBoxPen; HGDIOBJ oldBoxPen;
+                    double bx[4], by[4]; int r, pIdx; 
+                    POINT* boxPts = g_boxPts[depth]; 
+                    HPEN hBoxPen; HGDIOBJ oldBoxPen;
                     
                     int currentPt = 6; 
                     int refTagIdx = 0;
@@ -2386,8 +2463,10 @@ void RenderShapes(HDC dc, Shape* sArr, int sCnt, double sc, int offX, int offY, 
                         
                         if (sub->type == 3) {
                             if (g_RenderRefDepth < 3 && strncmp(sub->text, "{{EXT_REF=", 10) == 0) {
-                                Shape tempRef = *sub;
-                                char subPath[260]; double subSc = 1.0, subRot = 0.0;
+                                Shape* tempRef = &g_tempRef[depth];
+                                *tempRef = *sub;
+                                char* subPath = g_subPath[depth]; 
+                                double subSc = 1.0, subRot = 0.0;
                                 char *spS = strstr(sub->text, " scale="), *spR = strstr(sub->text, " rot="), *spE = strstr(sub->text, "}}");
                                 int sLen;
                                 
@@ -2395,19 +2474,23 @@ void RenderShapes(HDC dc, Shape* sArr, int sCnt, double sc, int offX, int offY, 
                                 if (sLen > 0 && sLen < 260) {
                                     strncpy(subPath, sub->text + 10, sLen); subPath[sLen] = '\0';
                                     while (sLen > 0 && isspace((unsigned char)subPath[sLen - 1])) subPath[--sLen] = '\0';
-                                    if (spS) sscanf(spS, " scale=%lf", &subSc);
-                                    if (spR) sscanf(spR, " rot=%lf", &subRot);
+                                    if (spS) subSc = atof(spS + 7);
+                                    if (spR) subRot = atof(spR + 5);
                                     
                                     {
                                         double dx = (sub->ptsX[0] - lcx) * refScale;
                                         double dy = (sub->ptsY[0] - lcy) * refScale;
-                                        tempRef.ptsX[0] = objCx + dx * cosR - dy * sinR;
-                                        tempRef.ptsY[0] = objCy + dx * sinR + dy * cosR;
-                                        sprintf(tempRef.text, "{{EXT_REF=%s scale=%.2f rot=%.2f}}", subPath, subSc * refScale, subRot + refRot);
+                                        tempRef->ptsX[0] = objCx + dx * cosR - dy * sinR;
+                                        tempRef->ptsY[0] = objCy + dx * sinR + dy * cosR;
                                         
+                                        if (strlen(subPath) > 80) subPath[80] = '\0';
+                                        sprintf(tempRef->text, "{{EXT_REF=%s scale=%.2f rot=%.2f}}", subPath, subSc * refScale, subRot + refRot);
+                                        
+                                        WriteLog("RenderShapes: Calling recursively for %s", subPath);
                                         g_RenderRefDepth++;
-                                        RenderShapes(dc, &tempRef, 1, sc, offX, offY, NULL, 0, isPreview);
+                                        RenderShapes(dc, tempRef, 1, sc, offX, offY, NULL, 0, isPreview);
                                         g_RenderRefDepth--;
+                                        WriteLog("RenderShapes: Returned from recursion");
                                     }
                                 }
                             }
@@ -2421,99 +2504,64 @@ void RenderShapes(HDC dc, Shape* sArr, int sCnt, double sc, int offX, int offY, 
                             double wy = objCy + dx * sinR + dy * cosR;
                             
                             if (!isPreview) {
-                                char tagBuf[128]; RECT rTag = {0, 0, 0, 0};
+                                char* tagBuf = g_tagBuf[depth]; 
+                                RECT rTag = {0, 0, 0, 0};
                                 int tx = offX + (int)round(wx * sc);
                                 int ty = offY + (int)round(wy * sc);
                                 
-                                char instVal[128];
+                                char* instVal = g_instVal[depth];
                                 GetPipeValue(s->tagData, refTagIdx, instVal, 128);
-                                if (strlen(instVal) > 0) {
-                                    strncpy(tagBuf, instVal, 127); tagBuf[127] = '\0';
-                                } else {
-                                    strncpy(tagBuf, sub->text, 127); tagBuf[127] = '\0';
-                                }
+                                if (strlen(instVal) > 0) { strncpy(tagBuf, instVal, 127); tagBuf[127] = '\0'; } 
+                                else { strncpy(tagBuf, sub->text, 127); tagBuf[127] = '\0'; }
 
                                 if (tagBuf[0] == '{' && tagBuf[1] == '{') {
                                     char cleanTag[128]; strcpy(cleanTag, tagBuf + 2);
-                                    char *pEndClean = strstr(cleanTag, "}}");
-                                    if (pEndClean) *pEndClean = '\0';
+                                    char *pEndClean = strstr(cleanTag, "}}"); if (pEndClean) *pEndClean = '\0';
                                     strcpy(tagBuf, cleanTag);
                                 }
-
                                 if (strcmp(tagBuf, "SHEETSCALE") == 0) {
-                                    if (activePageScale > 0 && activePageScale <= 1.0) {
-                                        sprintf(tagBuf, "1:%g", 1.0 / activePageScale);
-                                    } else {
-                                        sprintf(tagBuf, "%g", activePageScale);
-                                    }
+                                    if (activePageScale > 0 && activePageScale <= 1.0) sprintf(tagBuf, "1:%g", 1.0 / activePageScale);
+                                    else sprintf(tagBuf, "%g", activePageScale);
                                 }
 
                                 int fSize = sub->fontSize > 0 ? sub->fontSize : 24;
-                                int fH = (int)(fSize * refScale * (sc / 10.0));
-                                if (fH < 2) fH = 2;
+                                int fH = (int)(fSize * refScale * (sc / 10.0)); if (fH < 2) fH = 2;
                                 HFONT hFont = CreateFont(fH, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
                                 HGDIOBJ oldFont = SelectObject(dc, hFont);
 
                                 DrawText(dc, tagBuf, -1, &rTag, DT_CALCRECT | DT_NOPREFIX);
-                                int tw = rTag.right - rTag.left; 
-                                int th = rTag.bottom - rTag.top;
-                                
+                                int tw = rTag.right - rTag.left; int th = rTag.bottom - rTag.top;
                                 int dtFlags = DT_NOPREFIX;
-                                if (sub->useFill == 1) {
-                                    rTag.left = tx - tw/2; rTag.right = tx + tw/2;
-                                    dtFlags |= DT_CENTER;
-                                } else if (sub->useFill == 2) {
-                                    rTag.left = tx - tw; rTag.right = tx;
-                                    dtFlags |= DT_RIGHT;
-                                } else {
-                                    rTag.left = tx; rTag.right = tx + tw;
-                                    dtFlags |= DT_LEFT;
-                                }
+                                if (sub->useFill == 1) { rTag.left = tx - tw/2; rTag.right = tx + tw/2; dtFlags |= DT_CENTER; }
+                                else if (sub->useFill == 2) { rTag.left = tx - tw; rTag.right = tx; dtFlags |= DT_RIGHT; }
+                                else { rTag.left = tx; rTag.right = tx + tw; dtFlags |= DT_LEFT; }
                                 rTag.top = ty; rTag.bottom = ty + th;
                                 
-                                SetTextColor(dc, sub->stroke); SetBkMode(dc, TRANSPARENT);
-                                DrawText(dc, tagBuf, -1, &rTag, dtFlags);
-                                
-                                SelectObject(dc, oldFont);
-                                DeleteObject(hFont);
+                                SetTextColor(dc, sub->stroke); SetBkMode(dc, TRANSPARENT); DrawText(dc, tagBuf, -1, &rTag, dtFlags);
+                                SelectObject(dc, oldFont); DeleteObject(hFont);
 
                                 if (textHitCount < 128 && sArr == shapes) {
-                                    textHits[textHitCount].shapeIdx = i; 
-                                    textHits[textHitCount].isRef = 1;
-                                    textHits[textHitCount].tagIdx = refTagIdx;
-                                    textHits[textHitCount].box = rTag;
-                                    textHitCount++;
+                                    textHits[textHitCount].shapeIdx = i; textHits[textHitCount].isRef = 1; textHits[textHitCount].tagIdx = refTagIdx; textHits[textHitCount].box = rTag; textHitCount++;
                                 }
                             }
-                            
-                            if (currentPt < MAX_POINTS) {
-                                s->ptsX[currentPt] = wx; s->ptsY[currentPt] = wy; currentPt++;
-                            }
+                            if (currentPt < MAX_POINTS) { s->ptsX[currentPt] = wx; s->ptsY[currentPt] = wy; currentPt++; }
                             refTagIdx++;
                         } else {
-                            POINT subPts[MAX_POINTS];
+                            POINT* subPts = &g_subPts[depth * MAX_POINTS];
                             int subCount = (sub->ptCount > MAX_POINTS) ? MAX_POINTS : sub->ptCount;
-
                             for (pIdx = 0; pIdx < subCount; pIdx++) {
-                                double dx = (sub->ptsX[pIdx] - lcx) * refScale;
-                                double dy = (sub->ptsY[pIdx] - lcy) * refScale;
-                                double wx = objCx + (dx * cosR - dy * sinR);
-                                double wy = objCy + (dx * sinR + dy * cosR);
-                                subPts[pIdx].x = offX + (int)round(wx * sc);
-                                subPts[pIdx].y = offY + (int)round(wy * sc);
-
-                                if (currentPt < MAX_POINTS) {
-                                    s->ptsX[currentPt] = wx; s->ptsY[currentPt] = wy; currentPt++;
-                                }
+                                double dx = (sub->ptsX[pIdx] - lcx) * refScale; double dy = (sub->ptsY[pIdx] - lcy) * refScale;
+                                double wx = objCx + (dx * cosR - dy * sinR); double wy = objCy + (dx * sinR + dy * cosR);
+                                subPts[pIdx].x = offX + (int)round(wx * sc); subPts[pIdx].y = offY + (int)round(wy * sc);
+                                if (currentPt < MAX_POINTS) { s->ptsX[currentPt] = wx; s->ptsY[currentPt] = wy; currentPt++; }
                             }
 
                             b = sub->useFill ? CreateSolidBrush(sub->fill) : (HBRUSH)GetStockObject(NULL_BRUSH);
                             p = sub->useStroke ? CreatePen(PS_SOLID, sub->strokeWidth > 0 ? sub->strokeWidth : 1, sub->stroke) : (HPEN)GetStockObject(NULL_PEN);
                             ob = SelectObject(dc, b); op = SelectObject(dc, p);
 
-                            if (sub->type == 0 && subCount >= 3) {
-                                SetPolyFillMode(dc, ALTERNATE); Polygon(dc, subPts, subCount);
-                            } else if (subCount >= 2) { Polyline(dc, subPts, subCount); }
+                            if (sub->type == 0 && subCount >= 3) { SetPolyFillMode(dc, ALTERNATE); Polygon(dc, subPts, subCount); } 
+                            else if (subCount >= 2) { Polyline(dc, subPts, subCount); }
 
                             SelectObject(dc, ob); SelectObject(dc, op);
                             if (sub->useFill) DeleteObject(b); if (sub->useStroke) DeleteObject(p);
@@ -2522,34 +2570,17 @@ void RenderShapes(HDC dc, Shape* sArr, int sCnt, double sc, int offX, int offY, 
 
                     if (!isPreview && refCache[rIdx].dimCount > 0) {
                         int dIdx;
-                        HPEN hDimPen = CreatePen(PS_SOLID, 1, RGB(0, 128, 255));
-                        HBRUSH hDimBr = CreateSolidBrush(RGB(0, 128, 255));
-                        int fSize = 14; 
-                        HFONT hDimFont;
-                        HGDIOBJ oldPen2, oldBr2, oldFont2;
-
-                        hDimFont = CreateFont(fSize, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
-                        
-                        oldPen2 = SelectObject(dc, hDimPen);
-                        oldBr2 = SelectObject(dc, hDimBr);
-                        oldFont2 = SelectObject(dc, hDimFont);
-                        
-                        SetTextColor(dc, RGB(0, 128, 255));
-                        SetBkMode(dc, TRANSPARENT);
+                        HPEN hDimPen = CreatePen(PS_SOLID, 1, RGB(0, 128, 255)); HBRUSH hDimBr = CreateSolidBrush(RGB(0, 128, 255));
+                        HFONT hDimFont = CreateFont(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
+                        HGDIOBJ oldPen2 = SelectObject(dc, hDimPen), oldBr2 = SelectObject(dc, hDimBr), oldFont2 = SelectObject(dc, hDimFont);
+                        SetTextColor(dc, RGB(0, 128, 255)); SetBkMode(dc, TRANSPARENT);
 
                         for (dIdx = 0; dIdx < refCache[rIdx].dimCount; dIdx++) {
                             Dimension* d = &refCache[rIdx].dims[dIdx];
                             if (d->s1 < refCache[rIdx].shapeCount && d->s2 < refCache[rIdx].shapeCount) {
-                                double lA1x = refCache[rIdx].shapes[d->s1].ptsX[d->p1];
-                                double lA1y = refCache[rIdx].shapes[d->s1].ptsY[d->p1];
-                                double lA2x = refCache[rIdx].shapes[d->s2].ptsX[d->p2];
-                                double lA2y = refCache[rIdx].shapes[d->s2].ptsY[d->p2];
-                                
-                                double dX = lA2x - lA1x, dY = lA2y - lA1y;
-                                double val;
-                                
-                                double sOffset = d->offset * sc;
-                                double dx_r, dy_r, gA1x, gA1y, gA2x, gA2y;
+                                double lA1x = refCache[rIdx].shapes[d->s1].ptsX[d->p1]; double lA1y = refCache[rIdx].shapes[d->s1].ptsY[d->p1];
+                                double lA2x = refCache[rIdx].shapes[d->s2].ptsX[d->p2]; double lA2y = refCache[rIdx].shapes[d->s2].ptsY[d->p2];
+                                double dX = lA2x - lA1x, dY = lA2y - lA1y, val, sOffset = d->offset * sc, dx_r, dy_r, gA1x, gA1y, gA2x, gA2y;
                                 int sA1x, sA1y, sA2x, sA2y, sD1x, sD1y, sD2x, sD2y, sMidX, sMidY;
 
                                 dx_r = (lA1x - lcx) * refScale; dy_r = (lA1y - lcy) * refScale;
@@ -2561,100 +2592,54 @@ void RenderShapes(HDC dc, Shape* sArr, int sCnt, double sc, int offX, int offY, 
                                 sA2x = offX + (int)round(gA2x * sc); sA2y = offY + (int)round(gA2y * sc);
 
                                 if (d->mode == 0) {
-                                    double sDX = sA2x - sA1x, sDY = sA2y - sA1y;
-                                    double ang = atan2(sDY, sDX);
-                                    double nX = -sin(ang), nY = cos(ang);
-                                    sD1x = sA1x + (int)round(nX * sOffset);
-                                    sD1y = sA1y + (int)round(nY * sOffset);
-                                    sD2x = sA2x + (int)round(nX * sOffset);
-                                    sD2y = sA2y + (int)round(nY * sOffset);
+                                    double sDX = sA2x - sA1x, sDY = sA2y - sA1y, ang = atan2(sDY, sDX), nX = -sin(ang), nY = cos(ang);
+                                    sD1x = sA1x + (int)round(nX * sOffset); sD1y = sA1y + (int)round(nY * sOffset); sD2x = sA2x + (int)round(nX * sOffset); sD2y = sA2y + (int)round(nY * sOffset);
                                     val = sqrt(dX*dX + dY*dY) * refScale;
                                 } else if (d->mode == 1) {
-                                    sD1x = sA1x; sD1y = sA1y + (int)round(sOffset);
-                                    sD2x = sA2x; sD2y = sA1y + (int)round(sOffset);
-                                    val = fabs(dX) * refScale;
+                                    sD1x = sA1x; sD1y = sA1y + (int)round(sOffset); sD2x = sA2x; sD2y = sA1y + (int)round(sOffset); val = fabs(dX) * refScale;
                                 } else {
-                                    sD1x = sA1x + (int)round(sOffset); sD1y = sA1y;
-                                    sD2x = sA1x + (int)round(sOffset); sD2y = sA2y;
-                                    val = fabs(dY) * refScale;
+                                    sD1x = sA1x + (int)round(sOffset); sD1y = sA1y; sD2x = sA1x + (int)round(sOffset); sD2y = sA2y; val = fabs(dY) * refScale;
                                 }
 
                                 {
-                                    double L1dx = sD1x - sA1x, L1dy = sD1y - sA1y;
-                                    double L1len = sqrt(L1dx*L1dx + L1dy*L1dy);
-                                    if (L1len > 5.0) {
-                                        MoveTo(dc, sA1x + (int)round(L1dx/L1len*5.0), sA1y + (int)round(L1dy/L1len*5.0));
-                                        LineTo(dc, sD1x + (int)round(L1dx/L1len*2.0), sD1y + (int)round(L1dy/L1len*2.0));
-                                    }
-                                    double L2dx = sD2x - sA2x, L2dy = sD2y - sA2y;
-                                    double L2len = sqrt(L2dx*L2dx + L2dy*L2dy);
-                                    if (L2len > 5.0) {
-                                        MoveTo(dc, sA2x + (int)round(L2dx/L2len*5.0), sA2y + (int)round(L2dy/L2len*5.0));
-                                        LineTo(dc, sD2x + (int)round(L2dx/L2len*2.0), sD2y + (int)round(L2dy/L2len*2.0));
-                                    }
+                                    double L1dx = sD1x - sA1x, L1dy = sD1y - sA1y, L1len = sqrt(L1dx*L1dx + L1dy*L1dy);
+                                    if (L1len > 5.0) { MoveTo(dc, sA1x + (int)round(L1dx/L1len*5.0), sA1y + (int)round(L1dy/L1len*5.0)); LineTo(dc, sD1x + (int)round(L1dx/L1len*2.0), sD1y + (int)round(L1dy/L1len*2.0)); }
+                                    double L2dx = sD2x - sA2x, L2dy = sD2y - sA2y, L2len = sqrt(L2dx*L2dx + L2dy*L2dy);
+                                    if (L2len > 5.0) { MoveTo(dc, sA2x + (int)round(L2dx/L2len*5.0), sA2y + (int)round(L2dy/L2len*5.0)); LineTo(dc, sD2x + (int)round(L2dx/L2len*2.0), sD2y + (int)round(L2dy/L2len*2.0)); }
                                 }
-
                                 MoveTo(dc, sD1x, sD1y); LineTo(dc, sD2x, sD2y);
-
                                 {
-                                    double dimDx = sD2x - sD1x, dimDy = sD2y - sD1y;
-                                    double dimLen = sqrt(dimDx*dimDx + dimDy*dimDy);
+                                    double dimDx = sD2x - sD1x, dimDy = sD2y - sD1y, dimLen = sqrt(dimDx*dimDx + dimDy*dimDy);
                                     if (dimLen > 0) {
-                                        double dirX = dimDx/dimLen, dirY = dimDy/dimLen;
-                                        POINT pts[3];
-                                        pts[0].x = sD1x; pts[0].y = sD1y;
-                                        pts[1].x = sD1x + (int)round(dirX*10 - dirY*3); pts[1].y = sD1y + (int)round(dirY*10 + dirX*3);
-                                        pts[2].x = sD1x + (int)round(dirX*10 + dirY*3); pts[2].y = sD1y + (int)round(dirY*10 - dirX*3);
-                                        Polygon(dc, pts, 3);
-                                        
-                                        pts[0].x = sD2x; pts[0].y = sD2y;
-                                        pts[1].x = sD2x - (int)round(dirX*10 - dirY*3); pts[1].y = sD2y - (int)round(dirY*10 + dirX*3);
-                                        pts[2].x = sD2x - (int)round(dirX*10 + dirY*3); pts[2].y = sD2y - (int)round(dirY*10 - dirX*3);
-                                        Polygon(dc, pts, 3);
+                                        double dirX = dimDx/dimLen, dirY = dimDy/dimLen; POINT pts[3];
+                                        pts[0].x = sD1x; pts[0].y = sD1y; pts[1].x = sD1x + (int)round(dirX*10 - dirY*3); pts[1].y = sD1y + (int)round(dirY*10 + dirX*3); pts[2].x = sD1x + (int)round(dirX*10 + dirY*3); pts[2].y = sD1y + (int)round(dirY*10 - dirX*3); Polygon(dc, pts, 3);
+                                        pts[0].x = sD2x; pts[0].y = sD2y; pts[1].x = sD2x - (int)round(dirX*10 - dirY*3); pts[1].y = sD2y - (int)round(dirY*10 + dirX*3); pts[2].x = sD2x - (int)round(dirX*10 + dirY*3); pts[2].y = sD2y - (int)round(dirY*10 - dirX*3); Polygon(dc, pts, 3);
                                     }
                                 }
 
-                                sMidX = sD1x + (int)round((sD2x - sD1x) * d->textPos);
-                                sMidY = sD1y + (int)round((sD2y - sD1y) * d->textPos);
-
-                                char buf[64];
-                                FormatDimension(val, activeUnitName, buf);
-                                DWORD ext = GetTextExtent(dc, buf, strlen(buf));
-                                int tW = LOWORD(ext); int tH = HIWORD(ext);
-                                int tx = sMidX - tW/2; int ty = sMidY - tH/2;
-                                RECT tR;
-                                tR.left = tx - 2; tR.top = ty - 2; tR.right = tx + tW + 2; tR.bottom = ty + tH + 2;
-                                
-                                FillRect(dc, &tR, (HBRUSH)GetStockObject(WHITE_BRUSH));
-                                TextOut(dc, tx, ty, buf, strlen(buf));
+                                sMidX = sD1x + (int)round((sD2x - sD1x) * d->textPos); sMidY = sD1y + (int)round((sD2y - sD1y) * d->textPos);
+                                char buf[64]; FormatDimension(val, activeUnitName, buf);
+                                DWORD ext = GetTextExtent(dc, buf, strlen(buf)); int tW = LOWORD(ext), tH = HIWORD(ext), tx = sMidX - tW/2, ty = sMidY - tH/2;
+                                RECT tR; tR.left = tx - 2; tR.top = ty - 2; tR.right = tx + tW + 2; tR.bottom = ty + tH + 2;
+                                FillRect(dc, &tR, (HBRUSH)GetStockObject(WHITE_BRUSH)); TextOut(dc, tx, ty, buf, strlen(buf));
                             }
                         }
-                        SelectObject(dc, oldPen2); DeleteObject(hDimPen);
-                        SelectObject(dc, oldBr2); DeleteObject(hDimBr);
-                        SelectObject(dc, oldFont2); DeleteObject(hDimFont);
+                        SelectObject(dc, oldPen2); DeleteObject(hDimPen); SelectObject(dc, oldBr2); DeleteObject(hDimBr); SelectObject(dc, oldFont2); DeleteObject(hDimFont);
                     }
 
-                    bx[0] = refCache[rIdx].minX; by[0] = refCache[rIdx].minY;
-                    bx[1] = refCache[rIdx].maxX; by[1] = refCache[rIdx].minY;
-                    bx[2] = refCache[rIdx].maxX; by[2] = refCache[rIdx].maxY;
-                    bx[3] = refCache[rIdx].minX; by[3] = refCache[rIdx].maxY;
+                    bx[0] = refCache[rIdx].minX; by[0] = refCache[rIdx].minY; bx[1] = refCache[rIdx].maxX; by[1] = refCache[rIdx].minY;
+                    bx[2] = refCache[rIdx].maxX; by[2] = refCache[rIdx].maxY; bx[3] = refCache[rIdx].minX; by[3] = refCache[rIdx].maxY;
 
                     for (r = 0; r < 4; r++) {
-                        double dx = (bx[r] - lcx) * refScale;
-                        double dy = (by[r] - lcy) * refScale;
-                        s->ptsX[r + 1] = objCx + (dx * cosR - dy * sinR);
-                        s->ptsY[r + 1] = objCy + (dx * sinR + dy * cosR);
+                        double dx = (bx[r] - lcx) * refScale; double dy = (by[r] - lcy) * refScale;
+                        s->ptsX[r + 1] = objCx + (dx * cosR - dy * sinR); s->ptsY[r + 1] = objCy + (dx * sinR + dy * cosR);
                     }
                     s->ptsX[5] = objCx; s->ptsY[5] = objCy; s->ptCount = currentPt;
 
                     if (!isPreview && (currentMode == 27 || (sArr == shapes && ptSelected[i][0]))) {
-                        if (sArr == shapes && ptSelected[i][0]) hBoxPen = CreatePen(PS_DOT, 1, RGB(255, 0, 0));
-                        else hBoxPen = CreatePen(PS_DOT, 1, RGB(160, 160, 160));
+                        if (sArr == shapes && ptSelected[i][0]) hBoxPen = CreatePen(PS_DOT, 1, RGB(255, 0, 0)); else hBoxPen = CreatePen(PS_DOT, 1, RGB(160, 160, 160));
                         oldBoxPen = SelectObject(dc, hBoxPen);
-                        for (r = 0; r < 4; r++) {
-                            boxPts[r].x = offX + (int)round(s->ptsX[r + 1] * sc);
-                            boxPts[r].y = offY + (int)round(s->ptsY[r + 1] * sc);
-                        }
+                        for (r = 0; r < 4; r++) { boxPts[r].x = offX + (int)round(s->ptsX[r + 1] * sc); boxPts[r].y = offY + (int)round(s->ptsY[r + 1] * sc); }
                         boxPts[4] = boxPts[0]; Polyline(dc, boxPts, 5);
                         SelectObject(dc, oldBoxPen); DeleteObject(hBoxPen);
                     }
@@ -2665,61 +2650,30 @@ void RenderShapes(HDC dc, Shape* sArr, int sCnt, double sc, int offX, int offY, 
 
         if (s->type == 4) {
             if (!isPreview) {
-                if (s->text[0] == '{' && s->text[1] == '{') {
-                    strcpy(dispT, s->text + 2);
-                    char *pEnd = strstr(dispT, "}}");
-                    if (pEnd) *pEnd = '\0';
-                } else {
-                    strcpy(dispT, s->text);
-                }
+                if (s->text[0] == '{' && s->text[1] == '{') { strcpy(dispT, s->text + 2); char *pEnd = strstr(dispT, "}}"); if (pEnd) *pEnd = '\0'; } 
+                else { strcpy(dispT, s->text); }
 
                 if (strcmp(dispT, "SHEETSCALE") == 0) {
-                    if (activePageScale > 0 && activePageScale <= 1.0) {
-                        sprintf(dispT, "1:%g", 1.0 / activePageScale);
-                    } else {
-                        sprintf(dispT, "%g", activePageScale);
-                    }
+                    if (activePageScale > 0 && activePageScale <= 1.0) sprintf(dispT, "1:%g", 1.0 / activePageScale);
+                    else sprintf(dispT, "%g", activePageScale);
                 }
 
-                int fSize = s->fontSize > 0 ? s->fontSize : 24;
-                int fH = (int)(fSize * (sc / 10.0));
-                if (fH < 2) fH = 2;
+                int fSize = s->fontSize > 0 ? s->fontSize : 24; int fH = (int)(fSize * (sc / 10.0)); if (fH < 2) fH = 2;
                 HFONT hFont = CreateFont(fH, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
                 HGDIOBJ oldFont = SelectObject(dc, hFont);
 
-                RECT rCalc = {0, 0, 0, 0};
-                DrawText(dc, dispT, -1, &rCalc, DT_CALCRECT | DT_NOPREFIX);
-                int tw = rCalc.right - rCalc.left; 
-                int th = rCalc.bottom - rCalc.top;
+                RECT rCalc = {0, 0, 0, 0}; DrawText(dc, dispT, -1, &rCalc, DT_CALCRECT | DT_NOPREFIX);
+                int tw = rCalc.right - rCalc.left, th = rCalc.bottom - rCalc.top, tx = pA[0].x, ty = pA[0].y, dtFlags = DT_NOPREFIX;
                 
-                int tx = pA[0].x; int ty = pA[0].y;
-                
-                int dtFlags = DT_NOPREFIX;
-                if (s->useFill == 1) {
-                    tr.left = tx - tw/2; tr.right = tx + tw/2;
-                    dtFlags |= DT_CENTER;
-                } else if (s->useFill == 2) {
-                    tr.left = tx - tw; tr.right = tx;
-                    dtFlags |= DT_RIGHT;
-                } else {
-                    tr.left = tx; tr.right = tx + tw;
-                    dtFlags |= DT_LEFT;
-                }
+                if (s->useFill == 1) { tr.left = tx - tw/2; tr.right = tx + tw/2; dtFlags |= DT_CENTER; }
+                else if (s->useFill == 2) { tr.left = tx - tw; tr.right = tx; dtFlags |= DT_RIGHT; }
+                else { tr.left = tx; tr.right = tx + tw; dtFlags |= DT_LEFT; }
                 tr.top = ty; tr.bottom = ty + th;
                 
-                SetTextColor(dc, s->stroke); SetBkMode(dc, TRANSPARENT);
-                DrawText(dc, dispT, -1, &tr, dtFlags);
-                
-                SelectObject(dc, oldFont);
-                DeleteObject(hFont);
+                SetTextColor(dc, s->stroke); SetBkMode(dc, TRANSPARENT); DrawText(dc, dispT, -1, &tr, dtFlags);
+                SelectObject(dc, oldFont); DeleteObject(hFont);
 
-                if (textHitCount < 128 && sArr == shapes) {
-                    textHits[textHitCount].shapeIdx = i;
-                    textHits[textHitCount].isRef = 0;
-                    textHits[textHitCount].tagIdx = -1;
-                    textHits[textHitCount].box = tr;
-                    textHitCount++;
-                }
+                if (textHitCount < 128 && sArr == shapes) { textHits[textHitCount].shapeIdx = i; textHits[textHitCount].isRef = 0; textHits[textHitCount].tagIdx = -1; textHits[textHitCount].box = tr; textHitCount++; }
             }
             continue;
         }
@@ -2977,8 +2931,13 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             hMain = hwnd;
             DragAcceptFiles(hwnd, TRUE);
 
-            shapes = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
+shapes = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
             dragStartSnapshot = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
+            
+            g_tempRef = (Shape*)GlobalAllocPtr(GHND, 5 * sizeof(Shape));
+            g_subPts = (POINT*)GlobalAllocPtr(GHND, 5 * MAX_POINTS * sizeof(POINT));
+            g_pA = (POINT*)GlobalAllocPtr(GHND, 5 * MAX_POINTS * sizeof(POINT));
+
             for(i=0; i<MAX_UNDO; i++) {
                 history[i] = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
                 if (!history[i]) allocFailed = 1;
@@ -4619,8 +4578,14 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             if (IsWindow(hDistEdit) && oldEditProc) { SetWindowLong(hDistEdit, GWL_WNDPROC, (LONG)oldEditProc); oldEditProc = NULL; }
             if (IsWindow(hMultiEdit) && oldMultiEditProc) { SetWindowLong(hMultiEdit, GWL_WNDPROC, (LONG)oldMultiEditProc); oldMultiEditProc = NULL; }
 
-            if (shapes) { GlobalFreePtr(shapes); shapes = NULL; }
+if (shapes) { GlobalFreePtr(shapes); shapes = NULL; }
             if (dragStartSnapshot) { GlobalFreePtr(dragStartSnapshot); dragStartSnapshot = NULL; }
+
+            /* ADD THESE 3 LINES: */
+            if (g_tempRef) { GlobalFreePtr(g_tempRef); g_tempRef = NULL; }
+            if (g_subPts) { GlobalFreePtr(g_subPts); g_subPts = NULL; }
+            if (g_pA) { GlobalFreePtr(g_pA); g_pA = NULL; }
+
             for(i=0; i<MAX_UNDO; i++) {
                 if (history[i]) { GlobalFreePtr(history[i]); history[i] = NULL; }
             }
