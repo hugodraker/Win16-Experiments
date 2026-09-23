@@ -24,6 +24,7 @@
 #include <stdarg.h>
 
 void WriteLog(const char* fmt, ...) {
+return;
     FILE* f = fopen("debug.log", "a");
     if (f) {
         va_list args;
@@ -2394,299 +2395,299 @@ void DrawPalette(HDC dc) {
 }
 
 void RenderShapes(HDC dc, Shape* sArr, int sCnt, double sc, int offX, int offY, Shape* activeShape, int isActDrawing, int isPreview) {
-    int i, j;
+    int i, j, pass;
     RECT tr;
     char dispT[256];
     int depth = g_RenderRefDepth;
 
-    if (depth > 4) { WriteLog("RenderShapes: Depth limit exceeded!"); return; }
-    
-    if (depth == 0) WriteLog("RenderShapes: Starting render pass, count=%d", sCnt);
+    if (depth > 4) return; /* Safety check */
 
-    for (i = 0; i <= sCnt; i++) {
-        Shape* s = (i == sCnt) ? (isActDrawing ? activeShape : NULL) : &sArr[i];
-        HBRUSH b; HPEN p; HGDIOBJ ob, op; 
-        POINT* pA = &g_pA[depth * MAX_POINTS];
+    for (pass = 0; pass < 2; pass++) {
+        for (i = 0; i <= sCnt; i++) {
+            Shape* s = (i == sCnt) ? (isActDrawing ? activeShape : NULL) : &sArr[i];
+            HBRUSH b; HPEN p; HGDIOBJ ob, op; 
+            POINT* pA = &g_pA[depth * MAX_POINTS];
 
-        if (!s || (s->ptCount == 0 && s->type != 3 && s->type != 4)) continue;
-
-        for (j = 0; j < s->ptCount; j++) {
-            pA[j].x = offX + (int)round(s->ptsX[j] * sc);
-            pA[j].y = offY + (int)round(s->ptsY[j] * sc);
-        }
-
-        if (s->type == 3) {
-            char* refPath = g_refPath[depth]; 
-            double refScale = 1.0, refRot = 0.0;
-            char *pScale, *pRot, *pEnd; int pathLen;
-
-            if (strncmp(s->text, "{{EXT_REF=", 10) != 0) continue;
+            if (!s || (s->ptCount == 0 && s->type != 3 && s->type != 4)) continue;
             
-            WriteLog("RenderShapes (Depth %d): Found EXT_REF: %s", depth, s->text);
+            /* Pass 0: Background REFs. Pass 1: Foreground Polygons, Lines, and Tags */
+            if (pass == 0 && s->type != 3) continue;
+            if (pass == 1 && s->type == 3) continue;
 
-            pScale = strstr(s->text, " scale="); pRot = strstr(s->text, " rot="); pEnd = strstr(s->text, "}}");
-            if (pScale) pathLen = (int)(pScale - (s->text + 10));
-            else if (pEnd) pathLen = (int)(pEnd - (s->text + 10));
-            else pathLen = strlen(s->text + 10);
+            for (j = 0; j < s->ptCount; j++) {
+                pA[j].x = offX + (int)round(s->ptsX[j] * sc);
+                pA[j].y = offY + (int)round(s->ptsY[j] * sc);
+            }
 
-            if (pathLen <= 0 || pathLen >= 260) { WriteLog("RenderShapes: Path length invalid"); continue; }
-            strncpy(refPath, s->text + 10, pathLen); refPath[pathLen] = '\0';
-            while (pathLen > 0 && isspace((unsigned char)refPath[pathLen - 1])) refPath[--pathLen] = '\0';
+            if (s->type == 3) {
+                char* refPath = g_refPath[depth]; 
+                double refScale = 1.0, refRot = 0.0;
+                char *pScale, *pRot, *pEnd; int pathLen;
 
-            if (pScale) refScale = atof(pScale + 7);
-            if (pRot) refRot = atof(pRot + 5);
+                if (strncmp(s->text, "{{EXT_REF=", 10) != 0) continue;
 
-            {
-                char* absPath = g_absPath[depth]; 
-                int rIdx;
-                WriteLog("RenderShapes: Resolving path %s", refPath);
-                ResolvePath(loadedCFile[0] ? loadedCFile : "", refPath, absPath);
-                if (loadedCFile[0] && stricmp(absPath, loadedCFile) == 0) { WriteLog("RenderShapes: Circular ref detected"); continue; }
+                pScale = strstr(s->text, " scale="); pRot = strstr(s->text, " rot="); pEnd = strstr(s->text, "}}");
+                if (pScale) pathLen = (int)(pScale - (s->text + 10));
+                else if (pEnd) pathLen = (int)(pEnd - (s->text + 10));
+                else pathLen = strlen(s->text + 10);
 
-                rIdx = EnsureRefLoaded(absPath);
-                if (rIdx != -1) {
-                    WriteLog("RenderShapes: Preparing to draw nested elements");
-                    double lcx = (refCache[rIdx].minX + refCache[rIdx].maxX) / 2.0;
-                    double lcy = (refCache[rIdx].minY + refCache[rIdx].maxY) / 2.0;
-                    double objCx = s->ptsX[0] + lcx * refScale;
-                    double objCy = s->ptsY[0] + lcy * refScale;
-                    double rRad = refRot * PI / 180.0, cosR = cos(rRad), sinR = sin(rRad);
-                    double bx[4], by[4]; int r, pIdx; 
-                    POINT* boxPts = g_boxPts[depth]; 
-                    HPEN hBoxPen; HGDIOBJ oldBoxPen;
-                    
-                    int currentPt = 6; 
-                    int refTagIdx = 0;
+                if (pathLen <= 0 || pathLen >= 260) continue;
+                strncpy(refPath, s->text + 10, pathLen); refPath[pathLen] = '\0';
+                while (pathLen > 0 && isspace((unsigned char)refPath[pathLen - 1])) refPath[--pathLen] = '\0';
 
-                    for (r = 0; r < refCache[rIdx].shapeCount; r++) {
-                        Shape* sub = &refCache[rIdx].shapes[r];
+                if (pScale) refScale = atof(pScale + 7);
+                if (pRot) refRot = atof(pRot + 5);
+
+                {
+                    char* absPath = g_absPath[depth]; 
+                    int rIdx;
+                    ResolvePath(loadedCFile[0] ? loadedCFile : "", refPath, absPath);
+                    if (loadedCFile[0] && stricmp(absPath, loadedCFile) == 0) continue;
+
+                    rIdx = EnsureRefLoaded(absPath);
+                    if (rIdx != -1) {
+                        double lcx = (refCache[rIdx].minX + refCache[rIdx].maxX) / 2.0;
+                        double lcy = (refCache[rIdx].minY + refCache[rIdx].maxY) / 2.0;
+                        double objCx = s->ptsX[0] + lcx * refScale;
+                        double objCy = s->ptsY[0] + lcy * refScale;
+                        double rRad = refRot * PI / 180.0, cosR = cos(rRad), sinR = sin(rRad);
+                        double bx[4], by[4]; int r, pIdx; 
+                        POINT* boxPts = g_boxPts[depth]; 
+                        HPEN hBoxPen; HGDIOBJ oldBoxPen;
                         
-                        if (sub->type == 3) {
-                            if (g_RenderRefDepth < 3 && strncmp(sub->text, "{{EXT_REF=", 10) == 0) {
-                                Shape* tempRef = &g_tempRef[depth];
-                                *tempRef = *sub;
-                                char* subPath = g_subPath[depth]; 
-                                double subSc = 1.0, subRot = 0.0;
-                                char *spS = strstr(sub->text, " scale="), *spR = strstr(sub->text, " rot="), *spE = strstr(sub->text, "}}");
-                                int sLen;
-                                
-                                if (spS) sLen = (int)(spS - (sub->text + 10)); else if (spE) sLen = (int)(spE - (sub->text + 10)); else sLen = strlen(sub->text + 10);
-                                if (sLen > 0 && sLen < 260) {
-                                    strncpy(subPath, sub->text + 10, sLen); subPath[sLen] = '\0';
-                                    while (sLen > 0 && isspace((unsigned char)subPath[sLen - 1])) subPath[--sLen] = '\0';
-                                    if (spS) subSc = atof(spS + 7);
-                                    if (spR) subRot = atof(spR + 5);
-                                    
-                                    {
-                                        double dx = (sub->ptsX[0] - lcx) * refScale;
-                                        double dy = (sub->ptsY[0] - lcy) * refScale;
-                                        tempRef->ptsX[0] = objCx + dx * cosR - dy * sinR;
-                                        tempRef->ptsY[0] = objCy + dx * sinR + dy * cosR;
-                                        
-                                        if (strlen(subPath) > 80) subPath[80] = '\0';
-                                        sprintf(tempRef->text, "{{EXT_REF=%s scale=%.2f rot=%.2f}}", subPath, subSc * refScale, subRot + refRot);
-                                        
-                                        WriteLog("RenderShapes: Calling recursively for %s", subPath);
-                                        g_RenderRefDepth++;
-                                        RenderShapes(dc, tempRef, 1, sc, offX, offY, NULL, 0, isPreview);
-                                        g_RenderRefDepth--;
-                                        WriteLog("RenderShapes: Returned from recursion");
-                                    }
-                                }
-                            }
-                            continue;
-                        }
+                        int currentPt = 6; 
+                        int refTagIdx = 0;
 
-                        if (sub->type == 4) {
-                            double dx = (sub->ptsX[0] - lcx) * refScale;
-                            double dy = (sub->ptsY[0] - lcy) * refScale;
-                            double wx = objCx + dx * cosR - dy * sinR;
-                            double wy = objCy + dx * sinR + dy * cosR;
+                        for (r = 0; r < refCache[rIdx].shapeCount; r++) {
+                            Shape* sub = &refCache[rIdx].shapes[r];
                             
-                            if (!isPreview) {
-                                char* tagBuf = g_tagBuf[depth]; 
-                                RECT rTag = {0, 0, 0, 0};
-                                int tx = offX + (int)round(wx * sc);
-                                int ty = offY + (int)round(wy * sc);
-                                
-                                char* instVal = g_instVal[depth];
-                                GetPipeValue(s->tagData, refTagIdx, instVal, 128);
-                                if (strlen(instVal) > 0) { strncpy(tagBuf, instVal, 127); tagBuf[127] = '\0'; } 
-                                else { strncpy(tagBuf, sub->text, 127); tagBuf[127] = '\0'; }
-
-                                if (tagBuf[0] == '{' && tagBuf[1] == '{') {
-                                    char cleanTag[128]; strcpy(cleanTag, tagBuf + 2);
-                                    char *pEndClean = strstr(cleanTag, "}}"); if (pEndClean) *pEndClean = '\0';
-                                    strcpy(tagBuf, cleanTag);
-                                }
-                                if (strcmp(tagBuf, "SHEETSCALE") == 0) {
-                                    if (activePageScale > 0 && activePageScale <= 1.0) sprintf(tagBuf, "1:%g", 1.0 / activePageScale);
-                                    else sprintf(tagBuf, "%g", activePageScale);
-                                }
-
-                                int fSize = sub->fontSize > 0 ? sub->fontSize : 24;
-                                int fH = (int)(fSize * refScale * (sc / 10.0)); if (fH < 2) fH = 2;
-                                HFONT hFont = CreateFont(fH, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
-                                HGDIOBJ oldFont = SelectObject(dc, hFont);
-
-                                DrawText(dc, tagBuf, -1, &rTag, DT_CALCRECT | DT_NOPREFIX);
-                                int tw = rTag.right - rTag.left; int th = rTag.bottom - rTag.top;
-                                int dtFlags = DT_NOPREFIX;
-                                if (sub->useFill == 1) { rTag.left = tx - tw/2; rTag.right = tx + tw/2; dtFlags |= DT_CENTER; }
-                                else if (sub->useFill == 2) { rTag.left = tx - tw; rTag.right = tx; dtFlags |= DT_RIGHT; }
-                                else { rTag.left = tx; rTag.right = tx + tw; dtFlags |= DT_LEFT; }
-                                rTag.top = ty; rTag.bottom = ty + th;
-                                
-                                SetTextColor(dc, sub->stroke); SetBkMode(dc, TRANSPARENT); DrawText(dc, tagBuf, -1, &rTag, dtFlags);
-                                SelectObject(dc, oldFont); DeleteObject(hFont);
-
-                                if (textHitCount < 128 && sArr == shapes) {
-                                    textHits[textHitCount].shapeIdx = i; textHits[textHitCount].isRef = 1; textHits[textHitCount].tagIdx = refTagIdx; textHits[textHitCount].box = rTag; textHitCount++;
-                                }
-                            }
-                            if (currentPt < MAX_POINTS) { s->ptsX[currentPt] = wx; s->ptsY[currentPt] = wy; currentPt++; }
-                            refTagIdx++;
-                        } else {
-                            POINT* subPts = &g_subPts[depth * MAX_POINTS];
-                            int subCount = (sub->ptCount > MAX_POINTS) ? MAX_POINTS : sub->ptCount;
-                            for (pIdx = 0; pIdx < subCount; pIdx++) {
-                                double dx = (sub->ptsX[pIdx] - lcx) * refScale; double dy = (sub->ptsY[pIdx] - lcy) * refScale;
-                                double wx = objCx + (dx * cosR - dy * sinR); double wy = objCy + (dx * sinR + dy * cosR);
-                                subPts[pIdx].x = offX + (int)round(wx * sc); subPts[pIdx].y = offY + (int)round(wy * sc);
-                                if (currentPt < MAX_POINTS) { s->ptsX[currentPt] = wx; s->ptsY[currentPt] = wy; currentPt++; }
-                            }
-
-                            b = sub->useFill ? CreateSolidBrush(sub->fill) : (HBRUSH)GetStockObject(NULL_BRUSH);
-                            p = sub->useStroke ? CreatePen(PS_SOLID, sub->strokeWidth > 0 ? sub->strokeWidth : 1, sub->stroke) : (HPEN)GetStockObject(NULL_PEN);
-                            ob = SelectObject(dc, b); op = SelectObject(dc, p);
-
-                            if (sub->type == 0 && subCount >= 3) { SetPolyFillMode(dc, ALTERNATE); Polygon(dc, subPts, subCount); } 
-                            else if (subCount >= 2) { Polyline(dc, subPts, subCount); }
-
-                            SelectObject(dc, ob); SelectObject(dc, op);
-                            if (sub->useFill) DeleteObject(b); if (sub->useStroke) DeleteObject(p);
-                        }
-                    }
-
-                    if (!isPreview && refCache[rIdx].dimCount > 0) {
-                        int dIdx;
-                        HPEN hDimPen = CreatePen(PS_SOLID, 1, RGB(0, 128, 255)); HBRUSH hDimBr = CreateSolidBrush(RGB(0, 128, 255));
-                        HFONT hDimFont = CreateFont(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
-                        HGDIOBJ oldPen2 = SelectObject(dc, hDimPen), oldBr2 = SelectObject(dc, hDimBr), oldFont2 = SelectObject(dc, hDimFont);
-                        SetTextColor(dc, RGB(0, 128, 255)); SetBkMode(dc, TRANSPARENT);
-
-                        for (dIdx = 0; dIdx < refCache[rIdx].dimCount; dIdx++) {
-                            Dimension* d = &refCache[rIdx].dims[dIdx];
-                            if (d->s1 < refCache[rIdx].shapeCount && d->s2 < refCache[rIdx].shapeCount) {
-                                double lA1x = refCache[rIdx].shapes[d->s1].ptsX[d->p1]; double lA1y = refCache[rIdx].shapes[d->s1].ptsY[d->p1];
-                                double lA2x = refCache[rIdx].shapes[d->s2].ptsX[d->p2]; double lA2y = refCache[rIdx].shapes[d->s2].ptsY[d->p2];
-                                double dX = lA2x - lA1x, dY = lA2y - lA1y, val, sOffset = d->offset * sc, dx_r, dy_r, gA1x, gA1y, gA2x, gA2y;
-                                int sA1x, sA1y, sA2x, sA2y, sD1x, sD1y, sD2x, sD2y, sMidX, sMidY;
-
-                                dx_r = (lA1x - lcx) * refScale; dy_r = (lA1y - lcy) * refScale;
-                                gA1x = objCx + (dx_r * cosR - dy_r * sinR); gA1y = objCy + (dx_r * sinR + dy_r * cosR);
-                                dx_r = (lA2x - lcx) * refScale; dy_r = (lA2y - lcy) * refScale;
-                                gA2x = objCx + (dx_r * cosR - dy_r * sinR); gA2y = objCy + (dx_r * sinR + dy_r * cosR);
-
-                                sA1x = offX + (int)round(gA1x * sc); sA1y = offY + (int)round(gA1y * sc);
-                                sA2x = offX + (int)round(gA2x * sc); sA2y = offY + (int)round(gA2y * sc);
-
-                                if (d->mode == 0) {
-                                    double sDX = sA2x - sA1x, sDY = sA2y - sA1y, ang = atan2(sDY, sDX), nX = -sin(ang), nY = cos(ang);
-                                    sD1x = sA1x + (int)round(nX * sOffset); sD1y = sA1y + (int)round(nY * sOffset); sD2x = sA2x + (int)round(nX * sOffset); sD2y = sA2y + (int)round(nY * sOffset);
-                                    val = sqrt(dX*dX + dY*dY) * refScale;
-                                } else if (d->mode == 1) {
-                                    sD1x = sA1x; sD1y = sA1y + (int)round(sOffset); sD2x = sA2x; sD2y = sA1y + (int)round(sOffset); val = fabs(dX) * refScale;
-                                } else {
-                                    sD1x = sA1x + (int)round(sOffset); sD1y = sA1y; sD2x = sA1x + (int)round(sOffset); sD2y = sA2y; val = fabs(dY) * refScale;
-                                }
-
-                                {
-                                    double L1dx = sD1x - sA1x, L1dy = sD1y - sA1y, L1len = sqrt(L1dx*L1dx + L1dy*L1dy);
-                                    if (L1len > 5.0) { MoveTo(dc, sA1x + (int)round(L1dx/L1len*5.0), sA1y + (int)round(L1dy/L1len*5.0)); LineTo(dc, sD1x + (int)round(L1dx/L1len*2.0), sD1y + (int)round(L1dy/L1len*2.0)); }
-                                    double L2dx = sD2x - sA2x, L2dy = sD2y - sA2y, L2len = sqrt(L2dx*L2dx + L2dy*L2dy);
-                                    if (L2len > 5.0) { MoveTo(dc, sA2x + (int)round(L2dx/L2len*5.0), sA2y + (int)round(L2dy/L2len*5.0)); LineTo(dc, sD2x + (int)round(L2dx/L2len*2.0), sD2y + (int)round(L2dy/L2len*2.0)); }
-                                }
-                                MoveTo(dc, sD1x, sD1y); LineTo(dc, sD2x, sD2y);
-                                {
-                                    double dimDx = sD2x - sD1x, dimDy = sD2y - sD1y, dimLen = sqrt(dimDx*dimDx + dimDy*dimDy);
-                                    if (dimLen > 0) {
-                                        double dirX = dimDx/dimLen, dirY = dimDy/dimLen; POINT pts[3];
-                                        pts[0].x = sD1x; pts[0].y = sD1y; pts[1].x = sD1x + (int)round(dirX*10 - dirY*3); pts[1].y = sD1y + (int)round(dirY*10 + dirX*3); pts[2].x = sD1x + (int)round(dirX*10 + dirY*3); pts[2].y = sD1y + (int)round(dirY*10 - dirX*3); Polygon(dc, pts, 3);
-                                        pts[0].x = sD2x; pts[0].y = sD2y; pts[1].x = sD2x - (int)round(dirX*10 - dirY*3); pts[1].y = sD2y - (int)round(dirY*10 + dirX*3); pts[2].x = sD2x - (int)round(dirX*10 + dirY*3); pts[2].y = sD2y - (int)round(dirY*10 - dirX*3); Polygon(dc, pts, 3);
+                            if (sub->type == 3) {
+                                if (g_RenderRefDepth < 3 && strncmp(sub->text, "{{EXT_REF=", 10) == 0) {
+                                    Shape* tempRef = &g_tempRef[depth];
+                                    *tempRef = *sub;
+                                    char* subPath = g_subPath[depth]; 
+                                    double subSc = 1.0, subRot = 0.0;
+                                    char *spS = strstr(sub->text, " scale="), *spR = strstr(sub->text, " rot="), *spE = strstr(sub->text, "}}");
+                                    int sLen;
+                                    
+                                    if (spS) sLen = (int)(spS - (sub->text + 10)); else if (spE) sLen = (int)(spE - (sub->text + 10)); else sLen = strlen(sub->text + 10);
+                                    if (sLen > 0 && sLen < 260) {
+                                        strncpy(subPath, sub->text + 10, sLen); subPath[sLen] = '\0';
+                                        while (sLen > 0 && isspace((unsigned char)subPath[sLen - 1])) subPath[--sLen] = '\0';
+                                        if (spS) subSc = atof(spS + 7);
+                                        if (spR) subRot = atof(spR + 5);
+                                        
+                                        {
+                                            double dx = (sub->ptsX[0] - lcx) * refScale;
+                                            double dy = (sub->ptsY[0] - lcy) * refScale;
+                                            tempRef->ptsX[0] = objCx + dx * cosR - dy * sinR;
+                                            tempRef->ptsY[0] = objCy + dx * sinR + dy * cosR;
+                                            
+                                            if (strlen(subPath) > 80) subPath[80] = '\0';
+                                            sprintf(tempRef->text, "{{EXT_REF=%s scale=%.2f rot=%.2f}}", subPath, subSc * refScale, subRot + refRot);
+                                            
+                                            g_RenderRefDepth++;
+                                            RenderShapes(dc, tempRef, 1, sc, offX, offY, NULL, 0, isPreview);
+                                            g_RenderRefDepth--;
+                                        }
                                     }
                                 }
+                                continue;
+                            }
 
-                                sMidX = sD1x + (int)round((sD2x - sD1x) * d->textPos); sMidY = sD1y + (int)round((sD2y - sD1y) * d->textPos);
-                                char buf[64]; FormatDimension(val, activeUnitName, buf);
-                                DWORD ext = GetTextExtent(dc, buf, strlen(buf)); int tW = LOWORD(ext), tH = HIWORD(ext), tx = sMidX - tW/2, ty = sMidY - tH/2;
-                                RECT tR; tR.left = tx - 2; tR.top = ty - 2; tR.right = tx + tW + 2; tR.bottom = ty + tH + 2;
-                                FillRect(dc, &tR, (HBRUSH)GetStockObject(WHITE_BRUSH)); TextOut(dc, tx, ty, buf, strlen(buf));
+                            if (sub->type == 4) {
+                                double dx = (sub->ptsX[0] - lcx) * refScale;
+                                double dy = (sub->ptsY[0] - lcy) * refScale;
+                                double wx = objCx + dx * cosR - dy * sinR;
+                                double wy = objCy + dx * sinR + dy * cosR;
+                                
+                                if (!isPreview) {
+                                    char* tagBuf = g_tagBuf[depth]; 
+                                    RECT rTag = {0, 0, 0, 0};
+                                    int tx = offX + (int)round(wx * sc);
+                                    int ty = offY + (int)round(wy * sc);
+                                    
+                                    char* instVal = g_instVal[depth];
+                                    GetPipeValue(s->tagData, refTagIdx, instVal, 128);
+                                    if (strlen(instVal) > 0) { strncpy(tagBuf, instVal, 127); tagBuf[127] = '\0'; } 
+                                    else { strncpy(tagBuf, sub->text, 127); tagBuf[127] = '\0'; }
+
+                                    if (tagBuf[0] == '{' && tagBuf[1] == '{') {
+                                        char cleanTag[128]; strcpy(cleanTag, tagBuf + 2);
+                                        char *pEndClean = strstr(cleanTag, "}}"); if (pEndClean) *pEndClean = '\0';
+                                        strcpy(tagBuf, cleanTag);
+                                    }
+
+                                    if (strcmp(tagBuf, "SHEETSCALE") == 0) {
+                                        if (activePageScale > 0 && activePageScale <= 1.0) sprintf(tagBuf, "1:%g", 1.0 / activePageScale);
+                                        else sprintf(tagBuf, "%g", activePageScale);
+                                    }
+
+                                    int fSize = sub->fontSize > 0 ? sub->fontSize : 24;
+                                    int fH = (int)(fSize * refScale * (sc / 10.0)); if (fH < 2) fH = 2;
+                                    HFONT hFont = CreateFont(fH, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
+                                    HGDIOBJ oldFont = SelectObject(dc, hFont);
+
+                                    DrawText(dc, tagBuf, -1, &rTag, DT_CALCRECT | DT_NOPREFIX);
+                                    int tw = rTag.right - rTag.left; int th = rTag.bottom - rTag.top;
+                                    int dtFlags = DT_NOPREFIX;
+                                    if (sub->useFill == 1) { rTag.left = tx - tw/2; rTag.right = tx + tw/2; dtFlags |= DT_CENTER; }
+                                    else if (sub->useFill == 2) { rTag.left = tx - tw; rTag.right = tx; dtFlags |= DT_RIGHT; }
+                                    else { rTag.left = tx; rTag.right = tx + tw; dtFlags |= DT_LEFT; }
+                                    rTag.top = ty; rTag.bottom = ty + th;
+                                    
+                                    SetTextColor(dc, sub->stroke); SetBkMode(dc, TRANSPARENT); DrawText(dc, tagBuf, -1, &rTag, dtFlags);
+                                    SelectObject(dc, oldFont); DeleteObject(hFont);
+
+                                    if (textHitCount < 128 && sArr == shapes) {
+                                        textHits[textHitCount].shapeIdx = i; textHits[textHitCount].isRef = 1; textHits[textHitCount].tagIdx = refTagIdx; textHits[textHitCount].box = rTag; textHitCount++;
+                                    }
+                                }
+                                if (currentPt < MAX_POINTS) { s->ptsX[currentPt] = wx; s->ptsY[currentPt] = wy; currentPt++; }
+                                refTagIdx++;
+                            } else {
+                                POINT* subPts = &g_subPts[depth * MAX_POINTS];
+                                int subCount = (sub->ptCount > MAX_POINTS) ? MAX_POINTS : sub->ptCount;
+
+                                for (pIdx = 0; pIdx < subCount; pIdx++) {
+                                    double dx = (sub->ptsX[pIdx] - lcx) * refScale; double dy = (sub->ptsY[pIdx] - lcy) * refScale;
+                                    double wx = objCx + (dx * cosR - dy * sinR); double wy = objCy + (dx * sinR + dy * cosR);
+                                    subPts[pIdx].x = offX + (int)round(wx * sc); subPts[pIdx].y = offY + (int)round(wy * sc);
+                                    if (currentPt < MAX_POINTS) { s->ptsX[currentPt] = wx; s->ptsY[currentPt] = wy; currentPt++; }
+                                }
+
+                                b = sub->useFill ? CreateSolidBrush(sub->fill) : (HBRUSH)GetStockObject(NULL_BRUSH);
+                                p = sub->useStroke ? CreatePen(PS_SOLID, sub->strokeWidth > 0 ? sub->strokeWidth : 1, sub->stroke) : (HPEN)GetStockObject(NULL_PEN);
+                                ob = SelectObject(dc, b); op = SelectObject(dc, p);
+
+                                if (sub->type == 0 && subCount >= 3) { SetPolyFillMode(dc, ALTERNATE); Polygon(dc, subPts, subCount); } 
+                                else if (subCount >= 2) { Polyline(dc, subPts, subCount); }
+
+                                SelectObject(dc, ob); SelectObject(dc, op);
+                                if (sub->useFill) DeleteObject(b); if (sub->useStroke) DeleteObject(p);
                             }
                         }
-                        SelectObject(dc, oldPen2); DeleteObject(hDimPen); SelectObject(dc, oldBr2); DeleteObject(hDimBr); SelectObject(dc, oldFont2); DeleteObject(hDimFont);
-                    }
 
-                    bx[0] = refCache[rIdx].minX; by[0] = refCache[rIdx].minY; bx[1] = refCache[rIdx].maxX; by[1] = refCache[rIdx].minY;
-                    bx[2] = refCache[rIdx].maxX; by[2] = refCache[rIdx].maxY; bx[3] = refCache[rIdx].minX; by[3] = refCache[rIdx].maxY;
+                        if (!isPreview && refCache[rIdx].dimCount > 0) {
+                            int dIdx;
+                            HPEN hDimPen = CreatePen(PS_SOLID, 1, RGB(0, 128, 255)); HBRUSH hDimBr = CreateSolidBrush(RGB(0, 128, 255));
+                            HFONT hDimFont = CreateFont(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
+                            HGDIOBJ oldPen2 = SelectObject(dc, hDimPen), oldBr2 = SelectObject(dc, hDimBr), oldFont2 = SelectObject(dc, hDimFont);
+                            SetTextColor(dc, RGB(0, 128, 255)); SetBkMode(dc, TRANSPARENT);
 
-                    for (r = 0; r < 4; r++) {
-                        double dx = (bx[r] - lcx) * refScale; double dy = (by[r] - lcy) * refScale;
-                        s->ptsX[r + 1] = objCx + (dx * cosR - dy * sinR); s->ptsY[r + 1] = objCy + (dx * sinR + dy * cosR);
-                    }
-                    s->ptsX[5] = objCx; s->ptsY[5] = objCy; s->ptCount = currentPt;
+                            for (dIdx = 0; dIdx < refCache[rIdx].dimCount; dIdx++) {
+                                Dimension* d = &refCache[rIdx].dims[dIdx];
+                                if (d->s1 < refCache[rIdx].shapeCount && d->s2 < refCache[rIdx].shapeCount) {
+                                    double lA1x = refCache[rIdx].shapes[d->s1].ptsX[d->p1]; double lA1y = refCache[rIdx].shapes[d->s1].ptsY[d->p1];
+                                    double lA2x = refCache[rIdx].shapes[d->s2].ptsX[d->p2]; double lA2y = refCache[rIdx].shapes[d->s2].ptsY[d->p2];
+                                    double dX = lA2x - lA1x, dY = lA2y - lA1y, val, sOffset = d->offset * sc, dx_r, dy_r, gA1x, gA1y, gA2x, gA2y;
+                                    int sA1x, sA1y, sA2x, sA2y, sD1x, sD1y, sD2x, sD2y, sMidX, sMidY;
 
-                    if (!isPreview && (currentMode == 27 || (sArr == shapes && ptSelected[i][0]))) {
-                        if (sArr == shapes && ptSelected[i][0]) hBoxPen = CreatePen(PS_DOT, 1, RGB(255, 0, 0)); else hBoxPen = CreatePen(PS_DOT, 1, RGB(160, 160, 160));
-                        oldBoxPen = SelectObject(dc, hBoxPen);
-                        for (r = 0; r < 4; r++) { boxPts[r].x = offX + (int)round(s->ptsX[r + 1] * sc); boxPts[r].y = offY + (int)round(s->ptsY[r + 1] * sc); }
-                        boxPts[4] = boxPts[0]; Polyline(dc, boxPts, 5);
-                        SelectObject(dc, oldBoxPen); DeleteObject(hBoxPen);
+                                    dx_r = (lA1x - lcx) * refScale; dy_r = (lA1y - lcy) * refScale;
+                                    gA1x = objCx + (dx_r * cosR - dy_r * sinR); gA1y = objCy + (dx_r * sinR + dy_r * cosR);
+                                    dx_r = (lA2x - lcx) * refScale; dy_r = (lA2y - lcy) * refScale;
+                                    gA2x = objCx + (dx_r * cosR - dy_r * sinR); gA2y = objCy + (dx_r * sinR + dy_r * cosR);
+
+                                    sA1x = offX + (int)round(gA1x * sc); sA1y = offY + (int)round(gA1y * sc);
+                                    sA2x = offX + (int)round(gA2x * sc); sA2y = offY + (int)round(gA2y * sc);
+
+                                    if (d->mode == 0) {
+                                        double sDX = sA2x - sA1x, sDY = sA2y - sA1y, ang = atan2(sDY, sDX), nX = -sin(ang), nY = cos(ang);
+                                        sD1x = sA1x + (int)round(nX * sOffset); sD1y = sA1y + (int)round(nY * sOffset); sD2x = sA2x + (int)round(nX * sOffset); sD2y = sA2y + (int)round(nY * sOffset);
+                                        val = sqrt(dX*dX + dY*dY) * refScale;
+                                    } else if (d->mode == 1) {
+                                        sD1x = sA1x; sD1y = sA1y + (int)round(sOffset); sD2x = sA2x; sD2y = sA1y + (int)round(sOffset); val = fabs(dX) * refScale;
+                                    } else {
+                                        sD1x = sA1x + (int)round(sOffset); sD1y = sA1y; sD2x = sA1x + (int)round(sOffset); sD2y = sA2y; val = fabs(dY) * refScale;
+                                    }
+
+                                    {
+                                        double L1dx = sD1x - sA1x, L1dy = sD1y - sA1y, L1len = sqrt(L1dx*L1dx + L1dy*L1dy);
+                                        if (L1len > 5.0) { MoveTo(dc, sA1x + (int)round(L1dx/L1len*5.0), sA1y + (int)round(L1dy/L1len*5.0)); LineTo(dc, sD1x + (int)round(L1dx/L1len*2.0), sD1y + (int)round(L1dy/L1len*2.0)); }
+                                        double L2dx = sD2x - sA2x, L2dy = sD2y - sA2y, L2len = sqrt(L2dx*L2dx + L2dy*L2dy);
+                                        if (L2len > 5.0) { MoveTo(dc, sA2x + (int)round(L2dx/L2len*5.0), sA2y + (int)round(L2dy/L2len*5.0)); LineTo(dc, sD2x + (int)round(L2dx/L2len*2.0), sD2y + (int)round(L2dy/L2len*2.0)); }
+                                    }
+                                    MoveTo(dc, sD1x, sD1y); LineTo(dc, sD2x, sD2y);
+                                    {
+                                        double dimDx = sD2x - sD1x, dimDy = sD2y - sD1y, dimLen = sqrt(dimDx*dimDx + dimDy*dimDy);
+                                        if (dimLen > 0) {
+                                            double dirX = dimDx/dimLen, dirY = dimDy/dimLen; POINT pts[3];
+                                            pts[0].x = sD1x; pts[0].y = sD1y; pts[1].x = sD1x + (int)round(dirX*10 - dirY*3); pts[1].y = sD1y + (int)round(dirY*10 + dirX*3); pts[2].x = sD1x + (int)round(dirX*10 + dirY*3); pts[2].y = sD1y + (int)round(dirY*10 - dirX*3); Polygon(dc, pts, 3);
+                                            pts[0].x = sD2x; pts[0].y = sD2y; pts[1].x = sD2x - (int)round(dirX*10 - dirY*3); pts[1].y = sD2y - (int)round(dirY*10 + dirX*3); pts[2].x = sD2x - (int)round(dirX*10 + dirY*3); pts[2].y = sD2y - (int)round(dirY*10 - dirX*3); Polygon(dc, pts, 3);
+                                        }
+                                    }
+
+                                    sMidX = sD1x + (int)round((sD2x - sD1x) * d->textPos); sMidY = sD1y + (int)round((sD2y - sD1y) * d->textPos);
+                                    char buf[64]; FormatDimension(val, activeUnitName, buf);
+                                    DWORD ext = GetTextExtent(dc, buf, strlen(buf)); int tW = LOWORD(ext), tH = HIWORD(ext), tx = sMidX - tW/2, ty = sMidY - tH/2;
+                                    RECT tR; tR.left = tx - 2; tR.top = ty - 2; tR.right = tx + tW + 2; tR.bottom = ty + tH + 2;
+                                    FillRect(dc, &tR, (HBRUSH)GetStockObject(WHITE_BRUSH)); TextOut(dc, tx, ty, buf, strlen(buf));
+                                }
+                            }
+                            SelectObject(dc, oldPen2); DeleteObject(hDimPen); SelectObject(dc, oldBr2); DeleteObject(hDimBr); SelectObject(dc, oldFont2); DeleteObject(hDimFont);
+                        }
+
+                        bx[0] = refCache[rIdx].minX; by[0] = refCache[rIdx].minY; bx[1] = refCache[rIdx].maxX; by[1] = refCache[rIdx].minY;
+                        bx[2] = refCache[rIdx].maxX; by[2] = refCache[rIdx].maxY; bx[3] = refCache[rIdx].minX; by[3] = refCache[rIdx].maxY;
+
+                        for (r = 0; r < 4; r++) {
+                            double dx = (bx[r] - lcx) * refScale; double dy = (by[r] - lcy) * refScale;
+                            s->ptsX[r + 1] = objCx + (dx * cosR - dy * sinR); s->ptsY[r + 1] = objCy + (dx * sinR + dy * cosR);
+                        }
+                        s->ptsX[5] = objCx; s->ptsY[5] = objCy; s->ptCount = currentPt;
+
+                        if (!isPreview && (currentMode == 27 || (sArr == shapes && ptSelected[i][0]))) {
+                            if (sArr == shapes && ptSelected[i][0]) hBoxPen = CreatePen(PS_DOT, 1, RGB(255, 0, 0)); else hBoxPen = CreatePen(PS_DOT, 1, RGB(160, 160, 160));
+                            oldBoxPen = SelectObject(dc, hBoxPen);
+                            for (r = 0; r < 4; r++) { boxPts[r].x = offX + (int)round(s->ptsX[r + 1] * sc); boxPts[r].y = offY + (int)round(s->ptsY[r + 1] * sc); }
+                            boxPts[4] = boxPts[0]; Polyline(dc, boxPts, 5);
+                            SelectObject(dc, oldBoxPen); DeleteObject(hBoxPen);
+                        }
                     }
                 }
+                continue;
             }
-            continue;
-        }
 
-        if (s->type == 4) {
-            if (!isPreview) {
-                if (s->text[0] == '{' && s->text[1] == '{') { strcpy(dispT, s->text + 2); char *pEnd = strstr(dispT, "}}"); if (pEnd) *pEnd = '\0'; } 
-                else { strcpy(dispT, s->text); }
+            if (s->type == 4) {
+                if (!isPreview) {
+                    if (s->text[0] == '{' && s->text[1] == '{') { strcpy(dispT, s->text + 2); char *pEnd = strstr(dispT, "}}"); if (pEnd) *pEnd = '\0'; } 
+                    else { strcpy(dispT, s->text); }
 
-                if (strcmp(dispT, "SHEETSCALE") == 0) {
-                    if (activePageScale > 0 && activePageScale <= 1.0) sprintf(dispT, "1:%g", 1.0 / activePageScale);
-                    else sprintf(dispT, "%g", activePageScale);
+                    if (strcmp(dispT, "SHEETSCALE") == 0) {
+                        if (activePageScale > 0 && activePageScale <= 1.0) sprintf(dispT, "1:%g", 1.0 / activePageScale);
+                        else sprintf(dispT, "%g", activePageScale);
+                    }
+
+                    int fSize = s->fontSize > 0 ? s->fontSize : 24; int fH = (int)(fSize * (sc / 10.0)); if (fH < 2) fH = 2;
+                    HFONT hFont = CreateFont(fH, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
+                    HGDIOBJ oldFont = SelectObject(dc, hFont);
+
+                    RECT rCalc = {0, 0, 0, 0}; DrawText(dc, dispT, -1, &rCalc, DT_CALCRECT | DT_NOPREFIX);
+                    int tw = rCalc.right - rCalc.left, th = rCalc.bottom - rCalc.top, tx = pA[0].x, ty = pA[0].y, dtFlags = DT_NOPREFIX;
+                    
+                    if (s->useFill == 1) { tr.left = tx - tw/2; tr.right = tx + tw/2; dtFlags |= DT_CENTER; }
+                    else if (s->useFill == 2) { tr.left = tx - tw; tr.right = tx; dtFlags |= DT_RIGHT; }
+                    else { tr.left = tx; tr.right = tx + tw; dtFlags |= DT_LEFT; }
+                    tr.top = ty; tr.bottom = ty + th;
+                    
+                    SetTextColor(dc, s->stroke); SetBkMode(dc, TRANSPARENT); DrawText(dc, dispT, -1, &tr, dtFlags);
+                    SelectObject(dc, oldFont); DeleteObject(hFont);
+
+                    if (textHitCount < 128 && sArr == shapes) { textHits[textHitCount].shapeIdx = i; textHits[textHitCount].isRef = 0; textHits[textHitCount].tagIdx = -1; textHits[textHitCount].box = tr; textHitCount++; }
                 }
-
-                int fSize = s->fontSize > 0 ? s->fontSize : 24; int fH = (int)(fSize * (sc / 10.0)); if (fH < 2) fH = 2;
-                HFONT hFont = CreateFont(fH, 0, 0, 0, FW_NORMAL, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Arial");
-                HGDIOBJ oldFont = SelectObject(dc, hFont);
-
-                RECT rCalc = {0, 0, 0, 0}; DrawText(dc, dispT, -1, &rCalc, DT_CALCRECT | DT_NOPREFIX);
-                int tw = rCalc.right - rCalc.left, th = rCalc.bottom - rCalc.top, tx = pA[0].x, ty = pA[0].y, dtFlags = DT_NOPREFIX;
-                
-                if (s->useFill == 1) { tr.left = tx - tw/2; tr.right = tx + tw/2; dtFlags |= DT_CENTER; }
-                else if (s->useFill == 2) { tr.left = tx - tw; tr.right = tx; dtFlags |= DT_RIGHT; }
-                else { tr.left = tx; tr.right = tx + tw; dtFlags |= DT_LEFT; }
-                tr.top = ty; tr.bottom = ty + th;
-                
-                SetTextColor(dc, s->stroke); SetBkMode(dc, TRANSPARENT); DrawText(dc, dispT, -1, &tr, dtFlags);
-                SelectObject(dc, oldFont); DeleteObject(hFont);
-
-                if (textHitCount < 128 && sArr == shapes) { textHits[textHitCount].shapeIdx = i; textHits[textHitCount].isRef = 0; textHits[textHitCount].tagIdx = -1; textHits[textHitCount].box = tr; textHitCount++; }
+                continue;
             }
-            continue;
+
+            b = s->useFill ? CreateSolidBrush(s->fill) : (HBRUSH)GetStockObject(NULL_BRUSH);
+            p = s->useStroke ? CreatePen(PS_SOLID, s->strokeWidth > 0 ? s->strokeWidth : 1, s->stroke) : (HPEN)GetStockObject(NULL_PEN);
+            ob = SelectObject(dc, b); op = SelectObject(dc, p);
+
+            if (s->type == 0) { SetPolyFillMode(dc, ALTERNATE); Polygon(dc, pA, s->ptCount); } 
+            else { Polyline(dc, pA, s->ptCount); }
+
+            SelectObject(dc, ob); SelectObject(dc, op);
+            if (s->useFill) DeleteObject(b); if (s->useStroke) DeleteObject(p);
         }
-
-        b = s->useFill ? CreateSolidBrush(s->fill) : (HBRUSH)GetStockObject(NULL_BRUSH);
-        p = s->useStroke ? CreatePen(PS_SOLID, s->strokeWidth > 0 ? s->strokeWidth : 1, s->stroke) : (HPEN)GetStockObject(NULL_PEN);
-        ob = SelectObject(dc, b); op = SelectObject(dc, p);
-
-        if (s->type == 0) { SetPolyFillMode(dc, ALTERNATE); Polygon(dc, pA, s->ptCount); } 
-        else { Polyline(dc, pA, s->ptCount); }
-
-        SelectObject(dc, ob); SelectObject(dc, op);
-        if (s->useFill) DeleteObject(b); if (s->useStroke) DeleteObject(p);
     }
 }
 
@@ -2931,7 +2932,7 @@ LRESULT FAR PASCAL _export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             hMain = hwnd;
             DragAcceptFiles(hwnd, TRUE);
 
-shapes = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
+            shapes = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
             dragStartSnapshot = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
             
             g_tempRef = (Shape*)GlobalAllocPtr(GHND, 5 * sizeof(Shape));
@@ -2947,7 +2948,7 @@ shapes = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
             refCache = (RefCache*)GlobalAllocPtr(GHND, (DWORD)MAX_REFS * sizeof(RefCache));
             editMap = (TagEditMap*)GlobalAllocPtr(GHND, (DWORD)MAX_EDIT_TAGS * sizeof(TagEditMap));
 
-            if (!shapes || !dragStartSnapshot || allocFailed || !parsedIcons || !refCache || !editMap) {
+            if (!shapes || !dragStartSnapshot || allocFailed || !parsedIcons || !refCache || !editMap || !g_tempRef || !g_subPts || !g_pA) {
                 MessageBox(hwnd, "Failed to allocate memory on Far Heap!", "Error", MB_ICONHAND);
                 PostQuitMessage(0); return -1;
             }
@@ -3322,85 +3323,48 @@ shapes = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
 
             if (currentMode == 0 || currentMode == 1 || currentMode == 2 || currentMode == 27) { 
                 shiftDown = (GetKeyState(VK_SHIFT) & 0x8000); ctrlDown = (GetKeyState(VK_CONTROL) & 0x8000); hitS = -1; hitP = -1; sHasSel = 0; allSel = 1;
-                
-                if (selectedShape != -1 && selectedShape < shapeCount) {
-                    i = selectedShape;
-                    if (shapes[i].type == 4) {
-                        int px = (int)round(shapes[i].ptsX[0] * (scaleFactor * viewZoom) + viewPanX);
-                        int py = (int)round(shapes[i].ptsY[0] * (scaleFactor * viewZoom) + viewPanY);
-                        if (sqrt(pow(px - x, 2) + pow(py - y, 2)) <= 8.0) { 
-                            if (shiftDown) { SaveState(); shapes[i].useFill = (shapes[i].useFill + 1) % 3; RedrawCanvas(hwnd); return 0; }
-                            else { hitS = i; hitP = 0; }
+
+                if (tagHit != -1) {
+                    hitS = tagHit; hitP = 0;
+                    if (shiftDown && shapes[hitS].type == 4) {
+                        SaveState(); shapes[hitS].useFill = (shapes[hitS].useFill + 1) % 3; RedrawCanvas(hwnd); return 0;
+                    }
+                }
+
+                if (hitS == -1) {
+                    if (selectedShape != -1 && selectedShape < shapeCount && shapes[selectedShape].type != 3 && shapes[selectedShape].type != 4) {
+                        for (j = 0; j < shapes[selectedShape].ptCount; j++) {
+                            int px = (int)round(shapes[selectedShape].ptsX[j] * (scaleFactor * viewZoom) + viewPanX);
+                            int py = (int)round(shapes[selectedShape].ptsY[j] * (scaleFactor * viewZoom) + viewPanY);
+                            if (sqrt(pow(px - x, 2) + pow(py - y, 2)) <= 8.0) { hitS = selectedShape; hitP = j; break; }
                         }
-                        else if (i == tagHit) { hitS = i; hitP = 0; }
-                    } else if (shapes[i].type == 3) {
-                        if (currentMode == 27) {
+                    }
+                    if (hitS == -1) {
+                        for (i = shapeCount - 1; i >= 0; i--) {
+                            if (shapes[i].type == 3 || shapes[i].type == 4) continue;
                             for (j = 0; j < shapes[i].ptCount; j++) {
                                 int px = (int)round(shapes[i].ptsX[j] * (scaleFactor * viewZoom) + viewPanX);
                                 int py = (int)round(shapes[i].ptsY[j] * (scaleFactor * viewZoom) + viewPanY);
                                 if (sqrt(pow(px - x, 2) + pow(py - y, 2)) <= 8.0) { hitS = i; hitP = j; break; }
                             }
-                        }
-                        if (hitS == -1 && PointInPolyShape(gx, gy, &shapes[i])) { hitS = i; hitP = -1; }
-                    } else {
-                        for (j = 0; j < shapes[i].ptCount; j++) {
-                            int px = (int)round(shapes[i].ptsX[j] * (scaleFactor * viewZoom) + viewPanX);
-                            int py = (int)round(shapes[i].ptsY[j] * (scaleFactor * viewZoom) + viewPanY);
-                            if (sqrt(pow(px - x, 2) + pow(py - y, 2)) <= 8.0) { hitS = i; hitP = j; break; }
+                            if (hitS != -1) break;
                         }
                     }
                 }
 
                 if (hitS == -1) {
-                    for (i = shapeCount - 1; i >= 0; i--) {
-                        if (shapes[i].type == 4) {
-                            int px = (int)round(shapes[i].ptsX[0] * (scaleFactor * viewZoom) + viewPanX);
-                            int py = (int)round(shapes[i].ptsY[0] * (scaleFactor * viewZoom) + viewPanY);
-                            if (sqrt(pow(px - x, 2) + pow(py - y, 2)) <= 8.0) { 
-                                if (shiftDown) {
-                                    hitS = i; 
-                                    SaveState(); shapes[hitS].useFill = (shapes[hitS].useFill + 1) % 3; 
-                                    RedrawCanvas(hwnd); 
-                                    return 0;
-                                } else {
-                                    hitS = i; hitP = 0; break;
-                                }
-                            }
-                            if (i == tagHit) { hitS = i; hitP = 0; break; }
-                        } else if (shapes[i].type == 3) {
-                            if (currentMode == 27) {
-                                for (j = 0; j < shapes[i].ptCount; j++) {
-                                    int px = (int)round(shapes[i].ptsX[j] * (scaleFactor * viewZoom) + viewPanX);
-                                    int py = (int)round(shapes[i].ptsY[j] * (scaleFactor * viewZoom) + viewPanY);
-                                    if (sqrt(pow(px - x, 2) + pow(py - y, 2)) <= 8.0) { hitS = i; hitP = j; break; }
-                                }
-                            }
-                            if (hitS == -1 && PointInPolyShape(gx, gy, &shapes[i])) { hitS = i; hitP = -1; break; }
-                        } else {
-                            for (j = 0; j < shapes[i].ptCount; j++) {
-                                int px = (int)round(shapes[i].ptsX[j] * (scaleFactor * viewZoom) + viewPanX);
-                                int py = (int)round(shapes[i].ptsY[j] * (scaleFactor * viewZoom) + viewPanY);
-                                if (sqrt(pow(px - x, 2) + pow(py - y, 2)) <= 8.0) { hitS = i; hitP = j; break; }
-                            }
-                        }
-                        if (hitS != -1) break;
+                    if (selectedShape != -1 && selectedShape < shapeCount && shapes[selectedShape].type == 0) {
+                        if (PointInPolyShape(exactDragStartX, exactDragStartY, &shapes[selectedShape])) { hitS = selectedShape; hitP = -1; }
                     }
-                }
-
-                if (hitS == -1 && selectedShape != -1 && selectedShape < shapeCount && shapes[selectedShape].type == 0) {
-                    if (PointInPolyShape(exactDragStartX, exactDragStartY, &shapes[selectedShape])) {
-                        hitS = selectedShape; hitP = -1;
-                    }
-                }
-
-                if (hitS == -1) { 
-                    for (i = shapeCount - 1; i >= 0; i--) { 
-                        if (shapes[i].type == 0 && PointInPolyShape(exactDragStartX, exactDragStartY, &shapes[i])) { 
-                            hitS = i; hitP = -1; break; 
+                    if (hitS == -1) {
+                        for (i = shapeCount - 1; i >= 0; i--) { 
+                            if (shapes[i].type == 0 && PointInPolyShape(exactDragStartX, exactDragStartY, &shapes[i])) { 
+                                hitS = i; hitP = -1; break; 
+                            } 
                         } 
-                    } 
+                    }
                 }
-                
+
                 if (hitS == -1) {
                     double bestDist = 99999.0, d, prX, prY;
                     int foundSegS = -1, foundSegP = -1;
@@ -3430,6 +3394,22 @@ shapes = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
                             shapes[foundSegS].ptsY[foundSegP+1] = foundPrY;
                             shapes[foundSegS].ptCount++;
                             hitP = foundSegP + 1;
+                        }
+                    }
+                }
+
+                if (hitS == -1) {
+                    for (i = shapeCount - 1; i >= 0; i--) {
+                        if (shapes[i].type == 3) {
+                            if (currentMode == 27) {
+                                for (j = 0; j < shapes[i].ptCount; j++) {
+                                    int px = (int)round(shapes[i].ptsX[j] * (scaleFactor * viewZoom) + viewPanX);
+                                    int py = (int)round(shapes[i].ptsY[j] * (scaleFactor * viewZoom) + viewPanY);
+                                    if (sqrt(pow(px - x, 2) + pow(py - y, 2)) <= 8.0) { hitS = i; hitP = j; break; }
+                                }
+                            }
+                            if (hitS == -1 && PointInPolyShape(exactDragStartX, exactDragStartY, &shapes[i])) { hitS = i; hitP = -1; break; }
+                            if (hitS != -1) break;
                         }
                     }
                 }
@@ -3753,7 +3733,7 @@ shapes = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
                                         if (len > 0 && len < 260) {
                                             double newRot, oldCx, oldCy, newCx, newCy, newX2, newY2, lcx = 0, lcy = 0; char absPath[260]; int rIdx;
                                             strncpy(refPath, dragStartSnapshot[i].text + 10, len); refPath[len] = '\0';
-                                            sscanf(pS, " scale=%lf", &rSc); if (pR) sscanf(pR, " rot=%lf", &rRot);
+                                            rSc = atof(pS + 7); if (pR) rRot = atof(pR + 5);
                                             newRot = rRot + (diff * 180.0 / PI);
                                             while (newRot >= 360.0) newRot -= 360.0; while (newRot < 0.0) newRot += 360.0;
                                             sprintf(shapes[i].text, "{{EXT_REF=%s scale=%.2f rot=%.2f}}", refPath, rSc, newRot);
@@ -3795,7 +3775,7 @@ shapes = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
                                             if (len > 0 && len < 260) {
                                                 double newScale, oldCx, oldCy, newCx, newCy, newX2, newY2, lcx = 0, lcy = 0; char absPath[260]; int rIdx;
                                                 strncpy(refPath, dragStartSnapshot[i].text + 10, len); refPath[len] = '\0';
-                                                sscanf(pS, " scale=%lf", &rSc); if (pR) sscanf(pR, " rot=%lf", &rRot);
+                                                rSc = atof(pS + 7); if (pR) rRot = atof(pR + 5);
                                                 newScale = rSc * scale;
                                                 sprintf(shapes[i].text, "{{EXT_REF=%s scale=%.2f rot=%.2f}}", refPath, newScale, rRot);
                                                 ResolvePath(loadedCFile[0] ? loadedCFile : "", refPath, absPath); rIdx = EnsureRefLoaded(absPath);
@@ -3822,7 +3802,8 @@ shapes = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
                 needsRedraw = 1;
             } else if (currentMode == 0 || currentMode == 1 || currentMode == 2 || currentMode == 27) {
                 hoverShape = -1; hoverPt = -1; hoverSegShape = -1; hoverSegPt = -1; bestDist = 99999.0;
-                if (selectedShape != -1 && selectedShape < shapeCount) {
+                
+                if (selectedShape != -1 && selectedShape < shapeCount && shapes[selectedShape].type != 3 && shapes[selectedShape].type != 4) {
                     for (p = 0; p < shapes[selectedShape].ptCount; p++) {
                         d = sqrt(pow(shapes[selectedShape].ptsX[p]*(scaleFactor * viewZoom) + viewPanX - x, 2) + pow(shapes[selectedShape].ptsY[p]*(scaleFactor * viewZoom) + viewPanY - y, 2));
                         if (d < 15.0 && d < bestDist) { hoverShape = selectedShape; hoverPt = p; bestDist = d; }
@@ -3830,11 +3811,8 @@ shapes = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
                 }
                 if (hoverPt == -1) {
                     for (i = 0; i < shapeCount; i++) {
-                        if (shapes[i].type == 4) continue;
-                        if (shapes[i].type == 3 && currentMode != 27) continue;
-                        int startPt = (shapes[i].type == 3) ? 0 : 0; 
-                        int endPt = shapes[i].ptCount;
-                        for (p = startPt; p < endPt; p++) {
+                        if (shapes[i].type == 3 || shapes[i].type == 4) continue;
+                        for (p = 0; p < shapes[i].ptCount; p++) {
                             d = sqrt(pow(shapes[i].ptsX[p]*(scaleFactor * viewZoom) + viewPanX - x, 2) + pow(shapes[i].ptsY[p]*(scaleFactor * viewZoom) + viewPanY - y, 2));
                             if (d < 15.0 && d < bestDist) { hoverShape = i; hoverPt = p; bestDist = d; }
                         }
@@ -3848,6 +3826,16 @@ shapes = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
                             np = (p + 1) % shapes[i].ptCount;
                             PtToSegProj((double)exactX, (double)exactY, shapes[i].ptsX[p], shapes[i].ptsY[p], shapes[i].ptsX[np], shapes[i].ptsY[np], &prX, &prY, &d);
                             if (d < (10.0 / scaleFactor) && d < bestDist) { hoverSegShape = i; hoverSegPt = p; hoverProjX = prX; hoverProjY = prY; bestDist = d; }
+                        }
+                    }
+                }
+                if (hoverPt == -1 && hoverSegShape == -1 && currentMode == 27) {
+                    for (i = 0; i < shapeCount; i++) {
+                        if (shapes[i].type == 3) {
+                            for (p = 0; p < shapes[i].ptCount; p++) {
+                                d = sqrt(pow(shapes[i].ptsX[p]*(scaleFactor * viewZoom) + viewPanX - x, 2) + pow(shapes[i].ptsY[p]*(scaleFactor * viewZoom) + viewPanY - y, 2));
+                                if (d < 15.0 && d < bestDist) { hoverShape = i; hoverPt = p; bestDist = d; }
+                            }
                         }
                     }
                 }
@@ -3978,8 +3966,33 @@ shapes = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
             
             x = (int)(short)LOWORD(lParam); 
             y = (int)(short)HIWORD(lParam);
+
+            int cx_pal = clientW - PANEL_WIDTH + 15;
+            if (x >= cx_pal && x < cx_pal + 256 && y >= 382 && y < 414) {
+                int pIdx = ((y - 382) / 16) * 8 + (x - cx_pal) / 32;
+                CHOOSECOLOR cc;
+                static COLORREF acrCustClr[16];
+                memset(&cc, 0, sizeof(cc));
+                cc.lStructSize = sizeof(cc);
+                cc.hwndOwner = hwnd;
+                cc.rgbResult = palette[pIdx];
+                cc.lpCustColors = (LPDWORD)acrCustClr;
+                cc.Flags = CC_RGBINIT | CC_FULLOPEN;
+                if (ChooseColor(&cc)) {
+                    palette[pIdx] = cc.rgbResult;
+                    currentFill = cc.rgbResult;
+                    useFill = 1;
+                    if (selectedShape != -1) { 
+                        SaveState(); 
+                        shapes[selectedShape].fill = currentFill; 
+                        shapes[selectedShape].useFill = 1;
+                    }
+                    InvalidateRect(hwnd, NULL, TRUE);
+                }
+                return 0;
+            }
+
             tagHit = 0;
-            
             for (k = textHitCount - 1; k >= 0; k--) {
                 if (x >= textHits[k].box.left && x <= textHits[k].box.right && y >= textHits[k].box.top && y <= textHits[k].box.bottom) {
                     editShapeIdx = textHits[k].shapeIdx;
@@ -4578,10 +4591,9 @@ shapes = (Shape*)GlobalAllocPtr(GHND, (DWORD)MAX_SHAPES * sizeof(Shape));
             if (IsWindow(hDistEdit) && oldEditProc) { SetWindowLong(hDistEdit, GWL_WNDPROC, (LONG)oldEditProc); oldEditProc = NULL; }
             if (IsWindow(hMultiEdit) && oldMultiEditProc) { SetWindowLong(hMultiEdit, GWL_WNDPROC, (LONG)oldMultiEditProc); oldMultiEditProc = NULL; }
 
-if (shapes) { GlobalFreePtr(shapes); shapes = NULL; }
+            if (shapes) { GlobalFreePtr(shapes); shapes = NULL; }
             if (dragStartSnapshot) { GlobalFreePtr(dragStartSnapshot); dragStartSnapshot = NULL; }
-
-            /* ADD THESE 3 LINES: */
+            
             if (g_tempRef) { GlobalFreePtr(g_tempRef); g_tempRef = NULL; }
             if (g_subPts) { GlobalFreePtr(g_subPts); g_subPts = NULL; }
             if (g_pA) { GlobalFreePtr(g_pA); g_pA = NULL; }
