@@ -108,6 +108,280 @@ HWND hBtnImportDXF, hBtnExportDXF, hBtnExit;
 HWND hStatus;
 
 /* --- Memory Cleanup --- */
+void DrawDXFDimensions(FILE* f, Dimension* dims, int dimCount, Shape FAR* FAR* shapes, int shapeCount, double pageScale, double offX, double offY, double minX, double minY, const char* unitName, double rScale, double cosR, double sinR, double objCx, double objCy, double lcx, double lcy) {
+    int i;
+    double drawScale = pageScale > 0.001 ? pageScale : 1.0;
+    double extBase = 0.5 * drawScale;
+    double extOffset = 0.2 * drawScale;
+    double arrowLen = 1.6 * drawScale;
+    double arrowWid = 0.5 * drawScale;
+    double svgFSize = 2.0 * drawScale;
+
+    if (svgFSize < 0.1) svgFSize = 0.1;
+
+    for (i = 0; i < dimCount; i++) {
+        double lA1x, lA1y, lA2x, lA2y, lD1x, lD1y, lD2x, lD2y;
+        double gA1x, gA1y, gA2x, gA2y, gD1x, gD1y, gD2x, gD2y, gMidX, gMidY;
+        double svgA1x, svgA1y, svgA2x, svgA2y, svgD1x, svgD1y, svgD2x, svgD2y, svgMidX, svgMidY;
+        double lDx, lDy, ang, nx, ny, val, lGridOffset, lMidX, lMidY;
+        double tx_, ty_;
+        char buf[64];
+
+        if (dims[i].s1 < 0 || dims[i].s1 >= shapeCount || dims[i].s2 < 0 || dims[i].s2 >= shapeCount) continue;
+        
+        GetShapePoint(shapes[dims[i].s1], dims[i].p1, &lA1x, &lA1y);
+        GetShapePoint(shapes[dims[i].s2], dims[i].p2, &lA2x, &lA2y);
+
+        lDx = lA2x - lA1x; lDy = lA2y - lA1y;
+        lGridOffset = dims[i].offset;
+
+        if (dims[i].mode == 0) {
+            if (lDx == 0.0 && lDy == 0.0) ang = 0.0; else ang = atan2(lDy, lDx);
+            nx = -sin(ang); ny = cos(ang);
+            lD1x = lA1x + nx * lGridOffset; lD1y = lA1y + ny * lGridOffset;
+            lD2x = lA2x + nx * lGridOffset; lD2y = lA2y + ny * lGridOffset;
+            val = sqrt(pow((lA2x - lA1x)*rScale, 2) + pow((lA2y - lA1y)*rScale, 2));
+        } else if (dims[i].mode == 1) {
+            lD1x = lA1x; lD1y = lA1y - lGridOffset;
+            lD2x = lA2x; lD2y = lA1y - lGridOffset;
+            val = fabs((lA2x - lA1x)*rScale);
+        } else {
+            lD1x = lA1x + lGridOffset; lD1y = lA1y;
+            lD2x = lA1x + lGridOffset; lD2y = lA2y;
+            val = fabs((lA2y - lA1y)*rScale);
+        }
+
+        lMidX = lD1x + (lD2x - lD1x) * dims[i].textPos;
+        lMidY = lD1y + (lD2y - lD1y) * dims[i].textPos;
+
+        tx_ = (lA1x - lcx) * rScale; ty_ = (lA1y - lcy) * rScale;
+        gA1x = objCx + tx_ * cosR - ty_ * sinR; gA1y = objCy + tx_ * sinR + ty_ * cosR;
+
+        tx_ = (lA2x - lcx) * rScale; ty_ = (lA2y - lcy) * rScale;
+        gA2x = objCx + tx_ * cosR - ty_ * sinR; gA2y = objCy + tx_ * sinR + ty_ * cosR;
+
+        tx_ = (lD1x - lcx) * rScale; ty_ = (lD1y - lcy) * rScale;
+        gD1x = objCx + tx_ * cosR - ty_ * sinR; gD1y = objCy + tx_ * sinR + ty_ * cosR;
+
+        tx_ = (lD2x - lcx) * rScale; ty_ = (lD2y - lcy) * rScale;
+        gD2x = objCx + tx_ * cosR - ty_ * sinR; gD2y = objCy + tx_ * sinR + ty_ * cosR;
+
+        tx_ = (lMidX - lcx) * rScale; ty_ = (lMidY - lcy) * rScale;
+        gMidX = objCx + tx_ * cosR - ty_ * sinR; gMidY = objCy + tx_ * sinR + ty_ * cosR;
+
+        svgA1x = offX + (gA1x - minX) * pageScale; svgA1y = offY + (gA1y - minY) * pageScale;
+        svgA2x = offX + (gA2x - minX) * pageScale; svgA2y = offY + (gA2y - minY) * pageScale;
+        svgD1x = offX + (gD1x - minX) * pageScale; svgD1y = offY + (gD1y - minY) * pageScale;
+        svgD2x = offX + (gD2x - minX) * pageScale; svgD2y = offY + (gD2y - minY) * pageScale;
+        svgMidX = offX + (gMidX - minX) * pageScale; svgMidY = offY + (gMidY - minY) * pageScale;
+
+        FormatDimension(val, unitName, buf);
+
+        double L1dx = svgD1x - svgA1x, L1dy = svgD1y - svgA1y;
+        double L1len = sqrt(L1dx*L1dx + L1dy*L1dy);
+        if (L1len > extBase) {
+            fprintf(f, "  0\nLINE\n  8\n0\n 10\n%f\n 20\n%f\n 30\n0.0\n 11\n%f\n 21\n%f\n 31\n0.0\n",
+                svgA1x + L1dx/L1len*extBase, -(svgA1y + L1dy/L1len*extBase),
+                svgD1x - L1dx/L1len*extOffset, -(svgD1y - L1dy/L1len*extOffset));
+        }
+
+        double L2dx = svgD2x - svgA2x, L2dy = svgD2y - svgA2y;
+        double L2len = sqrt(L2dx*L2dx + L2dy*L2dy);
+        if (L2len > extBase) {
+            fprintf(f, "  0\nLINE\n  8\n0\n 10\n%f\n 20\n%f\n 30\n0.0\n 11\n%f\n 21\n%f\n 31\n0.0\n",
+                svgA2x + L2dx/L2len*extBase, -(svgA2y + L2dy/L2len*extBase),
+                svgD2x - L2dx/L2len*extOffset, -(svgD2y - L2dy/L2len*extOffset));
+        }
+
+        fprintf(f, "  0\nLINE\n  8\n0\n 10\n%f\n 20\n%f\n 30\n0.0\n 11\n%f\n 21\n%f\n 31\n0.0\n", 
+            svgD1x, -svgD1y, svgD2x, -svgD2y);
+
+        double dimDx = svgD2x - svgD1x, dimDy = svgD2y - svgD1y;
+        double dimLen = sqrt(dimDx*dimDx + dimDy*dimDy);
+        if (dimLen > 0) {
+            double dirX = dimDx/dimLen, dirY = dimDy/dimLen;
+            fprintf(f, "  0\nPOLYLINE\n  8\n0\n 66\n1\n 70\n1\n 10\n0.0\n 20\n0.0\n 30\n0.0\n");
+            fprintf(f, "  0\nVERTEX\n  8\n0\n 10\n%f\n 20\n%f\n 30\n0.0\n", svgD1x, -svgD1y);
+            fprintf(f, "  0\nVERTEX\n  8\n0\n 10\n%f\n 20\n%f\n 30\n0.0\n", svgD1x + dirX*arrowLen - dirY*arrowWid, -(svgD1y + dirY*arrowLen + dirX*arrowWid));
+            fprintf(f, "  0\nVERTEX\n  8\n0\n 10\n%f\n 20\n%f\n 30\n0.0\n", svgD1x + dirX*arrowLen + dirY*arrowWid, -(svgD1y + dirY*arrowLen - dirX*arrowWid));
+            fprintf(f, "  0\nSEQEND\n  8\n0\n");
+
+            fprintf(f, "  0\nPOLYLINE\n  8\n0\n 66\n1\n 70\n1\n 10\n0.0\n 20\n0.0\n 30\n0.0\n");
+            fprintf(f, "  0\nVERTEX\n  8\n0\n 10\n%f\n 20\n%f\n 30\n0.0\n", svgD2x, -svgD2y);
+            fprintf(f, "  0\nVERTEX\n  8\n0\n 10\n%f\n 20\n%f\n 30\n0.0\n", svgD2x - dirX*arrowLen - dirY*arrowWid, -(svgD2y - dirY*arrowLen + dirX*arrowWid));
+            fprintf(f, "  0\nVERTEX\n  8\n0\n 10\n%f\n 20\n%f\n 30\n0.0\n", svgD2x - dirX*arrowLen + dirY*arrowWid, -(svgD2y - dirY*arrowLen - dirX*arrowWid));
+            fprintf(f, "  0\nSEQEND\n  8\n0\n");
+        }
+
+        double text_w = strlen(buf) * svgFSize * 0.55;
+
+        fprintf(f, "  0\nTEXT\n  8\n0\n 10\n%f\n 20\n%f\n 30\n0.0\n 40\n%f\n  1\n%s\n", 
+            svgMidX - text_w/2.0, -(svgMidY + svgFSize/3.0), svgFSize, buf);
+    }
+}
+void DrawDXFShape(FILE* f, Shape FAR* sh, double scale, double iconPageScale) {
+    int p;
+    static char refPath_stack[4][512];
+    static char absPath_stack[4][512];
+    static char subPath_stack[4][512];
+    static char tagBuf_stack[4][512];
+
+    if (sh->type == 3) {
+        char* refPath = refPath_stack[g_RenderRefDepth];
+        char* absPath = absPath_stack[g_RenderRefDepth];
+
+        double rScale = 1.0, rRot = 0.0; char *pScale, *pRot, *pEnd; int pathLen;
+        if (strncmp(sh->text, "{{EXT_REF=", 10) != 0) return;
+
+        pScale = strstr(sh->text, " scale="); pRot = strstr(sh->text, " rot="); pEnd = strstr(sh->text, "}}");
+        if (pScale) pathLen = (int)(pScale - (sh->text + 10)); else if (pRot) pathLen = (int)(pRot - (sh->text + 10)); else if (pEnd) pathLen = (int)(pEnd - (sh->text + 10)); else pathLen = strlen(sh->text + 10);
+        if (pathLen <= 0 || pathLen >= 512) return;
+
+        strncpy(refPath, sh->text + 10, pathLen); refPath[pathLen] = '\0';
+        while (pathLen > 0 && isspace((unsigned char)refPath[pathLen - 1])) refPath[--pathLen] = '\0';
+        if (pScale) sscanf(pScale, " scale=%lf", &rScale); if (pRot) sscanf(pRot, " rot=%lf", &rRot);
+        
+        ResolvePath(loadedCFile, refPath, absPath);
+        if (loadedCFile[0] && stricmp(absPath, loadedCFile) == 0) return; 
+
+        int rIdx = EnsureRefLoaded(absPath);
+        if (rIdx != -1) {
+            double lcx = (refCache[rIdx]->minX + refCache[rIdx]->maxX) / 2.0;
+            double lcy = (refCache[rIdx]->minY + refCache[rIdx]->maxY) / 2.0;
+            double objCx = sh->ptsX[0] + lcx * rScale;
+            double objCy = sh->ptsY[0] + lcy * rScale;
+            double rRad = rRot * PI / 180.0, cosR = cos(rRad), sinR = sin(rRad);
+            int refTagIdx = 0, r;
+            
+            for (r = 0; r < refCache[rIdx]->shapeCount; r++) {
+                Shape FAR* sub = refCache[rIdx]->shapes[r];
+                if (sub->type == 3) {
+                    if (g_RenderRefDepth < 3 && strncmp(sub->text, "{{EXT_REF=", 10) == 0) {
+                        Shape FAR* tRef = (Shape FAR*)GlobalAllocPtr(GHND, sizeof(Shape));
+                        char* subPath = subPath_stack[g_RenderRefDepth];
+
+                        if (tRef) {
+                            double subSc = 1.0, subRot = 0.0;
+                            char *spS = strstr(sub->text, " scale="), *spR = strstr(sub->text, " rot="), *spE = strstr(sub->text, "}}");
+                            int sLen;
+                            
+                            *tRef = *sub;
+                            if (spS) sLen = (int)(spS - (sub->text + 10)); else if (spE) sLen = (int)(spE - (sub->text + 10)); else sLen = strlen(sub->text + 10);
+                            if (sLen > 0 && sLen < 512) {
+                                strncpy(subPath, sub->text + 10, sLen); subPath[sLen] = '\0';
+                                while (sLen > 0 && isspace((unsigned char)subPath[sLen - 1])) subPath[--sLen] = '\0';
+                                if (spS) sscanf(spS, " scale=%lf", &subSc);
+                                if (spR) sscanf(spR, " rot=%lf", &subRot);
+                                
+                                double dx = (sub->ptsX[0] - lcx) * rScale, dy = (sub->ptsY[0] - lcy) * rScale;
+                                tRef->ptsX[0] = objCx + dx * cosR - dy * sinR; tRef->ptsY[0] = objCy + dx * sinR + dy * cosR;
+                                sprintf(tRef->text, "{{EXT_REF=%.450s scale=%.2f rot=%.2f}}", subPath, subSc * rScale, subRot + rRot);
+                                
+                                g_RenderRefDepth++;
+                                DrawDXFShape(f, tRef, scale, iconPageScale);
+                                g_RenderRefDepth--;
+                            }
+                        }
+                        if (tRef) GlobalFreePtr(tRef);
+                    }
+                    continue;
+                }
+                
+                if (sub->type == 4) {
+                    Shape FAR* tShp = (Shape FAR*)GlobalAllocPtr(GHND, sizeof(Shape));
+                    char* tagBuf = tagBuf_stack[g_RenderRefDepth];
+                    
+                    if (tShp) {
+                        double dx = (sub->ptsX[0] - lcx) * rScale, dy = (sub->ptsY[0] - lcy) * rScale;
+                        GetPipeValue(sh->tagData, refTagIdx, tagBuf, 512);
+                        
+                        if (strlen(tagBuf) == 0) {
+                            strncpy(tagBuf, sub->text, 511); tagBuf[511] = '\0'; 
+                        }
+                        
+                        if (tagBuf[0] == '{' && tagBuf[1] == '{') {
+                            char* pEndClean = strstr(tagBuf + 2, "}}");
+                            if (pEndClean) *pEndClean = '\0'; 
+                            
+                            int stIdx = 0;
+                            while (tagBuf[stIdx + 2] != '\0') {
+                                tagBuf[stIdx] = tagBuf[stIdx + 2];
+                                stIdx++;
+                            }
+                            tagBuf[stIdx] = '\0';
+                        }
+                        
+                        if (strcmp(tagBuf, "SHEETSCALE") == 0) {
+                            if (iconPageScale > 0 && iconPageScale <= 1.0) sprintf(tagBuf, "1:%g", 1.0 / iconPageScale);
+                            else sprintf(tagBuf, "%g", iconPageScale);
+                        }
+
+                        *tShp = *sub; tShp->ptsX[0] = objCx + dx * cosR - dy * sinR; tShp->ptsY[0] = objCy + dx * sinR + dy * cosR;
+                        strcpy(tShp->text, tagBuf); tShp->fontSize = sub->fontSize > 0 ? (int)(sub->fontSize * rScale) : (int)(24 * rScale);
+                        tShp->strokeWidth = sub->strokeWidth > 0 ? (int)(sub->strokeWidth * rScale) : (int)(1 * rScale);
+                        DrawDXFShape(f, tShp, scale, iconPageScale);
+                    }
+                    if (tShp) GlobalFreePtr(tShp);
+                    refTagIdx++;
+                } else {
+                    Shape FAR* tmpShp = (Shape FAR*)GlobalAllocPtr(GHND, sizeof(Shape));
+                    if (tmpShp) {
+                        int pIdx;
+                        *tmpShp = *sub;
+                        for (pIdx = 0; pIdx < sub->ptCount; pIdx++) {
+                            double dx = (sub->ptsX[pIdx] - lcx) * rScale, dy = (sub->ptsY[pIdx] - lcy) * rScale;
+                            tmpShp->ptsX[pIdx] = objCx + dx * cosR - dy * sinR; tmpShp->ptsY[pIdx] = objCy + dx * sinR + dy * cosR;
+                        }
+                        tmpShp->strokeWidth = sub->strokeWidth > 0 ? (int)(sub->strokeWidth * rScale) : (int)(1 * rScale);
+                        DrawDXFShape(f, tmpShp, scale, iconPageScale);
+                        GlobalFreePtr(tmpShp);
+                    }
+                }
+            }
+            if (refCache[rIdx]->dimCount > 0) {
+                DrawDXFDimensions(f, refCache[rIdx]->dims, refCache[rIdx]->dimCount, refCache[rIdx]->shapes, refCache[rIdx]->shapeCount, scale, 0.0, 0.0, 0.0, 0.0, refCache[rIdx]->unitName, rScale, cosR, sinR, objCx, objCy, lcx, lcy);
+            }
+        }
+        return;
+    }
+
+    if (sh->type == 1 && sh->ptCount >= 2) {
+        fprintf(f, "  0\nLINE\n  8\n0\n 10\n%f\n 20\n%f\n 30\n0.0\n 11\n%f\n 21\n%f\n 31\n0.0\n", 
+            sh->ptsX[0]*scale, -sh->ptsY[0]*scale, sh->ptsX[1]*scale, -sh->ptsY[1]*scale);
+    } else if (sh->type == 0 || sh->type == 2) {
+        if (sh->ptCount >= 2) {
+            fprintf(f, "  0\nPOLYLINE\n  8\n0\n 66\n1\n 70\n%d\n 10\n0.0\n 20\n0.0\n 30\n0.0\n", sh->type == 0 ? 1 : 0);
+            for (p = 0; p < sh->ptCount; p++) {
+                fprintf(f, "  0\nVERTEX\n  8\n0\n 10\n%f\n 20\n%f\n 30\n0.0\n", sh->ptsX[p]*scale, -sh->ptsY[p]*scale);
+            }
+            fprintf(f, "  0\nSEQEND\n  8\n0\n");
+        }
+    } else if (sh->type == 4) {
+        char safeText[512]; char dispT[512];
+        char *pText;
+        
+        if (sh->text[0] == '{' && sh->text[1] == '{') {
+            strcpy(dispT, sh->text + 2); char *pEnd = strstr(dispT, "}}"); if (pEnd) *pEnd = '\0';
+        } else { strcpy(dispT, sh->text); }
+
+        if (strcmp(dispT, "SHEETSCALE") == 0) {
+            if (iconPageScale > 0 && iconPageScale <= 1.0) sprintf(dispT, "1:%g", 1.0 / iconPageScale);
+            else sprintf(dispT, "%g", iconPageScale);
+        }
+
+        strncpy(safeText, dispT, 511); safeText[511] = '\0';
+        if (strlen(safeText) == 0) strcpy(safeText, " ");
+        for (pText = safeText; *pText; pText++) {
+            if (*pText == '\r' || *pText == '\n') *pText = ' ';
+        }
+
+        double fSize = ((sh->fontSize>0 ? sh->fontSize : 24.0) * scale) / 10.0;
+        if (fSize < 0.1) fSize = 0.1;
+
+        fprintf(f, "  0\nTEXT\n  8\n0\n 10\n%f\n 20\n%f\n 30\n0.0\n 40\n%f\n  1\n%s\n", 
+            sh->ptsX[0]*scale, -(sh->ptsY[0]*scale + fSize*0.8), fSize, safeText); 
+    }
+}
 void FreeAllData(void) {
     int i, j;
     for (i = 0; i < MAX_ICONS; i++) {
@@ -149,6 +423,62 @@ void FreeTempShapes(void) {
     }
     tempShapeCount = 0;
 }
+void GetShapePoint(Shape FAR* sh, int ptIdx, double* outX, double* outY) {
+    if (sh->type == 3) {
+        char refPath[512]; double rScale = 1.0, rRot = 0.0;
+        *outX = sh->ptsX[0]; *outY = sh->ptsY[0];
+        
+        if (strncmp(sh->text, "{{EXT_REF=", 10) == 0) {
+            char *pScale = strstr(sh->text, " scale="); 
+            char *pRot = strstr(sh->text, " rot="); 
+            char *pEnd = strstr(sh->text, "}}");
+            int pathLen;
+            if (pScale) pathLen = (int)(pScale - (sh->text + 10)); else if (pRot) pathLen = (int)(pRot - (sh->text + 10)); else if (pEnd) pathLen = (int)(pEnd - (sh->text + 10)); else pathLen = strlen(sh->text + 10);
+            if (pathLen > 0 && pathLen < 512) {
+                strncpy(refPath, sh->text + 10, pathLen); refPath[pathLen] = '\0';
+                while (pathLen > 0 && isspace((unsigned char)refPath[pathLen - 1])) refPath[--pathLen] = '\0';
+                if (pScale) sscanf(pScale, " scale=%lf", &rScale);
+                if (pRot) sscanf(pRot, " rot=%lf", &rRot);
+            } else { return; }
+        } else {
+            strncpy(refPath, sh->text, 511); refPath[511] = '\0';
+        }
+        
+        char absPath[260];
+        ResolvePath(loadedCFile, refPath, absPath);
+        if (loadedCFile[0] && stricmp(absPath, loadedCFile) == 0) return;
+        
+        int rIdx = EnsureRefLoaded(absPath);
+        if (rIdx != -1) {
+            double lcx = (refCache[rIdx]->minX + refCache[rIdx]->maxX) / 2.0;
+            double lcy = (refCache[rIdx]->minY + refCache[rIdx]->maxY) / 2.0;
+            double objCx = sh->ptsX[0] + lcx * rScale;
+            double objCy = sh->ptsY[0] + lcy * rScale;
+            double rRad = rRot * PI / 180.0, cosR = cos(rRad), sinR = sin(rRad);
+            
+            double bx[5], by[5];
+            bx[0] = refCache[rIdx]->minX; by[0] = refCache[rIdx]->minY; 
+            bx[1] = refCache[rIdx]->maxX; by[1] = refCache[rIdx]->minY; 
+            bx[2] = refCache[rIdx]->maxX; by[2] = refCache[rIdx]->maxY; 
+            bx[3] = refCache[rIdx]->minX; by[3] = refCache[rIdx]->maxY; 
+            bx[4] = lcx;                  by[4] = lcy;                  
+            
+            if (ptIdx >= 0 && ptIdx <= 4) {
+                double dx_r = (bx[ptIdx] - lcx) * rScale, dy_r = (by[ptIdx] - lcy) * rScale;
+                *outX = objCx + dx_r * cosR - dy_r * sinR;
+                *outY = objCy + dx_r * sinR + dy_r * cosR;
+            }
+        }
+    } else {
+        if (ptIdx >= 0 && ptIdx < sh->ptCount) {
+            *outX = sh->ptsX[ptIdx];
+            *outY = sh->ptsY[ptIdx];
+        } else {
+            *outX = sh->ptsX[0];
+            *outY = sh->ptsY[0];
+        }
+    }
+}
 
 /* --- Text & Path Utilities --- */
 void sanitize_pdf_string(char* str) {
@@ -713,7 +1043,7 @@ void WriteShapeToC(FILE* f, Shape FAR* s, int j) {
 
 /* --- DXF Importer/Exporter --- */
 void ExportCtoDXF(const char* c_path, const char* save_path, double scale) {
-    char drive[3], dir[260], fname[260], ext[16]; int i, j, k;
+    char drive[3], dir[260], fname[260], ext[16]; int i, j;
     if (!LoadCFile(c_path)) { SetWindowText(hStatus, " Error: Failed to load C file."); return; }
     if (parsedCount <= 0) { SetWindowText(hStatus, " Error: No icons found in C file."); return; }
     
@@ -734,58 +1064,17 @@ void ExportCtoDXF(const char* c_path, const char* save_path, double scale) {
         f = fopen(final_path, "w");
         if (!f) continue;
         
-        /* Highly Compatible Minimal DXF Header */
         fprintf(f, "  0\nSECTION\n  2\nHEADER\n  9\n$ACADVER\n  1\nAC1009\n  0\nENDSEC\n");
         fprintf(f, "  0\nSECTION\n  2\nTABLES\n  0\nENDSEC\n");
         fprintf(f, "  0\nSECTION\n  2\nBLOCKS\n  0\nENDSEC\n");
         fprintf(f, "  0\nSECTION\n  2\nENTITIES\n");
         
         for (j = 0; j < parsedIcons[i]->shapeCount; j++) {
-            Shape FAR* sh = parsedIcons[i]->shapes[j];
-            if (sh->type == 1 && sh->ptCount >= 2) {
-                fprintf(f, "  0\nLINE\n  8\n0\n 10\n%f\n 20\n%f\n 30\n0.0\n 11\n%f\n 21\n%f\n 31\n0.0\n", 
-                    sh->ptsX[0]*scale, sh->ptsY[0]*scale, sh->ptsX[1]*scale, sh->ptsY[1]*scale);
-            } else if (sh->type == 0 || sh->type == 2) {
-                if (sh->ptCount >= 2) {
-                    /* 70 Polyline flag: 1 = closed, 0 = open. 66 = 1 (vertices follow) */
-                    fprintf(f, "  0\nPOLYLINE\n  8\n0\n 66\n1\n 70\n%d\n 10\n0.0\n 20\n0.0\n 30\n0.0\n", sh->type == 0 ? 1 : 0);
-                    for (k = 0; k < sh->ptCount; k++) {
-                        fprintf(f, "  0\nVERTEX\n  8\n0\n 10\n%f\n 20\n%f\n 30\n0.0\n", sh->ptsX[k]*scale, sh->ptsY[k]*scale);
-                    }
-                    fprintf(f, "  0\nSEQEND\n  8\n0\n");
-                }
-            } else if (sh->type == 3 || sh->type == 4) {
-                char safeText[512];
-                char *pText;
-                strncpy(safeText, sh->text, 511);
-                safeText[511] = '\0';
-                if (strlen(safeText) == 0) strcpy(safeText, " ");
-                for (pText = safeText; *pText; pText++) {
-                    if (*pText == '\r' || *pText == '\n') *pText = ' ';
-                }
-
-                fprintf(f, "  0\nTEXT\n  8\n0\n 10\n%f\n 20\n%f\n 30\n0.0\n 40\n%f\n  1\n%s\n", 
-                    sh->ptsX[0]*scale, sh->ptsY[0]*scale, (sh->type == 3 ? 10.0 : (sh->fontSize>0?sh->fontSize:24.0))*scale, safeText);
-            }
+            DrawDXFShape(f, parsedIcons[i]->shapes[j], scale, parsedIcons[i]->pageScale);
         }
         
-        for (j = 0; j < parsedIcons[i]->dimCount; j++) {
-            Dimension* d = &parsedIcons[i]->dims[j];
-            char dimStr[64]; double val = 0.0;
-            
-            if (d->s1 >= 0 && d->s1 < parsedIcons[i]->shapeCount && d->s2 >= 0 && d->s2 < parsedIcons[i]->shapeCount) {
-                double lDx = parsedIcons[i]->shapes[d->s2]->ptsX[d->p2] - parsedIcons[i]->shapes[d->s1]->ptsX[d->p1];
-                double lDy = parsedIcons[i]->shapes[d->s2]->ptsY[d->p2] - parsedIcons[i]->shapes[d->s1]->ptsY[d->p1];
-                if (d->mode == 0) val = sqrt(lDx*lDx + lDy*lDy);
-                else if (d->mode == 1) val = fabs(lDx);
-                else val = fabs(lDy);
-            }
-            FormatDimension(val, parsedIcons[i]->unitName, dimStr);
-            if (strlen(dimStr) == 0) strcpy(dimStr, " ");
-            
-            fprintf(f, "  0\nTEXT\n  8\nDIM_DEF\n 10\n0.0\n 20\n0.0\n 30\n0.0\n 40\n10.0\n  1\nDIMENSION(%d, %d, %d, %d, %f, %f, %d)\n",
-                d->s1, d->p1, d->s2, d->p2, d->offset, d->textPos, d->mode);
-            fprintf(f, "  0\nTEXT\n  8\nDIMENSIONS\n 10\n0.0\n 20\n0.0\n 30\n0.0\n 40\n10.0\n  1\n%s\n", dimStr);
+        if (parsedIcons[i]->dimCount > 0) {
+            DrawDXFDimensions(f, parsedIcons[i]->dims, parsedIcons[i]->dimCount, parsedIcons[i]->shapes, parsedIcons[i]->shapeCount, scale, 0.0, 0.0, 0.0, 0.0, parsedIcons[i]->unitName, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         }
         
         fprintf(f, "  0\nENDSEC\n  0\nEOF\n");
@@ -1222,22 +1511,21 @@ void CalcBoundingBox(Shape FAR* FAR* shapes, int count, Dimension* dims, int dim
     for (i=0; i<dimCount; i++) {
         Dimension* d = &dims[i];
         if (d->s1 >= 0 && d->s1 < count && d->s2 >= 0 && d->s2 < count) {
-            Shape FAR* s1 = shapes[d->s1]; Shape FAR* s2 = shapes[d->s2];
-            if (d->p1 >= 0 && d->p1 < s1->ptCount && d->p2 >= 0 && d->p2 < s2->ptCount) {
-                double px1 = s1->ptsX[d->p1], py1 = s1->ptsY[d->p1];
-                double px2 = s2->ptsX[d->p2], py2 = s2->ptsY[d->p2];
-                double dx = px2 - px1, dy = py2 - py1, len, nx, ny, dim_x1, dim_y1, dim_x2, dim_y2;
-                
-                if (d->mode == 1) dy = 0.0; if (d->mode == 2) dx = 0.0;
-                len = sqrt(dx*dx + dy*dy);
-                if (len > 0) {
-                    nx = -dy / len; ny = dx / len;
-                    if (d->mode == 1) { dim_x1 = px1; dim_x2 = px2; dim_y1 = py1 - d->offset; dim_y2 = py2 - d->offset; }
-                    else if (d->mode == 2) { dim_x1 = px1 + d->offset; dim_x2 = px2 + d->offset; dim_y1 = py1; dim_y2 = py2; }
-                    else { dim_x1 = px1 + nx * d->offset; dim_y1 = py1 + ny * d->offset; dim_x2 = px2 + nx * d->offset; dim_y2 = py2 + ny * d->offset; }
-                    minX = fmin(minX, fmin(dim_x1, dim_x2)); maxX = fmax(maxX, fmax(dim_x1, dim_x2));
-                    minY = fmin(minY, fmin(dim_y1, dim_y2)); maxY = fmax(maxY, fmax(dim_y1, dim_y2));
-                }
+            double px1, py1, px2, py2;
+            GetShapePoint(shapes[d->s1], d->p1, &px1, &py1);
+            GetShapePoint(shapes[d->s2], d->p2, &px2, &py2);
+            
+            double dx = px2 - px1, dy = py2 - py1, len, nx, ny, dim_x1, dim_y1, dim_x2, dim_y2;
+            
+            if (d->mode == 1) dy = 0.0; if (d->mode == 2) dx = 0.0;
+            len = sqrt(dx*dx + dy*dy);
+            if (len > 0) {
+                nx = -dy / len; ny = dx / len;
+                if (d->mode == 1) { dim_x1 = px1; dim_x2 = px2; dim_y1 = py1 - d->offset; dim_y2 = py2 - d->offset; }
+                else if (d->mode == 2) { dim_x1 = px1 + d->offset; dim_x2 = px2 + d->offset; dim_y1 = py1; dim_y2 = py2; }
+                else { dim_x1 = px1 + nx * d->offset; dim_y1 = py1 + ny * d->offset; dim_x2 = px2 + nx * d->offset; dim_y2 = py2 + ny * d->offset; }
+                minX = fmin(minX, fmin(dim_x1, dim_x2)); maxX = fmax(maxX, fmax(dim_x1, dim_x2));
+                minY = fmin(minY, fmin(dim_y1, dim_y2)); maxY = fmax(maxY, fmax(dim_y1, dim_y2));
             }
         }
     }
@@ -1250,6 +1538,17 @@ void CalcBoundingBox(Shape FAR* FAR* shapes, int count, Dimension* dims, int dim
 
 void DrawSVGDimensions(FILE* f, Dimension* dims, int dimCount, Shape FAR* FAR* shapes, int shapeCount, double pageScale, double offX, double offY, double minX, double minY, const char* unitName, double rScale, double cosR, double sinR, double objCx, double objCy, double lcx, double lcy) {
     int i;
+    double drawScale = pageScale > 0.001 ? pageScale : 1.0;
+    double extBase = 0.5 * drawScale;
+    double extOffset = 0.2 * drawScale;
+    double arrowLen = 1.6 * drawScale;
+    double arrowWid = 0.5 * drawScale;
+    double strokeW = 0.1 * drawScale;
+    double svgFSize = 2.0 * drawScale;
+    
+    if (strokeW < 0.01) strokeW = 0.01;
+    if (svgFSize < 0.1) svgFSize = 0.1;
+
     for (i = 0; i < dimCount; i++) {
         double lA1x, lA1y, lA2x, lA2y, lD1x, lD1y, lD2x, lD2y;
         double gA1x, gA1y, gA2x, gA2y, gD1x, gD1y, gD2x, gD2y, gMidX, gMidY;
@@ -1259,13 +1558,9 @@ void DrawSVGDimensions(FILE* f, Dimension* dims, int dimCount, Shape FAR* FAR* s
         char buf[64];
 
         if (dims[i].s1 < 0 || dims[i].s1 >= shapeCount || dims[i].s2 < 0 || dims[i].s2 >= shapeCount) continue;
-        if (shapes[dims[i].s1]->type != 3 && dims[i].p1 >= shapes[dims[i].s1]->ptCount) continue;
-        if (shapes[dims[i].s2]->type != 3 && dims[i].p2 >= shapes[dims[i].s2]->ptCount) continue;
-
-        lA1x = shapes[dims[i].s1]->ptsX[dims[i].p1];
-        lA1y = shapes[dims[i].s1]->ptsY[dims[i].p1];
-        lA2x = shapes[dims[i].s2]->ptsX[dims[i].p2];
-        lA2y = shapes[dims[i].s2]->ptsY[dims[i].p2];
+        
+        GetShapePoint(shapes[dims[i].s1], dims[i].p1, &lA1x, &lA1y);
+        GetShapePoint(shapes[dims[i].s2], dims[i].p2, &lA2x, &lA2y);
 
         lDx = lA2x - lA1x; lDy = lA2y - lA1y;
         lGridOffset = dims[i].offset;
@@ -1314,21 +1609,21 @@ void DrawSVGDimensions(FILE* f, Dimension* dims, int dimCount, Shape FAR* FAR* s
 
         double L1dx = svgD1x - svgA1x, L1dy = svgD1y - svgA1y;
         double L1len = sqrt(L1dx*L1dx + L1dy*L1dy);
-        if (L1len > 5.0) {
-            fprintf(f, "<line x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" stroke=\"#0080FF\" stroke-width=\"1.0\" />\n",
-                svgA1x + L1dx/L1len*5.0, svgA1y + L1dy/L1len*5.0,
-                svgD1x - L1dx/L1len*2.0, svgD1y - L1dy/L1len*2.0);
+        if (L1len > extBase) {
+            fprintf(f, "<line x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" stroke=\"#0080FF\" stroke-width=\"%.2f\" />\n",
+                svgA1x + L1dx/L1len*extBase, svgA1y + L1dy/L1len*extBase,
+                svgD1x - L1dx/L1len*extOffset, svgD1y - L1dy/L1len*extOffset, strokeW);
         }
 
         double L2dx = svgD2x - svgA2x, L2dy = svgD2y - svgA2y;
         double L2len = sqrt(L2dx*L2dx + L2dy*L2dy);
-        if (L2len > 5.0) {
-            fprintf(f, "<line x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" stroke=\"#0080FF\" stroke-width=\"1.0\" />\n",
-                svgA2x + L2dx/L2len*5.0, svgA2y + L2dy/L2len*5.0,
-                svgD2x - L2dx/L2len*2.0, svgD2y - L2dy/L2len*2.0);
+        if (L2len > extBase) {
+            fprintf(f, "<line x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" stroke=\"#0080FF\" stroke-width=\"%.2f\" />\n",
+                svgA2x + L2dx/L2len*extBase, svgA2y + L2dy/L2len*extBase,
+                svgD2x - L2dx/L2len*extOffset, svgD2y - L2dy/L2len*extOffset, strokeW);
         }
 
-        fprintf(f, "<line x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" stroke=\"#0080FF\" stroke-width=\"1.0\" />\n", svgD1x, svgD1y, svgD2x, svgD2y);
+        fprintf(f, "<line x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" stroke=\"#0080FF\" stroke-width=\"%.2f\" />\n", svgD1x, svgD1y, svgD2x, svgD2y, strokeW);
 
         double dimDx = svgD2x - svgD1x, dimDy = svgD2y - svgD1y;
         double dimLen = sqrt(dimDx*dimDx + dimDy*dimDy);
@@ -1336,19 +1631,18 @@ void DrawSVGDimensions(FILE* f, Dimension* dims, int dimCount, Shape FAR* FAR* s
             double dirX = dimDx/dimLen, dirY = dimDy/dimLen;
             fprintf(f, "<polygon points=\"%.2f,%.2f %.2f,%.2f %.2f,%.2f\" fill=\"#0080FF\" />\n",
                 svgD1x, svgD1y,
-                svgD1x + dirX*16.0 - dirY*5.0, svgD1y + dirY*16.0 + dirX*5.0,
-                svgD1x + dirX*16.0 + dirY*5.0, svgD1y + dirY*16.0 - dirX*5.0);
+                svgD1x + dirX*arrowLen - dirY*arrowWid, svgD1y + dirY*arrowLen + dirX*arrowWid,
+                svgD1x + dirX*arrowLen + dirY*arrowWid, svgD1y + dirY*arrowLen - dirX*arrowWid);
             fprintf(f, "<polygon points=\"%.2f,%.2f %.2f,%.2f %.2f,%.2f\" fill=\"#0080FF\" />\n",
                 svgD2x, svgD2y,
-                svgD2x - dirX*16.0 - dirY*5.0, svgD2y - dirY*16.0 + dirX*5.0,
-                svgD2x - dirX*16.0 + dirY*5.0, svgD2y - dirY*16.0 - dirX*5.0);
+                svgD2x - dirX*arrowLen - dirY*arrowWid, svgD2y - dirY*arrowLen + dirX*arrowWid,
+                svgD2x - dirX*arrowLen + dirY*arrowWid, svgD2y - dirY*arrowLen - dirX*arrowWid);
         }
 
-        double svgFSize = 20.0;
         double text_w = strlen(buf) * svgFSize * 0.55;
 
         fprintf(f, "<rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" fill=\"#FFFFFF\" />\n",
-            svgMidX - text_w/2.0 - 2.0, svgMidY - svgFSize/2.0 - 2.0, text_w + 4.0, svgFSize + 4.0);
+            svgMidX - text_w/2.0 - (0.2 * drawScale), svgMidY - svgFSize/2.0 - (0.2 * drawScale), text_w + (0.4 * drawScale), svgFSize + (0.4 * drawScale));
         fprintf(f, "<text x=\"%.2f\" y=\"%.2f\" font-family=\"Arial\" font-size=\"%.2f\" fill=\"#0080FF\" text-anchor=\"middle\">%s</text>\n",
             svgMidX, svgMidY + svgFSize/3.0, svgFSize, buf);
     }
@@ -1510,7 +1804,7 @@ void DrawSVGShape(FILE* f, Shape FAR* sh, double scale, double minX, double minY
         tx = (sh->ptsX[0] - minX) * scale; ty = (sh->ptsY[0] - minY) * scale;
         
         svgFSize = ((double)(sh->fontSize > 0 ? sh->fontSize : 24) * scale) / 10.0;
-        if (svgFSize < 2.0) svgFSize = 2.0;
+        if (svgFSize < 0.1) svgFSize = 0.1;
         
         fprintf(f, "<text x=\"%.2f\" y=\"%.2f\" font-family=\"Arial\" font-size=\"%.2f\"", tx, ty + (svgFSize * 0.8), svgFSize);
         if (sh->useFill == 1) fprintf(f, " text-anchor=\"middle\"");
@@ -1543,52 +1837,52 @@ void DrawSVGShape(FILE* f, Shape FAR* sh, double scale, double minX, double minY
     fprintf(f, " stroke-width=\"%.2f\" />\n", ((sh->strokeWidth > 0 ? sh->strokeWidth : 1.0) * scale) / 10.0);
 }
 
-void ExportCtoSVG(const char* c_path, const char* save_path, double scale) {
-    char drive[3], dir[260], fname[260], ext[16]; int i, j;
-    if (!LoadCFile(c_path)) { SetWindowText(hStatus, " Error: Failed to load C file."); return; }
-    if (parsedCount <= 0) { SetWindowText(hStatus, " Error: No icons found in C file."); return; }
-    
-    _splitpath(save_path, drive, dir, fname, ext);
-    if (!ext[0]) strcpy(ext, ".svg");
-    
-    for (i=0; i<parsedCount; i++) {
-        char final_path[MAX_PATH];
-        double minX, minY, maxX, maxY; FILE* f;
-        
-        if (parsedCount == 1) {
-            strcpy(final_path, save_path);
-        } else {
-            char numStr[16]; char newFname[260]; int maxNameLen;
-            sprintf(numStr, "%d", i+1);
-            maxNameLen = 8 - strlen(numStr);
-            if (maxNameLen < 1) maxNameLen = 1;
-            strncpy(newFname, fname, maxNameLen); newFname[maxNameLen] = '\0';
-            strcat(newFname, numStr);
-            _makepath(final_path, drive, dir, newFname, ext);
-        }
-        
-        f = fopen(final_path, "w");
-        if (!f) continue;
-        
-        CalcBoundingBox(parsedIcons[i]->shapes, parsedIcons[i]->shapeCount, parsedIcons[i]->dims, parsedIcons[i]->dimCount, &minX, &minY, &maxX, &maxY);
-        
-        fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-        fprintf(f, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%.2f\" height=\"%.2f\" viewBox=\"0 0 %.2f %.2f\">\n",
-            (maxX - minX)*scale, (maxY - minY)*scale, (maxX - minX)*scale, (maxY - minY)*scale);
-        
-        for (j=0; j<parsedIcons[i]->shapeCount; j++) {
-            DrawSVGShape(f, parsedIcons[i]->shapes[j], scale, minX, minY, parsedIcons[i]->pageScale);
-        }
-        
-        if (parsedIcons[i]->dimCount > 0) {
-            DrawSVGDimensions(f, parsedIcons[i]->dims, parsedIcons[i]->dimCount, parsedIcons[i]->shapes, parsedIcons[i]->shapeCount, scale, 0.0, 0.0, minX, minY, parsedIcons[i]->unitName, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-        }
-        
-        fprintf(f, "</svg>\n");
-        fclose(f);
-    }
-    SetWindowText(hStatus, " Success: SVG Exported!");
-}
+void ExportCtoSVG(const char* c_path, const char* save_path, double scale) {
+    char drive[3], dir[260], fname[260], ext[16]; int i, j;
+    if (!LoadCFile(c_path)) { SetWindowText(hStatus, " Error: Failed to load C file."); return; }
+    if (parsedCount <= 0) { SetWindowText(hStatus, " Error: No icons found in C file."); return; }
+    
+    _splitpath(save_path, drive, dir, fname, ext);
+    if (!ext[0]) strcpy(ext, ".svg");
+    
+    for (i=0; i<parsedCount; i++) {
+        char final_path[MAX_PATH];
+        double minX, minY, maxX, maxY; FILE* f;
+        
+        if (parsedCount == 1) {
+            strcpy(final_path, save_path);
+        } else {
+            char numStr[16]; char newFname[260]; int maxNameLen;
+            sprintf(numStr, "%d", i+1);
+            maxNameLen = 8 - strlen(numStr);
+            if (maxNameLen < 1) maxNameLen = 1;
+            strncpy(newFname, fname, maxNameLen); newFname[maxNameLen] = '\0';
+            strcat(newFname, numStr);
+            _makepath(final_path, drive, dir, newFname, ext);
+        }
+        
+        f = fopen(final_path, "w");
+        if (!f) continue;
+        
+        CalcBoundingBox(parsedIcons[i]->shapes, parsedIcons[i]->shapeCount, parsedIcons[i]->dims, parsedIcons[i]->dimCount, &minX, &minY, &maxX, &maxY);
+        
+        fprintf(f, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        fprintf(f, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%.2f\" height=\"%.2f\" viewBox=\"0 0 %.2f %.2f\">\n",
+            (maxX - minX)*scale, (maxY - minY)*scale, (maxX - minX)*scale, (maxY - minY)*scale);
+        
+        for (j=0; j<parsedIcons[i]->shapeCount; j++) {
+            DrawSVGShape(f, parsedIcons[i]->shapes[j], scale, minX, minY, parsedIcons[i]->pageScale);
+        }
+        
+        if (parsedIcons[i]->dimCount > 0) {
+            DrawSVGDimensions(f, parsedIcons[i]->dims, parsedIcons[i]->dimCount, parsedIcons[i]->shapes, parsedIcons[i]->shapeCount, scale, 0.0, 0.0, minX, minY, parsedIcons[i]->unitName, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        }
+        
+        fprintf(f, "</svg>\n");
+        fclose(f);
+    }
+    SetWindowText(hStatus, " Success: SVG Exported!");
+}
 
 void ImportSVGtoC(const char* svg_path, const char* out_c_path, double scale) {
     FILE* f; int i;
@@ -1610,91 +1904,103 @@ void ImportSVGtoC(const char* svg_path, const char* out_c_path, double scale) {
 }
 
 /* --- GUI Actions --- */
-void ImportAction(HWND hwnd, int isDXF) {
-    char in_path[MAX_PATH] = ""; char out_path[MAX_PATH] = ""; 
-    char scaleStr[32]; double scale;
-    
-    GetWindowText(hTxtFile, in_path, MAX_PATH);
-    if (strlen(in_path) == 0) {
-        OPENFILENAME ofn;
-        memset(&ofn, 0, sizeof(ofn)); ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
-        ofn.lpstrFilter = isDXF ? "DXF Files (*.dxf)\0*.dxf\0All Files (*.*)\0*.*\0" : "SVG Files (*.svg)\0*.svg\0All Files (*.*)\0*.*\0";
-        ofn.lpstrFile = in_path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST;
-        if (!GetOpenFileName(&ofn)) return;
-        SetWindowText(hTxtFile, in_path);
-    }
+void ImportAction(HWND hwnd, int isDXF) {
+    char in_path[MAX_PATH] = ""; char out_path[MAX_PATH] = ""; 
+    char scaleStr[32]; double scale;
+    
+    GetWindowText(hTxtFile, in_path, MAX_PATH);
+    if (strlen(in_path) == 0) {
+        OPENFILENAME ofn;
+        memset(&ofn, 0, sizeof(ofn)); ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
+        ofn.lpstrFilter = isDXF ? "DXF Files (*.dxf)\0*.dxf\0All Files (*.*)\0*.*\0" : "SVG Files (*.svg)\0*.svg\0All Files (*.*)\0*.*\0";
+        ofn.lpstrFile = in_path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST;
+        if (!GetOpenFileName(&ofn)) return;
+        SetWindowText(hTxtFile, in_path);
+    }
+
+    GetWindowText(hTxtOutFile, out_path, MAX_PATH);
+    if (strlen(out_path) == 0) {
+        strcpy(out_path, in_path);
+        char* ext = strrchr(out_path, '.');
+        if (ext) strcpy(ext, ".c"); else strcat(out_path, ".c");
+        
+        OPENFILENAME ofn;
+        memset(&ofn, 0, sizeof(ofn)); ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
+        ofn.lpstrFilter = "C Files (*.c)\0*.c\0All Files (*.*)\0*.*\0";
+        ofn.lpstrFile = out_path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+        if (!GetSaveFileName(&ofn)) return;
+    } else {
+        char* ext = strrchr(out_path, '.');
+        char* slash = strrchr(out_path, '\\');
+        if (!ext || (slash && ext < slash)) {
+            strcat(out_path, ".c");
+        }
+
+        if (strchr(out_path, '\\') || strchr(out_path, '/') || strchr(out_path, ':')) {
+            // Full path - keep as is
+        } else {
+            char local_dir[MAX_PATH];
+            _getcwd(local_dir, MAX_PATH);
+            strcat(local_dir, "\\");
+            strcat(local_dir, out_path);
+            strcpy(out_path, local_dir);
+        }
+    }
+    
+    GetWindowText(hTxtScale, scaleStr, 32); scale = atof(scaleStr); if (scale <= 0) scale = 1.0;
+    
+    if (isDXF) ImportDXFtoC(in_path, out_path, scale);
+    else ImportSVGtoC(in_path, out_path, scale);
+}
 
-    GetWindowText(hTxtOutFile, out_path, MAX_PATH);
-    if (strlen(out_path) == 0) {
-        strcpy(out_path, in_path);
-        char* ext = strrchr(out_path, '.');
-        if (ext) strcpy(ext, ".c"); else strcat(out_path, ".c");
-        
-        OPENFILENAME ofn;
-        memset(&ofn, 0, sizeof(ofn)); ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
-        ofn.lpstrFilter = "C Files (*.c)\0*.c\0All Files (*.*)\0*.*\0";
-        ofn.lpstrFile = out_path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-        if (!GetSaveFileName(&ofn)) return;
-    } else {
-        if (strchr(out_path, '\\') || strchr(out_path, '/') || strchr(out_path, ':')) {
-            // Full path - keep as is
-        } else {
-            char local_dir[MAX_PATH];
-            _getcwd(local_dir, MAX_PATH);
-            strcat(local_dir, "\\");
-            strcat(local_dir, out_path);
-            strcpy(out_path, local_dir);
-        }
-    }
-    
-    GetWindowText(hTxtScale, scaleStr, 32); scale = atof(scaleStr); if (scale <= 0) scale = 1.0;
-    
-    if (isDXF) ImportDXFtoC(in_path, out_path, scale);
-    else ImportSVGtoC(in_path, out_path, scale);
-}
-
-void ExportAction(HWND hwnd, int isDXF) {
-    char in_path[MAX_PATH] = ""; char out_path[MAX_PATH] = ""; 
-    char scaleStr[32]; double scale;
-    
-    GetWindowText(hTxtFile, in_path, MAX_PATH);
-    if (strlen(in_path) == 0) {
-        OPENFILENAME ofn;
-        memset(&ofn, 0, sizeof(ofn)); ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
-        ofn.lpstrFilter = "C Files (*.c)\0*.c\0All Files (*.*)\0*.*\0";
-        ofn.lpstrFile = in_path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST;
-        if (!GetOpenFileName(&ofn)) return;
-        SetWindowText(hTxtFile, in_path);
-    }
-
-    GetWindowText(hTxtOutFile, out_path, MAX_PATH);
-    if (strlen(out_path) == 0) {
-        strcpy(out_path, in_path);
-        char* ext = strrchr(out_path, '.');
-        if (ext) strcpy(ext, isDXF ? ".dxf" : ".svg"); else strcat(out_path, isDXF ? ".dxf" : ".svg");
-        
-        OPENFILENAME ofn;
-        memset(&ofn, 0, sizeof(ofn)); ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
-        ofn.lpstrFilter = isDXF ? "DXF Files (*.dxf)\0*.dxf\0All Files (*.*)\0*.*\0" : "SVG Files (*.svg)\0*.svg\0All Files (*.*)\0*.*\0";
-        ofn.lpstrFile = out_path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-        if (!GetSaveFileName(&ofn)) return;
-    } else {
-        if (strchr(out_path, '\\') || strchr(out_path, '/') || strchr(out_path, ':')) {
-            // Full path - keep as is
-        } else {
-            char local_dir[MAX_PATH];
-            _getcwd(local_dir, MAX_PATH);
-            strcat(local_dir, "\\");
-            strcat(local_dir, out_path);
-            strcpy(out_path, local_dir);
-        }
-    }
-    
-    GetWindowText(hTxtScale, scaleStr, 32); scale = atof(scaleStr); if (scale <= 0) scale = 1.0;
-    
-    if (isDXF) ExportCtoDXF(in_path, out_path, scale);
-    else ExportCtoSVG(in_path, out_path, scale);
-}
+void ExportAction(HWND hwnd, int isDXF) {
+    char in_path[MAX_PATH] = ""; char out_path[MAX_PATH] = ""; 
+    char scaleStr[32]; double scale;
+    
+    GetWindowText(hTxtFile, in_path, MAX_PATH);
+    if (strlen(in_path) == 0) {
+        OPENFILENAME ofn;
+        memset(&ofn, 0, sizeof(ofn)); ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
+        ofn.lpstrFilter = "C Files (*.c)\0*.c\0All Files (*.*)\0*.*\0";
+        ofn.lpstrFile = in_path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST;
+        if (!GetOpenFileName(&ofn)) return;
+        SetWindowText(hTxtFile, in_path);
+    }
+
+    GetWindowText(hTxtOutFile, out_path, MAX_PATH);
+    if (strlen(out_path) == 0) {
+        strcpy(out_path, in_path);
+        char* ext = strrchr(out_path, '.');
+        if (ext) strcpy(ext, isDXF ? ".dxf" : ".svg"); else strcat(out_path, isDXF ? ".dxf" : ".svg");
+        
+        OPENFILENAME ofn;
+        memset(&ofn, 0, sizeof(ofn)); ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = hwnd;
+        ofn.lpstrFilter = isDXF ? "DXF Files (*.dxf)\0*.dxf\0All Files (*.*)\0*.*\0" : "SVG Files (*.svg)\0*.svg\0All Files (*.*)\0*.*\0";
+        ofn.lpstrFile = out_path; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+        if (!GetSaveFileName(&ofn)) return;
+    } else {
+        char* ext = strrchr(out_path, '.');
+        char* slash = strrchr(out_path, '\\');
+        if (!ext || (slash && ext < slash)) {
+            strcat(out_path, isDXF ? ".dxf" : ".svg");
+        }
+        
+        if (strchr(out_path, '\\') || strchr(out_path, '/') || strchr(out_path, ':')) {
+            // Full path - keep as is
+        } else {
+            char local_dir[MAX_PATH];
+            _getcwd(local_dir, MAX_PATH);
+            strcat(local_dir, "\\");
+            strcat(local_dir, out_path);
+            strcpy(out_path, local_dir);
+        }
+    }
+    
+    GetWindowText(hTxtScale, scaleStr, 32); scale = atof(scaleStr); if (scale <= 0) scale = 1.0;
+    
+    if (isDXF) ExportCtoDXF(in_path, out_path, scale);
+    else ExportCtoSVG(in_path, out_path, scale);
+}
 
 LRESULT CALLBACK __export WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch(msg) {
